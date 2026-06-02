@@ -71,13 +71,14 @@ BASE_BRANCH=main
 ORCHESTRATOR_DB_PATH=/var/lib/riseos-agent-orchestrator/orchestrator.db
 ORCHESTRATOR_ADMIN_TOKEN=replace-with-long-random-admin-token
 ORCHESTRATOR_MAX_REVIEW_ITEMS=500
+REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=false
 ```
 
 Do not commit real values. `ENABLE_OPENAI_REVIEW=false` keeps review processing deterministic and prevents live OpenAI calls. When it is set to `true`, `OPENAI_API_KEY` is required and `OPENAI_REVIEW_MODEL` is used to request validated `ReviewDecision` JSON.
 
 `ORCHESTRATOR_DB_PATH` enables SQLite persistence for accepted webhook events and review queue items. The service creates the database file and tables at startup. Keep `/var/lib/riseos-agent-orchestrator` owned by `riseos:riseos` so the systemd service can write there.
 
-`ORCHESTRATOR_ADMIN_TOKEN` protects `POST /debug/review-queue/{id}/process`. Read-only debug endpoints remain public for now. `ORCHESTRATOR_MAX_REVIEW_ITEMS=500` caps persisted review queue rows; only oldest processed items are pruned.
+`ORCHESTRATOR_ADMIN_TOKEN` protects `POST /debug/review-queue/{id}/process`. `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=false` leaves read-only debug endpoints public for local-style verification. Set it to `true` in production if `/debug/*` metadata should require `X-Orchestrator-Admin-Token`. `ORCHESTRATOR_MAX_REVIEW_ITEMS=500` caps persisted review queue rows; only oldest processed items are pruned.
 
 `ENABLE_GITHUB_CONTEXT_HYDRATION=false` keeps review processing fully deterministic and offline. Set it to `true` only when `GITHUB_TOKEN` has the read permissions needed for commits and branch comparisons. Hydration remains read-only and does not comment, label, mutate repositories, or merge.
 
