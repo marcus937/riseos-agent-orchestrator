@@ -12,6 +12,7 @@ class Settings:
     github_app_id: str | None = None
     github_app_private_key_path: str | None = None
     openai_api_key: str | None = None
+    openai_review_model: str = "gpt-5.5-thinking"
     enable_openai_review: bool = False
     orchestrator_db_path: str | None = None
     enable_github_context_hydration: bool = False
@@ -29,6 +30,7 @@ def get_settings() -> Settings:
         github_app_id=os.getenv("GITHUB_APP_ID"),
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
+        openai_review_model=os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.5-thinking"),
         enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
         orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
