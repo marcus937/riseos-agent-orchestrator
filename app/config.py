@@ -14,6 +14,8 @@ class Settings:
     openai_api_key: str | None = None
     openai_review_model: str = "gpt-5.5-thinking"
     enable_openai_review: bool = False
+    enable_bb_context_pack: bool = True
+    bb_context_max_chars: int = 20000
     orchestrator_db_path: str | None = None
     orchestrator_admin_token: str | None = None
     orchestrator_max_review_items: int = 500
@@ -35,6 +37,8 @@ def get_settings() -> Settings:
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         openai_review_model=os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.5-thinking"),
         enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
+        enable_bb_context_pack=os.getenv("ENABLE_BB_CONTEXT_PACK", "true").lower() == "true",
+        bb_context_max_chars=_int_env("BB_CONTEXT_MAX_CHARS", 20000),
         orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
         orchestrator_admin_token=os.getenv("ORCHESTRATOR_ADMIN_TOKEN"),
         orchestrator_max_review_items=_int_env("ORCHESTRATOR_MAX_REVIEW_ITEMS", 500),
