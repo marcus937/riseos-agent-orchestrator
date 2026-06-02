@@ -6,13 +6,18 @@ from app.config import get_settings
 from app.event_store import event_store
 from app.github_events import GitHubEventType, parse_github_event
 from app.main import app
+from app.review_queue import review_queue
 from app.security import build_signature
 
 
-def client_with_secret(secret: str = "test-secret") -> TestClient:
+def client_with_secret(secret: str = "test-secret", admin_token: str = "admin-token") -> TestClient:
     get_settings.cache_clear()
     event_store.reset()
-    app.dependency_overrides[get_settings] = lambda: get_settings().__class__(github_webhook_secret=secret)
+    review_queue.reset()
+    app.dependency_overrides[get_settings] = lambda: get_settings().__class__(
+        github_webhook_secret=secret,
+        orchestrator_admin_token=admin_token,
+    )
     return TestClient(app)
 
 
@@ -79,6 +84,9 @@ def test_debug_health_counts_rejected_webhook() -> None:
     assert debug["webhook_count"] == 1
     assert debug["accepted_count"] == 0
     assert debug["rejected_count"] == 1
+    assert debug["review_queue_count"] == 0
+    assert debug["pending_review_count"] == 0
+    assert debug["approved_count"] == 0
     assert debug["uptime"] >= 0
 
 
@@ -204,3 +212,228 @@ def test_accepted_webhook_is_stored_in_recent_events() -> None:
     assert debug["webhook_count"] == 1
     assert debug["accepted_count"] == 1
     assert debug["rejected_count"] == 0
+
+
+def test_agent_integration_push_creates_review_queue_item() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+
+    assert response.status_code == 200
+    queue = client.get("/debug/review-queue").json()
+    assert len(queue) == 1
+    item = queue[0]
+    assert item["id"]
+    assert item["repo_full_name"] == "riseos/example"
+    assert item["event_type"] == "push"
+    assert item["branch"] == "agent-integration"
+    assert item["commit_sha"] == "abc123"
+    assert item["issue_number"] is None
+    assert item["pr_number"] is None
+    assert item["status"] == "pending_review"
+
+    lookup = client.get(f"/debug/review-queue/{item['id']}")
+    assert lookup.status_code == 200
+    assert lookup.json() == item
+
+    debug = client.get("/debug/health").json()
+    assert debug["review_queue_count"] == 1
+    assert debug["pending_review_count"] == 1
+
+
+def test_status_done_issue_comment_creates_review_queue_item() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "riseos/example"},
+        "issue": {"number": 42},
+        "comment": {"body": "Status: Done\nReady for review."},
+        "sender": {"login": "agent"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "issue_comment", body))
+
+    assert response.status_code == 200
+    queue = client.get("/debug/review-queue").json()
+    assert len(queue) == 1
+    assert queue[0]["event_type"] == "issue_comment"
+    assert queue[0]["repo_full_name"] == "riseos/example"
+    assert queue[0]["issue_number"] == 42
+    assert queue[0]["pr_number"] is None
+    assert queue[0]["status"] == "pending_review"
+
+
+def test_pull_request_opened_creates_review_queue_item() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "riseos/example"},
+        "pull_request": {
+            "number": 7,
+            "head": {"ref": "feature/task", "sha": "def456"},
+            "base": {"ref": "main"},
+        },
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "pull_request", body))
+
+    assert response.status_code == 200
+    queue = client.get("/debug/review-queue").json()
+    assert len(queue) == 1
+    assert queue[0]["event_type"] == "pull_request"
+    assert queue[0]["branch"] == "feature/task"
+    assert queue[0]["commit_sha"] == "def456"
+    assert queue[0]["pr_number"] == 7
+    assert queue[0]["status"] == "pending_review"
+
+
+def test_pull_request_synchronize_creates_review_queue_item() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "action": "synchronize",
+        "repository": {"full_name": "riseos/example"},
+        "pull_request": {
+            "number": 8,
+            "head": {"ref": "agent-integration", "sha": "feedface"},
+            "base": {"ref": "main"},
+        },
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "pull_request", body))
+
+    assert response.status_code == 200
+    queue = client.get("/debug/review-queue").json()
+    assert len(queue) == 1
+    assert queue[0]["event_type"] == "pull_request"
+    assert queue[0]["branch"] == "agent-integration"
+    assert queue[0]["commit_sha"] == "feedface"
+    assert queue[0]["pr_number"] == 8
+
+
+def test_non_matching_accepted_event_does_not_create_review_queue_item() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/main",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+
+    assert response.status_code == 200
+    assert client.get("/debug/review-queue").json() == []
+    debug = client.get("/debug/health").json()
+    assert debug["accepted_count"] == 1
+    assert debug["review_queue_count"] == 0
+
+
+def test_missing_review_queue_item_returns_404() -> None:
+    client = client_with_secret()
+
+    response = client.get("/debug/review-queue/missing")
+
+    assert response.status_code == 404
+
+
+def test_process_review_queue_item_endpoint_updates_status() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+    item = client.get("/debug/review-queue").json()[0]
+
+    response = client.post(
+        f"/debug/review-queue/{item['id']}/process",
+        headers={"X-Orchestrator-Admin-Token": "admin-token"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["dry_run"] is True
+    assert data["work_item"]["id"] == item["id"]
+    assert data["work_item"]["status"] == "approved_for_human_review"
+    assert data["decision"]["decision"] == "APPROVED_FOR_HUMAN_REVIEW"
+    assert data["decision"]["summary"] == "Dry-run review processor accepted this work item for human review."
+    assert "Do not merge automatically." in data["intended_next_actions"]
+
+    lookup = client.get(f"/debug/review-queue/{item['id']}").json()
+    assert lookup["status"] == "approved_for_human_review"
+    debug = client.get("/debug/health").json()
+    assert debug["pending_review_count"] == 0
+    assert debug["approved_count"] == 1
+    assert debug["approved_for_human_review_count"] == 1
+
+
+def test_process_missing_review_queue_item_returns_404() -> None:
+    client = client_with_secret()
+
+    response = client.post(
+        "/debug/review-queue/missing/process",
+        headers={"X-Orchestrator-Admin-Token": "admin-token"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_process_endpoint_rejects_missing_admin_token() -> None:
+    client = client_with_secret()
+
+    response = client.post("/debug/review-queue/missing/process")
+
+    assert response.status_code == 401
+
+
+def test_process_endpoint_rejects_invalid_admin_token() -> None:
+    client = client_with_secret()
+
+    response = client.post(
+        "/debug/review-queue/missing/process",
+        headers={"X-Orchestrator-Admin-Token": "wrong"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_duplicate_webhook_does_not_create_duplicate_pending_queue_item() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    headers = signed_headers(secret, "push", body)
+
+    first = client.post("/webhooks/github", content=body, headers=headers)
+    second = client.post("/webhooks/github", content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    queue = client.get("/debug/review-queue").json()
+    assert len(queue) == 1
+    assert queue[0]["commit_sha"] == "abc123"
