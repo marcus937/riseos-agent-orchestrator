@@ -3,6 +3,7 @@ import json
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
+from app.event_store import event_store
 from app.github_events import GitHubEventType, parse_github_event
 from app.main import app
 from app.security import build_signature
@@ -10,6 +11,7 @@ from app.security import build_signature
 
 def client_with_secret(secret: str = "test-secret") -> TestClient:
     get_settings.cache_clear()
+    event_store.reset()
     app.dependency_overrides[get_settings] = lambda: get_settings().__class__(github_webhook_secret=secret)
     return TestClient(app)
 
@@ -61,6 +63,23 @@ def test_invalid_signature_is_rejected() -> None:
         headers={"X-GitHub-Event": "issue_comment", "X-Hub-Signature-256": "sha256=bad"},
     )
     assert response.status_code == 401
+
+
+def test_debug_health_counts_rejected_webhook() -> None:
+    client = client_with_secret()
+
+    response = client.post(
+        "/webhooks/github",
+        json={"action": "created"},
+        headers={"X-GitHub-Event": "issue_comment", "X-Hub-Signature-256": "sha256=bad"},
+    )
+
+    assert response.status_code == 401
+    debug = client.get("/debug/health").json()
+    assert debug["webhook_count"] == 1
+    assert debug["accepted_count"] == 0
+    assert debug["rejected_count"] == 1
+    assert debug["uptime"] >= 0
 
 
 def test_issue_comment_parser_extracts_context() -> None:
@@ -154,3 +173,34 @@ def test_signed_agent_integration_push_returns_review_stub() -> None:
     assert data["repo"] == "riseos/example"
     assert data["commit_sha"] == "abc123"
     assert data["review_context"]["trigger"] == "push_agent_integration"
+
+
+def test_accepted_webhook_is_stored_in_recent_events() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+
+    assert response.status_code == 200
+    events = client.get("/debug/recent-events").json()
+    assert len(events) == 1
+    assert events[0]["event_id"]
+    assert events[0]["github_event"] == "push"
+    assert events[0]["repo_full_name"] == "riseos/example"
+    assert events[0]["branch"] == "agent-integration"
+    assert events[0]["commit_sha"] == "abc123"
+    assert events[0]["issue_number"] is None
+    assert events[0]["pr_number"] is None
+    assert events[0]["raw_action"] is None
+
+    debug = client.get("/debug/health").json()
+    assert debug["webhook_count"] == 1
+    assert debug["accepted_count"] == 1
+    assert debug["rejected_count"] == 0
