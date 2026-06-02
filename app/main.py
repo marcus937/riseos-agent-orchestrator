@@ -3,13 +3,26 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
+from app.clients.github import GitHubClient
 from app.event_store import DebugHealth, EventRecord, event_store
+from app.github_context import hydrate_github_context
 from app.github_events import UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
+from app.review_queue import ReviewProcessResponse, ReviewWorkItem, process_review_work_item, review_queue
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
+from app.storage import SQLiteStateStore, build_sqlite_store
 
 
 app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    app.state.storage = build_sqlite_store(get_settings().orchestrator_db_path)
+
+
+def _storage() -> SQLiteStateStore | None:
+    return getattr(app.state, "storage", None)
 
 
 @app.get("/health")
@@ -19,12 +32,79 @@ async def health() -> dict[str, str]:
 
 @app.get("/debug/recent-events", response_model=list[EventRecord])
 async def recent_events() -> list[EventRecord]:
+    storage = _storage()
+    if storage is not None:
+        return storage.recent_events()
     return event_store.recent_events()
 
 
 @app.get("/debug/health", response_model=DebugHealth)
 async def debug_health() -> DebugHealth:
-    return event_store.debug_health()
+    storage = _storage()
+    if storage is not None:
+        return event_store.debug_health(storage.review_queue_counters(), accepted_count=storage.event_count())
+    return event_store.debug_health(review_queue.counters())
+
+
+@app.get("/debug/review-queue", response_model=list[ReviewWorkItem])
+async def debug_review_queue() -> list[ReviewWorkItem]:
+    storage = _storage()
+    if storage is not None:
+        return storage.list_review_work_items()
+    return review_queue.list_items()
+
+
+@app.get("/debug/review-queue/{item_id}", response_model=ReviewWorkItem)
+async def debug_review_queue_item(item_id: str) -> ReviewWorkItem:
+    storage = _storage()
+    item = storage.get_review_work_item(item_id) if storage is not None else review_queue.get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review work item not found")
+    return item
+
+
+@app.post("/debug/review-queue/{item_id}/process", response_model=ReviewProcessResponse)
+async def process_debug_review_queue_item(
+    item_id: str,
+    settings: Settings = Depends(get_settings),
+) -> ReviewProcessResponse:
+    storage = _storage()
+    if storage is not None:
+        item = storage.get_review_work_item(item_id)
+        if item is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review work item not found")
+        result = await _process_work_item(item, settings)
+        storage.save_review_work_item(result.work_item)
+        return result
+
+    item = review_queue.get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review work item not found")
+    result = await _process_work_item(item, settings)
+    return result
+
+
+async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
+    if not settings.enable_github_context_hydration:
+        return process_review_work_item(item)
+
+    github_client = GitHubClient(token=settings.github_token)
+    try:
+        github_context = await hydrate_github_context(
+            item,
+            github_client,
+            base_branch=settings.base_branch,
+        )
+    finally:
+        await github_client.aclose()
+
+    return process_review_work_item(
+        item,
+        changed_files=github_context.changed_files,
+        diff_summary=github_context.diff_summary,
+        github_context_available=github_context.github_context_available,
+        github_context_error=github_context.github_context_error,
+    )
 
 
 @app.post("/webhooks/github", response_model=WebhookAcceptedResponse)
@@ -56,7 +136,13 @@ async def github_webhook(
         raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail=str(exc)) from exc
 
     workflow = build_review_workflow(parsed)
-    event_store.record_accepted(parsed)
+    event_record = event_store.record_accepted(parsed)
+    work_item = review_queue.create_from_review_event(parsed, workflow)
+    storage = _storage()
+    if storage is not None:
+        storage.save_event_record(event_record)
+        if work_item is not None:
+            storage.save_review_work_item(work_item)
 
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
