@@ -4,7 +4,6 @@ from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.task_state import TaskState, transition_task_state
 
 AGENT_INTEGRATION_REF = "refs/heads/agent-integration"
-AGENT_INTEGRATION_BRANCH = "agent-integration"
 STATUS_DONE_MARKER = "status: done"
 REVIEW_NEXT_ACTION = "Build review prompt and prepare BB/Jarvis Architect review stub."
 NO_REVIEW_NEXT_ACTION = "No review action needed for this event."
@@ -52,12 +51,8 @@ def _review_trigger(parsed: ParsedGitHubEvent) -> str | None:
     if parsed.event_type == GitHubEventType.ISSUE_COMMENT and _contains_status_done(parsed.comment_body):
         return "issue_comment_status_done"
 
-    if (
-        parsed.event_type == GitHubEventType.PULL_REQUEST
-        and parsed.action in {"opened", "synchronize"}
-        and parsed.head_ref == AGENT_INTEGRATION_BRANCH
-    ):
-        return "pull_request_agent_integration"
+    if parsed.event_type == GitHubEventType.PULL_REQUEST and parsed.action in {"opened", "synchronize"}:
+        return "pull_request_review_event"
 
     return None
 
