@@ -22,10 +22,22 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | Variable | Required | Purpose |
 |---|---:|---|
 | `GITHUB_WEBHOOK_SECRET` | Yes | Shared secret used to verify `X-Hub-Signature-256`. |
+| `GITHUB_TOKEN` | GitHub client | Token for read/review GitHub API calls. |
 | `GITHUB_APP_ID` | Later | Placeholder for GitHub App authentication. |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Later | Placeholder path for GitHub App private key. |
 | `OPENAI_API_KEY` | Later | Placeholder for reviewer integration. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
+
+## GitHub Token Permissions
+
+`GITHUB_TOKEN` should be scoped to the smallest permissions needed for the target repository. The client uses read access for commits and branch comparisons, plus issue/PR write access for comments and labels. It does not merge, delete branches, or write repository files.
+
+Recommended fine-grained token permissions:
+
+- Contents: read
+- Metadata: read
+- Issues: read/write for comments and labels
+- Pull requests: read/write for PR comments and labels
 
 ## Local Run
 
