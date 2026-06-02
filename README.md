@@ -26,6 +26,7 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | `GITHUB_APP_ID` | Later | Placeholder for GitHub App authentication. |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Later | Placeholder path for GitHub App private key. |
 | `OPENAI_API_KEY` | Later | Placeholder for reviewer integration. |
+| `ENABLE_OPENAI_REVIEW` | No | Must be `true` before future OpenAI reviewer calls are allowed. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
 
 ## GitHub Token Permissions
