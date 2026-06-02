@@ -48,10 +48,13 @@ def build_review_prompt(
     changed_files: list[str],
     diff: str,
     architecture_context: dict[str, Any] | str | None = None,
+    *,
+    diff_patches: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the BB/Jarvis Architect review prompt for completed agent work."""
 
     files = "\n".join(f"- {path}" for path in changed_files) if changed_files else "- No files reported"
+    patches = _format_diff_patches(diff_patches or [])
     architecture = architecture_context if architecture_context is not None else "Not provided"
     return (
         "You are BB/Jarvis Architect reviewing completed coding-agent work.\n"
@@ -71,5 +74,26 @@ def build_review_prompt(
         f"Task context:\n{task_context}\n\n"
         f"Changed files:\n{files}\n\n"
         f"Diff:\n{diff}\n\n"
+        f"Diff patches:\n{patches}\n\n"
         f"Architecture context:\n{architecture}"
     )
+
+
+def _format_diff_patches(diff_patches: list[dict[str, Any]]) -> str:
+    if not diff_patches:
+        return "No patch content available; review from summary context only."
+
+    formatted: list[str] = []
+    for patch_info in diff_patches:
+        filename = patch_info.get("filename") or "unknown"
+        status = patch_info.get("status") or "unknown"
+        additions = patch_info.get("additions", 0)
+        deletions = patch_info.get("deletions", 0)
+        patch = patch_info.get("patch") or ""
+        formatted.append(
+            f"### {filename} ({status}, +{additions}/-{deletions})\n"
+            "```diff\n"
+            f"{patch}\n"
+            "```"
+        )
+    return "\n\n".join(formatted)
