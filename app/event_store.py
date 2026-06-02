@@ -6,6 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from app.github_events import GitHubEventType, ParsedGitHubEvent
+from app.review_queue import ReviewQueueCounters
 
 
 class EventRecord(BaseModel):
@@ -25,6 +26,13 @@ class DebugHealth(BaseModel):
     accepted_count: int
     rejected_count: int
     uptime: float
+    review_queue_count: int
+    pending_review_count: int
+    reviewing_count: int
+    needs_changes_count: int
+    approved_count: int
+    approved_for_human_review_count: int
+    blocked_count: int
 
 
 class InMemoryEventStore:
@@ -49,12 +57,18 @@ class InMemoryEventStore:
     def recent_events(self) -> list[EventRecord]:
         return list(reversed(self._records))
 
-    def debug_health(self) -> DebugHealth:
+    def debug_health(
+        self,
+        review_queue_counters: ReviewQueueCounters,
+        accepted_count: int | None = None,
+    ) -> DebugHealth:
+        effective_accepted_count = self.accepted_count if accepted_count is None else accepted_count
         return DebugHealth(
-            webhook_count=self.webhook_count,
-            accepted_count=self.accepted_count,
+            webhook_count=effective_accepted_count + self.rejected_count,
+            accepted_count=effective_accepted_count,
             rejected_count=self.rejected_count,
             uptime=round(monotonic() - self._started_at, 3),
+            **review_queue_counters.model_dump(),
         )
 
     def reset(self) -> None:
