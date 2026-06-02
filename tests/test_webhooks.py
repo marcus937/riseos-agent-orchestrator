@@ -338,7 +338,7 @@ def test_status_done_issue_comment_creates_review_queue_item() -> None:
 def test_status_done_issue_comment_with_commit_line_sets_commit_sha() -> None:
     secret = "test-secret"
     client = client_with_secret(secret)
-    commit_sha = "11ff7f7fad1b5c563e42f143eb9523c3126974cf5"
+    commit_sha = "11ff7f7fad1b5c563e42f143eb9523c3126974cf"
     payload = {
         "action": "created",
         "repository": {"full_name": "riseos/example"},
