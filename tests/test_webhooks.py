@@ -335,6 +335,120 @@ def test_status_done_issue_comment_creates_review_queue_item() -> None:
     assert queue[0]["status"] == "pending_review"
 
 
+def test_status_done_issue_comment_with_commit_line_sets_commit_sha() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    commit_sha = "11ff7f7fad1b5c563e42f143eb9523c3126974cf5"
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "riseos/example"},
+        "issue": {"number": 42},
+        "comment": {"body": f"Status: Done\nCommit: {commit_sha}"},
+        "sender": {"login": "agent"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "issue_comment", body))
+
+    assert response.status_code == 200
+    assert response.json()["commit_sha"] == commit_sha
+    queue = client.get("/debug/review-queue").json()
+    assert queue[0]["commit_sha"] == commit_sha
+    events = client.get("/debug/recent-events").json()
+    assert events[0]["commit_sha"] == commit_sha
+
+
+def test_status_done_issue_comment_with_lowercase_commit_short_sha_sets_commit_sha() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "riseos/example"},
+        "issue": {"number": 42},
+        "comment": {"body": "Status: Done\ncommit: abc1234"},
+        "sender": {"login": "agent"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "issue_comment", body))
+
+    assert response.status_code == 200
+    assert client.get("/debug/review-queue").json()[0]["commit_sha"] == "abc1234"
+
+
+def test_status_done_issue_comment_with_commit_sha_format_sets_commit_sha() -> None:
+    parsed = parse_github_event(
+        "issue_comment",
+        {
+            "action": "created",
+            "repository": {"full_name": "riseos/example"},
+            "issue": {"number": 42},
+            "comment": {"body": "Status: Done\ncommit_sha: deadbee"},
+            "sender": {"login": "agent"},
+        },
+    )
+
+    assert parsed.head_sha == "deadbee"
+
+
+def test_issue_comment_commit_sha_parser_supports_expected_labels() -> None:
+    formats = [
+        ("Commit", "abc1234"),
+        ("commit", "abc1235"),
+        ("SHA", "abc1236"),
+        ("sha", "abc1237"),
+        ("Commit SHA", "abc1238"),
+        ("commit_sha", "abc1239"),
+    ]
+
+    for label, expected_sha in formats:
+        parsed = parse_github_event(
+            "issue_comment",
+            {
+                "action": "created",
+                "repository": {"full_name": "riseos/example"},
+                "issue": {"number": 42},
+                "comment": {"body": f"Status: Done\n{label}: {expected_sha}"},
+                "sender": {"login": "agent"},
+            },
+        )
+        assert parsed.head_sha == expected_sha
+
+
+def test_status_done_issue_comment_without_commit_line_keeps_commit_sha_null() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "riseos/example"},
+        "issue": {"number": 42},
+        "comment": {"body": "Status: Done\nReady for review."},
+        "sender": {"login": "agent"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "issue_comment", body))
+
+    assert response.status_code == 200
+    assert response.json()["commit_sha"] is None
+    assert client.get("/debug/review-queue").json()[0]["commit_sha"] is None
+
+
+def test_status_done_issue_comment_with_invalid_non_hex_commit_is_ignored() -> None:
+    parsed = parse_github_event(
+        "issue_comment",
+        {
+            "action": "created",
+            "repository": {"full_name": "riseos/example"},
+            "issue": {"number": 42},
+            "comment": {"body": "Status: Done\nSHA: not-a-sha"},
+            "sender": {"login": "agent"},
+        },
+    )
+
+    assert parsed.head_sha is None
+
+
 def test_pull_request_opened_creates_review_queue_item() -> None:
     secret = "test-secret"
     client = client_with_secret(secret)
