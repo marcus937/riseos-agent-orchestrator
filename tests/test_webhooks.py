@@ -10,13 +10,18 @@ from app.review_queue import review_queue
 from app.security import build_signature
 
 
-def client_with_secret(secret: str = "test-secret", admin_token: str = "admin-token") -> TestClient:
+def client_with_secret(
+    secret: str = "test-secret",
+    admin_token: str = "admin-token",
+    require_debug_read_token: bool = False,
+) -> TestClient:
     get_settings.cache_clear()
     event_store.reset()
     review_queue.reset()
     app.dependency_overrides[get_settings] = lambda: get_settings().__class__(
         github_webhook_secret=secret,
         orchestrator_admin_token=admin_token,
+        require_admin_token_for_debug_reads=require_debug_read_token,
     )
     return TestClient(app)
 
@@ -88,6 +93,63 @@ def test_debug_health_counts_rejected_webhook() -> None:
     assert debug["pending_review_count"] == 0
     assert debug["approved_count"] == 0
     assert debug["uptime"] >= 0
+
+
+def test_debug_read_endpoints_are_public_when_flag_false() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret, require_debug_read_token=False)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+    item = client.get("/debug/review-queue").json()[0]
+
+    assert client.get("/debug/health").status_code == 200
+    assert client.get("/debug/recent-events").status_code == 200
+    assert client.get("/debug/review-queue").status_code == 200
+    assert client.get(f"/debug/review-queue/{item['id']}").status_code == 200
+
+
+def test_debug_read_endpoints_reject_missing_token_when_flag_true() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret, require_debug_read_token=True)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+
+    assert client.get("/debug/health").status_code == 401
+    assert client.get("/debug/recent-events").status_code == 401
+    assert client.get("/debug/review-queue").status_code == 401
+    assert client.get("/debug/review-queue/missing").status_code == 401
+
+
+def test_debug_read_endpoints_accept_valid_token_when_flag_true() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret, require_debug_read_token=True)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+    headers = {"X-Orchestrator-Admin-Token": "admin-token"}
+    item = client.get("/debug/review-queue", headers=headers).json()[0]
+
+    assert client.get("/debug/health", headers=headers).status_code == 200
+    assert client.get("/debug/recent-events", headers=headers).status_code == 200
+    assert client.get("/debug/review-queue", headers=headers).status_code == 200
+    assert client.get(f"/debug/review-queue/{item['id']}", headers=headers).status_code == 200
 
 
 def test_issue_comment_parser_extracts_context() -> None:
