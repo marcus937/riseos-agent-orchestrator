@@ -1,3 +1,4 @@
+import hmac
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -6,10 +7,25 @@ from app.config import Settings, get_settings
 from app.clients.github import GitHubClient
 from app.event_store import DebugHealth, EventRecord, event_store
 from app.github_context import hydrate_github_context
-from app.github_events import UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
+from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
+from app.operational_logging import (
+    log_github_writeback_result,
+    log_github_writeback_attempted,
+    log_openai_review_attempted,
+    log_openai_review_result,
+    log_queue_item_created,
+    log_review_processing_started,
+    log_webhook_accepted,
+)
 from app.reviewer.openai_review import request_openai_review_decision
-from app.review_queue import ReviewProcessResponse, ReviewWorkItem, process_review_work_item, review_queue
+from app.review_queue import (
+    ReviewProcessResponse,
+    ReviewWorkItem,
+    process_review_work_item,
+    review_queue,
+    review_work_item_from_parsed,
+)
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
 from app.storage import SQLiteStateStore, build_sqlite_store
@@ -20,7 +36,11 @@ app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
 
 @app.on_event("startup")
 async def startup() -> None:
-    app.state.storage = build_sqlite_store(get_settings().orchestrator_db_path)
+    settings = get_settings()
+    app.state.storage = build_sqlite_store(
+        settings.orchestrator_db_path,
+        max_review_items=settings.orchestrator_max_review_items,
+    )
 
 
 def _storage() -> SQLiteStateStore | None:
@@ -68,8 +88,10 @@ async def debug_review_queue_item(item_id: str) -> ReviewWorkItem:
 @app.post("/debug/review-queue/{item_id}/process", response_model=ReviewProcessResponse)
 async def process_debug_review_queue_item(
     item_id: str,
+    x_orchestrator_admin_token: Annotated[str | None, Header(alias="X-Orchestrator-Admin-Token")] = None,
     settings: Settings = Depends(get_settings),
 ) -> ReviewProcessResponse:
+    _require_admin_token(settings, x_orchestrator_admin_token)
     storage = _storage()
     if storage is not None:
         item = storage.get_review_work_item(item_id)
@@ -87,6 +109,7 @@ async def process_debug_review_queue_item(
 
 
 async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
+    log_review_processing_started(item)
     changed_files: list[str] = []
     diff_summary: str | None = None
     github_context_available = False
@@ -110,6 +133,8 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         github_context_available = github_context.github_context_available
         github_context_error = github_context.github_context_error
 
+    if settings.enable_openai_review:
+        log_openai_review_attempted(reviewer_model=settings.openai_review_model)
     openai_review = await request_openai_review_decision(
         item,
         settings,
@@ -117,6 +142,12 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         diff_summary=diff_summary,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
+    )
+    log_openai_review_result(
+        attempted=openai_review.attempted,
+        success=openai_review.success,
+        error=openai_review.error,
+        reviewer_model=openai_review.reviewer_model,
     )
 
     response = process_review_work_item(
@@ -135,6 +166,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     if not settings.enable_github_writeback:
         return response
 
+    log_github_writeback_attempted()
     github_client = GitHubClient(token=settings.github_token)
     try:
         writeback = await writeback_review_decision(response, github_client)
@@ -144,6 +176,11 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     response.github_writeback_attempted = writeback.attempted
     response.github_writeback_success = writeback.success
     response.github_writeback_error = writeback.error
+    log_github_writeback_result(
+        attempted=writeback.attempted,
+        success=writeback.success,
+        error=writeback.error,
+    )
     return response
 
 
@@ -177,12 +214,12 @@ async def github_webhook(
 
     workflow = build_review_workflow(parsed)
     event_record = event_store.record_accepted(parsed)
-    work_item = review_queue.create_from_review_event(parsed, workflow)
+    log_webhook_accepted(parsed)
+    _create_review_work_item(parsed, workflow.review_context is not None, settings)
     storage = _storage()
     if storage is not None:
         storage.save_event_record(event_record)
-        if work_item is not None:
-            storage.save_review_work_item(work_item)
+        storage.prune_processed_review_items(settings.orchestrator_max_review_items)
 
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
@@ -197,3 +234,40 @@ async def github_webhook(
         review_context=workflow.review_context.model_dump(mode="json") if workflow.review_context else None,
         next_intended_action=workflow.next_intended_action,
     )
+
+
+def _require_admin_token(settings: Settings, provided_token: str | None) -> None:
+    if not settings.orchestrator_admin_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ORCHESTRATOR_ADMIN_TOKEN is required before processing review queue items.",
+        )
+    if not provided_token or not hmac.compare_digest(provided_token, settings.orchestrator_admin_token):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid orchestrator admin token")
+
+
+def _create_review_work_item(
+    parsed: ParsedGitHubEvent,
+    has_review_context: bool,
+    settings: Settings,
+) -> ReviewWorkItem | None:
+    if not has_review_context:
+        return None
+
+    item = review_work_item_from_parsed(parsed)
+    storage = _storage()
+    if storage is not None:
+        duplicate = storage.find_pending_duplicate(item)
+        if duplicate is not None:
+            return duplicate
+        storage.save_review_work_item(item)
+        log_queue_item_created(item)
+        return item
+
+    duplicate = review_queue.find_pending_duplicate(item)
+    if duplicate is not None:
+        return duplicate
+    item = review_queue.add_if_absent(item)
+    review_queue.prune_processed(settings.orchestrator_max_review_items)
+    log_queue_item_created(item)
+    return item
