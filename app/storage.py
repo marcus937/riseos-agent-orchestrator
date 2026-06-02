@@ -2,12 +2,13 @@ import sqlite3
 from pathlib import Path
 
 from app.event_store import EventRecord
-from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus
+from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_work_item_identity
 
 
 class SQLiteStateStore:
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, max_review_items: int = 500) -> None:
         self.db_path = Path(db_path)
+        self.max_review_items = max_review_items
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -123,6 +124,39 @@ class SQLiteStateStore:
                     str(item.status),
                 ),
             )
+        self.prune_processed_review_items(self.max_review_items)
+
+    def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
+        repo_full_name, event_type, commit_sha, pr_number, issue_number = review_work_item_identity(item)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM review_work_items
+                WHERE status = ?
+                  AND (repo_full_name IS ? OR repo_full_name = ?)
+                  AND event_type = ?
+                  AND (commit_sha IS ? OR commit_sha = ?)
+                  AND (pr_number IS ? OR pr_number = ?)
+                  AND (issue_number IS ? OR issue_number = ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (
+                    ReviewWorkItemStatus.PENDING_REVIEW.value,
+                    repo_full_name,
+                    repo_full_name,
+                    event_type,
+                    commit_sha,
+                    commit_sha,
+                    pr_number,
+                    pr_number,
+                    issue_number,
+                    issue_number,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._review_work_item_from_row(row)
 
     def list_review_work_items(self) -> list[ReviewWorkItem]:
         with self._connect() as conn:
@@ -162,6 +196,32 @@ class SQLiteStateStore:
             blocked_count=status_counts.get(ReviewWorkItemStatus.BLOCKED.value, 0),
         )
 
+    def prune_processed_review_items(self, max_items: int | None = None) -> int:
+        limit = max_items or self.max_review_items
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM review_work_items").fetchone()
+            overage = int(row["count"]) - limit
+            if overage <= 0:
+                return 0
+            rows = conn.execute(
+                """
+                SELECT id FROM review_work_items
+                WHERE status NOT IN (?, ?)
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (
+                    ReviewWorkItemStatus.PENDING_REVIEW.value,
+                    ReviewWorkItemStatus.REVIEWING.value,
+                    overage,
+                ),
+            ).fetchall()
+            ids = [str(row["id"]) for row in rows]
+            if not ids:
+                return 0
+            conn.executemany("DELETE FROM review_work_items WHERE id = ?", [(item_id,) for item_id in ids])
+        return len(ids)
+
     def _event_record_from_row(self, row: sqlite3.Row) -> EventRecord:
         return EventRecord.model_validate(dict(row))
 
@@ -169,11 +229,11 @@ class SQLiteStateStore:
         return ReviewWorkItem.model_validate(dict(row))
 
 
-def build_sqlite_store(db_path: str | None) -> SQLiteStateStore | None:
+def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> SQLiteStateStore | None:
     if not db_path:
         return None
     try:
-        return SQLiteStateStore(db_path)
+        return SQLiteStateStore(db_path, max_review_items=max_review_items)
     except OSError:
         return None
     except sqlite3.Error:
