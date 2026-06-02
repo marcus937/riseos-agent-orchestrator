@@ -34,6 +34,7 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | `ORCHESTRATOR_DB_PATH` | No | SQLite path for persisted webhook events and review queue items. If unset or unavailable, the service uses in-memory state. |
 | `ORCHESTRATOR_ADMIN_TOKEN` | Process endpoint | Required for `POST /debug/review-queue/{id}/process`. |
 | `ORCHESTRATOR_MAX_REVIEW_ITEMS` | No | Max persisted review queue items. Defaults to `500`; oldest processed items may be pruned. |
+| `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS` | No | Set to `true` to require `X-Orchestrator-Admin-Token` on all `/debug/*` endpoints. Defaults to `false`. |
 
 ## GitHub Token Permissions
 
@@ -145,6 +146,13 @@ List pending and processed work items:
 curl http://localhost:8000/debug/review-queue
 ```
 
+Protected read mode:
+
+```bash
+curl http://localhost:8000/debug/review-queue \
+  -H "X-Orchestrator-Admin-Token: $ORCHESTRATOR_ADMIN_TOKEN"
+```
+
 Inspect one work item:
 
 ```bash
@@ -160,7 +168,7 @@ curl -X POST http://localhost:8000/debug/review-queue/<work-item-id>/process \
 
 The processor temporarily moves `pending_review` items to `reviewing`, then sets a final dry-run status. Missing `repo_full_name`, missing both `commit_sha` and `pr_number`, or unsupported event types become `blocked`. Valid work items become `approved_for_human_review`.
 
-Read-only debug endpoints are public for now. The processing endpoint requires `ORCHESTRATOR_ADMIN_TOKEN`. Duplicate pending queue items are suppressed for the same repo, event type, commit SHA, PR number, and issue number.
+Read-only debug endpoints are public by default for local testing. Set `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true` to require `X-Orchestrator-Admin-Token` for all `/debug/*` routes. The processing endpoint always requires `ORCHESTRATOR_ADMIN_TOKEN`. Duplicate pending queue items are suppressed for the same repo, event type, commit SHA, PR number, and issue number.
 
 By default, processing does not call GitHub or OpenAI. To include read-only GitHub context in the dry-run response, set `ENABLE_GITHUB_CONTEXT_HYDRATION=true` and provide `GITHUB_TOKEN`. Commit work items fetch commit metadata. PR work items compare `BASE_BRANCH` to the work item branch when branch context is available. Hydration never comments, labels, mutates repositories, or merges.
 
