@@ -1,9 +1,33 @@
 import asyncio
+from typing import Any
 
 from pydantic import ValidationError
 
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel, build_review_prompt
 from app.reviewer.openai import OpenAIReviewDisabledError, OpenAIReviewer
+
+
+class FakeOpenAIResponse:
+    status_code = 200
+    text = ""
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "output_text": (
+                '{"decision":"APPROVED_FOR_HUMAN_REVIEW","confidence":0.91,"risk_level":"LOW",'
+                '"summary":"Ready for human review.","required_changes":[],"next_task_prompt":null,'
+                '"human_review_required":true}'
+            )
+        }
+
+
+class FakeOpenAIHTTPClient:
+    def __init__(self) -> None:
+        self.posts: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> FakeOpenAIResponse:
+        self.posts.append({"url": url, **kwargs})
+        return FakeOpenAIResponse()
 
 
 def test_valid_decision_parses() -> None:
@@ -93,12 +117,11 @@ def test_openai_reviewer_does_not_call_when_disabled() -> None:
         raise AssertionError("OpenAIReviewDisabledError was not raised")
 
 
-def test_openai_reviewer_placeholder_requires_future_integration_when_enabled() -> None:
-    reviewer = OpenAIReviewer(api_key="test-key", enabled=True)
+def test_openai_reviewer_accepts_valid_mocked_json_when_enabled() -> None:
+    http_client = FakeOpenAIHTTPClient()
+    reviewer = OpenAIReviewer(api_key="test-key", enabled=True, model="test-model", http_client=http_client)
 
-    try:
-        asyncio.run(reviewer.request_review_decision("prompt"))
-    except NotImplementedError as exc:
-        assert "not implemented" in str(exc)
-    else:
-        raise AssertionError("NotImplementedError was not raised")
+    decision = asyncio.run(reviewer.request_review_decision("prompt"))
+
+    assert decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW
+    assert http_client.posts[0]["json"]["model"] == "test-model"
