@@ -67,7 +67,7 @@ class OpenAIReviewer:
                     "format": {
                         "type": "json_schema",
                         "name": "review_decision",
-                        "schema": ReviewDecision.model_json_schema(),
+                        "schema": review_decision_json_schema(),
                         "strict": True,
                     }
                 },
@@ -129,3 +129,10 @@ def _extract_json_text(payload: dict[str, Any]) -> str | None:
                 return message["content"]
 
     return None
+
+
+def review_decision_json_schema() -> dict[str, Any]:
+    schema = ReviewDecision.model_json_schema()
+    properties = schema.get("properties", {})
+    schema["required"] = list(properties.keys())
+    return schema
