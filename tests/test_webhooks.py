@@ -131,3 +131,26 @@ def test_pull_request_parser_extracts_context() -> None:
     assert parsed.pull_request_number == 9
     assert parsed.head_sha == "feedface"
     assert parsed.labels == ["agent:review-needed"]
+
+
+def test_signed_agent_integration_push_returns_review_stub() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "agent"},
+        "ref": "refs/heads/agent-integration",
+        "after": "abc123",
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "push", body))
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "accepted"
+    assert data["event_accepted"] is True
+    assert data["task_state"] == "review_needed"
+    assert data["repo"] == "riseos/example"
+    assert data["commit_sha"] == "abc123"
+    assert data["review_context"]["trigger"] == "push_agent_integration"
