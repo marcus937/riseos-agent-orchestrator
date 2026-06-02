@@ -71,8 +71,21 @@ class InMemoryReviewQueue:
             return None
 
         item = review_work_item_from_parsed(parsed)
+        return self.add_if_absent(item)
+
+    def add_if_absent(self, item: ReviewWorkItem) -> ReviewWorkItem:
+        duplicate = self.find_pending_duplicate(item)
+        if duplicate is not None:
+            return duplicate
         self._items.append(item)
         return item
+
+    def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
+        identity = review_work_item_identity(item)
+        for existing in self._items:
+            if existing.status == ReviewWorkItemStatus.PENDING_REVIEW and review_work_item_identity(existing) == identity:
+                return existing
+        return None
 
     def list_items(self) -> list[ReviewWorkItem]:
         return list(reversed(self._items))
@@ -105,6 +118,18 @@ class InMemoryReviewQueue:
     def reset(self) -> None:
         self._items.clear()
 
+    def prune_processed(self, max_items: int) -> int:
+        removed = 0
+        while len(self._items) > max_items:
+            for item in list(self._items):
+                if item.status not in {ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}:
+                    self._items.remove(item)
+                    removed += 1
+                    break
+            else:
+                break
+        return removed
+
 
 def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
     return ReviewWorkItem(
@@ -116,6 +141,16 @@ def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
+    )
+
+
+def review_work_item_identity(item: ReviewWorkItem) -> tuple[str | None, str, str | None, int | None, int | None]:
+    return (
+        item.repo_full_name,
+        str(item.event_type),
+        item.commit_sha,
+        item.pr_number,
+        item.issue_number,
     )
 
 
