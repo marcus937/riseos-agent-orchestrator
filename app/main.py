@@ -8,6 +8,7 @@ from app.event_store import DebugHealth, EventRecord, event_store
 from app.github_context import hydrate_github_context
 from app.github_events import UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
+from app.reviewer.openai_review import request_openai_review_decision
 from app.review_queue import ReviewProcessResponse, ReviewWorkItem, process_review_work_item, review_queue
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
@@ -86,8 +87,13 @@ async def process_debug_review_queue_item(
 
 
 async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
+    changed_files: list[str] = []
+    diff_summary: str | None = None
+    github_context_available = False
+    github_context_error: str | None = None
+
     if not settings.enable_github_context_hydration:
-        response = process_review_work_item(item)
+        pass
     else:
         github_client = GitHubClient(token=settings.github_token)
         try:
@@ -99,13 +105,32 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         finally:
             await github_client.aclose()
 
-        response = process_review_work_item(
-            item,
-            changed_files=github_context.changed_files,
-            diff_summary=github_context.diff_summary,
-            github_context_available=github_context.github_context_available,
-            github_context_error=github_context.github_context_error,
-        )
+        changed_files = github_context.changed_files
+        diff_summary = github_context.diff_summary
+        github_context_available = github_context.github_context_available
+        github_context_error = github_context.github_context_error
+
+    openai_review = await request_openai_review_decision(
+        item,
+        settings,
+        changed_files=changed_files,
+        diff_summary=diff_summary,
+        github_context_available=github_context_available,
+        github_context_error=github_context_error,
+    )
+
+    response = process_review_work_item(
+        item,
+        decision=openai_review.decision,
+        changed_files=changed_files,
+        diff_summary=diff_summary,
+        github_context_available=github_context_available,
+        github_context_error=github_context_error,
+        openai_review_attempted=openai_review.attempted,
+        openai_review_success=openai_review.success,
+        openai_review_error=openai_review.error,
+        reviewer_model=openai_review.reviewer_model,
+    )
 
     if not settings.enable_github_writeback:
         return response
