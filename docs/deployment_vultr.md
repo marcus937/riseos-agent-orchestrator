@@ -8,6 +8,7 @@ This guide deploys the FastAPI orchestrator at `https://orchestrator.riseconnect
 - Ubuntu 22.04 or 24.04 is installed.
 - Deployment user is `riseos`.
 - App path is `/opt/riseos-agent-orchestrator`.
+- SQLite state path is `/var/lib/riseos-agent-orchestrator/orchestrator.db`.
 - Uvicorn listens on `127.0.0.1:8010` only.
 - NGINX is the public HTTPS entrypoint.
 
@@ -24,6 +25,7 @@ sudo apt install -y git python3 python3-venv python3-pip nginx certbot python3-c
 sudo useradd --system --create-home --shell /bin/bash riseos || true
 sudo mkdir -p /opt
 sudo chown riseos:riseos /opt
+sudo install -d -m 750 -o riseos -g riseos /var/lib/riseos-agent-orchestrator
 sudo -u riseos git clone https://github.com/marcus937/riseos-agent-orchestrator.git /opt/riseos-agent-orchestrator
 cd /opt/riseos-agent-orchestrator
 sudo -u riseos git checkout agent-integration
@@ -61,11 +63,20 @@ GITHUB_WEBHOOK_SECRET=replace-with-github-webhook-secret
 GITHUB_TOKEN=replace-with-fine-grained-token-if-needed
 OPENAI_API_KEY=
 ENABLE_OPENAI_REVIEW=false
+ENABLE_GITHUB_CONTEXT_HYDRATION=false
+ENABLE_GITHUB_WRITEBACK=false
 WORK_BRANCH=agent-integration
 BASE_BRANCH=main
+ORCHESTRATOR_DB_PATH=/var/lib/riseos-agent-orchestrator/orchestrator.db
 ```
 
 Do not commit real values. `ENABLE_OPENAI_REVIEW=false` keeps the reviewer placeholder from making live OpenAI calls.
+
+`ORCHESTRATOR_DB_PATH` enables SQLite persistence for accepted webhook events and review queue items. The service creates the database file and tables at startup. Keep `/var/lib/riseos-agent-orchestrator` owned by `riseos:riseos` so the systemd service can write there.
+
+`ENABLE_GITHUB_CONTEXT_HYDRATION=false` keeps review processing fully deterministic and offline. Set it to `true` only when `GITHUB_TOKEN` has the read permissions needed for commits and branch comparisons. Hydration remains read-only and does not comment, label, mutate repositories, or merge.
+
+`ENABLE_GITHUB_WRITEBACK=false` prevents production GitHub writes. Set it to `true` only when dry-run review decisions should be posted back as comments and one status label. Writeback remains limited to `post_issue_comment` and `apply_label`; it does not merge, change branches, write repository files, release, or delete anything.
 
 ## 5. Install Systemd Service
 
@@ -75,6 +86,12 @@ sudo cp deploy/riseos-agent-orchestrator.service /etc/systemd/system/riseos-agen
 sudo systemctl daemon-reload
 sudo systemctl enable --now riseos-agent-orchestrator
 sudo systemctl status riseos-agent-orchestrator --no-pager
+```
+
+If the data directory was not created earlier, create it before starting the service:
+
+```bash
+sudo install -d -m 750 -o riseos -g riseos /var/lib/riseos-agent-orchestrator
 ```
 
 Local service check:
@@ -199,6 +216,9 @@ sudo systemctl restart riseos-agent-orchestrator
 ## Safety Notes
 
 - The service must keep `ENABLE_OPENAI_REVIEW=false` until live reviewer calls are intentionally implemented.
+- Keep `ENABLE_GITHUB_CONTEXT_HYDRATION=false` unless read-only GitHub context hydration is intentionally enabled.
+- Keep `ENABLE_GITHUB_WRITEBACK=false` unless comment/label writeback is intentionally enabled.
 - GitHub webhook writes remain disabled by default.
 - No auto-merge behavior is part of this deployment.
+- SQLite writes are limited to `/var/lib/riseos-agent-orchestrator/orchestrator.db`.
 - NGINX exposes only `/health` and `/webhooks/github`; all other paths return 404.
