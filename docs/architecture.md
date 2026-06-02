@@ -12,8 +12,8 @@
 | Signature verifier | Validates `X-Hub-Signature-256` before parsing payloads. |
 | Event parser | Normalizes `issue_comment`, `push`, and `pull_request` payloads. |
 | Task state enum | Defines the lifecycle used by agent orchestration. |
-| GitHub client placeholder | Future wrapper for commit fetch, branch compare, comments, and labels. |
-| OpenAI reviewer placeholder | Future prompt and decision interface. |
+| GitHub client | Supports commit fetch, branch compare, comments, and labels. |
+| OpenAI reviewer placeholder | Builds review prompts and gates future OpenAI review calls. |
 
 ## Task States
 
@@ -25,6 +25,12 @@
 - `approved_for_human_review`
 - `blocked`
 - `done`
+
+## Review Decision Flow
+
+After a coding agent finishes work, the orchestrator builds a BB/Jarvis Architect review prompt from task context, changed files, diff, and architecture context. The expected decision contract includes `decision`, `confidence`, `risk_level`, `summary`, `required_changes`, `next_task_prompt`, and `human_review_required`.
+
+Allowed decisions are `APPROVED_FOR_HUMAN_REVIEW`, `NEEDS_CHANGES`, `BLOCKED`, and `ESCALATE_TO_MARCUS`. Human review is always required before merge. The reviewer placeholder does not call OpenAI unless `OPENAI_API_KEY` is set and `ENABLE_OPENAI_REVIEW=true`; even then, the live OpenAI call remains a future integration.
 
 ## Write Policy
 
@@ -40,4 +46,4 @@ The orchestrator must not merge PRs, push commits, modify branches, or edit repo
 
 ## Runtime Caveats
 
-This MVP does not include durable storage, queue workers, production GitHub App auth, or OpenAI calls. Those belong in later increments after the workflow contract is reviewed.
+This MVP does not include durable storage, queue workers, production GitHub App auth, or live OpenAI calls. Those belong in later increments after the workflow contract is reviewed.
