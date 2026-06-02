@@ -17,6 +17,7 @@ class ReviewDecisionRequester(Protocol):
         task_context: dict[str, object] | str,
         changed_files: list[str],
         diff: str,
+        diff_patches: list[dict[str, object]] | None = None,
         architecture_context: dict[str, object] | str | None = None,
     ) -> str:
         ...
@@ -42,6 +43,8 @@ async def request_openai_review_decision(
     diff_summary: str | None,
     github_context_available: bool,
     github_context_error: str | None,
+    diff_patches: list[dict[str, object]] | None = None,
+    patch_truncated: bool = False,
     reviewer: ReviewDecisionRequester | None = None,
 ) -> OpenAIReviewResult:
     if not settings.enable_openai_review:
@@ -63,10 +66,12 @@ async def request_openai_review_decision(
         enabled=True,
         model=settings.openai_review_model,
     )
-    prompt = reviewer.build_review_prompt(
-        task_context=_task_context(item, github_context_available, github_context_error),
+    prompt = _build_prompt(
+        reviewer,
+        task_context=_task_context(item, github_context_available, github_context_error, patch_truncated),
         changed_files=changed_files,
         diff=diff_summary or "No diff summary available.",
+        diff_patches=diff_patches or [],
         architecture_context=_architecture_context(settings),
     )
     try:
@@ -94,11 +99,45 @@ async def request_openai_review_decision(
     )
 
 
-def _task_context(item: ReviewWorkItem, github_context_available: bool, github_context_error: str | None) -> dict[str, object]:
+def _build_prompt(
+    reviewer: ReviewDecisionRequester,
+    *,
+    task_context: dict[str, object],
+    changed_files: list[str],
+    diff: str,
+    diff_patches: list[dict[str, object]],
+    architecture_context: dict[str, object],
+) -> str:
+    try:
+        return reviewer.build_review_prompt(
+            task_context=task_context,
+            changed_files=changed_files,
+            diff=diff,
+            diff_patches=diff_patches,
+            architecture_context=architecture_context,
+        )
+    except TypeError as exc:
+        if "diff_patches" not in str(exc):
+            raise
+        return reviewer.build_review_prompt(
+            task_context=task_context,
+            changed_files=changed_files,
+            diff=diff,
+            architecture_context=architecture_context,
+        )
+
+
+def _task_context(
+    item: ReviewWorkItem,
+    github_context_available: bool,
+    github_context_error: str | None,
+    patch_truncated: bool,
+) -> dict[str, object]:
     return {
         "review_work_item": item.model_dump(mode="json"),
         "github_context_available": github_context_available,
         "github_context_error": github_context_error,
+        "patch_truncated": patch_truncated,
     }
 
 
