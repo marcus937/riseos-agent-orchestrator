@@ -184,6 +184,40 @@ def test_valid_mocked_openai_json_produces_review_decision() -> None:
     assert result.reviewer_model == "mock-review-model"
 
 
+def test_mocked_openai_json_missing_required_changes_becomes_blocked() -> None:
+    payload = {
+        "output_text": (
+            '{"decision":"APPROVED_FOR_HUMAN_REVIEW","confidence":0.92,"risk_level":"LOW",'
+            '"summary":"Looks ready for Marcus.","next_task_prompt":null,'
+            '"human_review_required":true}'
+        )
+    }
+    reviewer = OpenAIReviewer(
+        api_key="test-key",
+        enabled=True,
+        model="mock-review-model",
+        http_client=FakeHTTPClient(payload),
+    )
+
+    result = run(
+        request_openai_review_decision(
+            _item(),
+            _settings(enabled=True),
+            changed_files=["app/main.py"],
+            diff_summary="commit abc123: 1 changed file(s), +1/-0.",
+            github_context_available=True,
+            github_context_error=None,
+            reviewer=reviewer,
+        )
+    )
+
+    assert result.attempted is True
+    assert result.success is False
+    assert result.decision is not None
+    assert result.decision.decision == "BLOCKED"
+    assert "required_changes" in result.error
+
+
 def test_invalid_mocked_openai_json_becomes_blocked() -> None:
     reviewer = OpenAIReviewer(
         api_key="test-key",
