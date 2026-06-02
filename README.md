@@ -25,8 +25,9 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | `GITHUB_TOKEN` | GitHub client | Token for read/review GitHub API calls. |
 | `GITHUB_APP_ID` | Later | Placeholder for GitHub App authentication. |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Later | Placeholder path for GitHub App private key. |
-| `OPENAI_API_KEY` | Later | Placeholder for reviewer integration. |
-| `ENABLE_OPENAI_REVIEW` | No | Must be `true` before future OpenAI reviewer calls are allowed. |
+| `OPENAI_API_KEY` | OpenAI review | Required only when `ENABLE_OPENAI_REVIEW=true`. |
+| `OPENAI_REVIEW_MODEL` | No | Model for BB/Jarvis Architect review decisions. Defaults to `gpt-5.5-thinking`. |
+| `ENABLE_OPENAI_REVIEW` | No | Set to `true` to request validated OpenAI `ReviewDecision` JSON. Defaults to `false`. |
 | `ENABLE_GITHUB_CONTEXT_HYDRATION` | No | Set to `true` to let dry-run processing fetch read-only commit or compare context from GitHub. Defaults to `false`. |
 | `ENABLE_GITHUB_WRITEBACK` | No | Set to `true` to post dry-run review comments and labels. Defaults to `false`. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
@@ -132,7 +133,7 @@ Example dry-run response shape:
 
 ## Debug Review Queue
 
-Review-needed events create `ReviewWorkItem` records. This queue is for dry-run debugging only. It does not call OpenAI, comment on GitHub, apply labels, mutate repositories, or merge anything.
+Review-needed events create `ReviewWorkItem` records. This queue is dry-run safe by default. It does not call OpenAI, comment on GitHub, apply labels, mutate repositories, or merge anything unless the relevant feature flags are explicitly enabled. Merge, branch, and repository file writes remain out of scope.
 
 When `ORCHESTRATOR_DB_PATH` is set and writable, webhook events and review queue items are also stored in SQLite and reload after service restart. The app creates the DB directory and tables at startup and does not delete existing rows. If the DB path is unset or cannot initialize, the service falls back to in-memory state.
 
@@ -156,7 +157,9 @@ curl -X POST http://localhost:8000/debug/review-queue/<work-item-id>/process
 
 The processor temporarily moves `pending_review` items to `reviewing`, then sets a final dry-run status. Missing `repo_full_name`, missing both `commit_sha` and `pr_number`, or unsupported event types become `blocked`. Valid work items become `approved_for_human_review`.
 
-By default, processing does not call GitHub. To include read-only GitHub context in the dry-run response, set `ENABLE_GITHUB_CONTEXT_HYDRATION=true` and provide `GITHUB_TOKEN`. Commit work items fetch commit metadata. PR work items compare `BASE_BRANCH` to the work item branch when branch context is available. Hydration never comments, labels, mutates repositories, or merges.
+By default, processing does not call GitHub or OpenAI. To include read-only GitHub context in the dry-run response, set `ENABLE_GITHUB_CONTEXT_HYDRATION=true` and provide `GITHUB_TOKEN`. Commit work items fetch commit metadata. PR work items compare `BASE_BRANCH` to the work item branch when branch context is available. Hydration never comments, labels, mutates repositories, or merges.
+
+OpenAI BB/Jarvis Architect review generation is disabled by default. When `ENABLE_OPENAI_REVIEW=true`, `OPENAI_API_KEY` is required and the processor asks `OPENAI_REVIEW_MODEL` for structured JSON matching `ReviewDecision`. The prompt includes the work item, changed files, diff summary, hydrated GitHub context, branch policy, no-auto-merge policy, and the human approval boundary. Invalid or unvalidated model output becomes a `BLOCKED` dry-run decision with `openai_review_error`.
 
 GitHub writeback is also disabled by default. When `ENABLE_GITHUB_WRITEBACK=true`, processing may call only `post_issue_comment` and `apply_label`. The comment target is the PR number when present, otherwise the issue number. If no issue or PR number is available, writeback is skipped and `github_writeback_error` explains why. Labels map to the structured decision: `agent-approved-human-review`, `agent-needs-changes`, `agent-blocked`, or `agent-escalate-marcus`.
 
@@ -198,6 +201,31 @@ Example process response:
   "github_writeback_attempted": false,
   "github_writeback_success": false,
   "github_writeback_error": null,
+  "openai_review_attempted": false,
+  "openai_review_success": false,
+  "openai_review_error": null,
+  "reviewer_model": null,
+  "dry_run": true
+}
+```
+
+Example OpenAI review decision response when `ENABLE_OPENAI_REVIEW=true` and the model output validates:
+
+```json
+{
+  "decision": {
+    "decision": "NEEDS_CHANGES",
+    "confidence": 0.86,
+    "risk_level": "MEDIUM",
+    "summary": "One test is missing.",
+    "required_changes": ["Add coverage for the processor."],
+    "next_task_prompt": "Add the missing processor test.",
+    "human_review_required": true
+  },
+  "openai_review_attempted": true,
+  "openai_review_success": true,
+  "openai_review_error": null,
+  "reviewer_model": "gpt-5.5-thinking",
   "dry_run": true
 }
 ```
@@ -234,4 +262,4 @@ True
 
 Deploy behind HTTPS. Configure the GitHub webhook secret in the hosting secret manager. Point GitHub webhooks at `POST /webhooks/github`. Keep GitHub App credentials and OpenAI credentials in managed secrets only.
 
-For the MVP, the service should only comment on issues/PRs or apply labels after future integrations are implemented. Human review remains required for merges.
+For the MVP, enabled GitHub writeback may only comment on issues/PRs or apply labels. Human review remains required for merges.
