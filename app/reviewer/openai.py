@@ -42,9 +42,10 @@ class OpenAIReviewer:
         task_context: dict[str, Any] | str,
         changed_files: list[str],
         diff: str,
+        diff_patches: list[dict[str, Any]] | None = None,
         architecture_context: dict[str, Any] | str | None = None,
     ) -> str:
-        return build_review_prompt(task_context, changed_files, diff, architecture_context)
+        return build_review_prompt(task_context, changed_files, diff, architecture_context, diff_patches=diff_patches)
 
     async def request_review_decision(self, prompt: str) -> ReviewDecision:
         if not self.enabled:
