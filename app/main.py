@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
 from app.github_events import UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
+from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
 
 
@@ -39,8 +40,18 @@ async def github_webhook(
     except UnsupportedGitHubEventError as exc:
         raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail=str(exc)) from exc
 
+    workflow = build_review_workflow(parsed)
+
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
         repository=parsed.repository,
+        repo=workflow.repo,
         action=parsed.action,
+        event_accepted=workflow.event_accepted,
+        task_state=workflow.task_state.value,
+        issue_number=workflow.issue_number,
+        pull_request_number=workflow.pull_request_number,
+        commit_sha=workflow.commit_sha,
+        review_context=workflow.review_context.model_dump(mode="json") if workflow.review_context else None,
+        next_intended_action=workflow.next_intended_action,
     )
