@@ -15,6 +15,7 @@ class Settings:
     enable_openai_review: bool = False
     orchestrator_db_path: str | None = None
     enable_github_context_hydration: bool = False
+    enable_github_writeback: bool = False
     work_branch: str = "agent-integration"
     base_branch: str = "main"
 
@@ -31,6 +32,7 @@ def get_settings() -> Settings:
         enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
         orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
+        enable_github_writeback=os.getenv("ENABLE_GITHUB_WRITEBACK", "").lower() == "true",
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
     )
