@@ -38,6 +38,9 @@ class ReviewProcessResponse(BaseModel):
     diff_summary: str | None = None
     github_context_available: bool = False
     github_context_error: str | None = None
+    github_writeback_attempted: bool = False
+    github_writeback_success: bool = False
+    github_writeback_error: str | None = None
     dry_run: bool = True
 
 
@@ -151,6 +154,9 @@ def process_review_work_item(
     diff_summary: str | None = None,
     github_context_available: bool = False,
     github_context_error: str | None = None,
+    github_writeback_attempted: bool = False,
+    github_writeback_success: bool = False,
+    github_writeback_error: str | None = None,
 ) -> ReviewProcessResponse:
     if item.status == ReviewWorkItemStatus.PENDING_REVIEW:
         item.status = ReviewWorkItemStatus.REVIEWING
@@ -165,6 +171,9 @@ def process_review_work_item(
         diff_summary=diff_summary,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
+        github_writeback_attempted=github_writeback_attempted,
+        github_writeback_success=github_writeback_success,
+        github_writeback_error=github_writeback_error,
         dry_run=True,
     )
 
