@@ -4,7 +4,7 @@
 
 The orchestrator is default-safe. GitHub context hydration, OpenAI review, and GitHub writeback are disabled unless their feature flags are set. Auto-merge, branch mutation, repository file writes, releases, and deletes are out of scope.
 
-Read-only debug endpoints are public for now:
+Read-only debug endpoints are public by default when `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=false`:
 
 - `GET /debug/health`
 - `GET /debug/recent-events`
@@ -17,6 +17,15 @@ Processing is protected:
 curl -X POST "https://orchestrator.riseconnect.us/debug/review-queue/<work-item-id>/process" \
   -H "X-Orchestrator-Admin-Token: $ORCHESTRATOR_ADMIN_TOKEN"
 ```
+
+Protected debug read mode:
+
+```bash
+curl "https://orchestrator.riseconnect.us/debug/health" \
+  -H "X-Orchestrator-Admin-Token: $ORCHESTRATOR_ADMIN_TOKEN"
+```
+
+Set `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true` to require this header on every `/debug/*` endpoint. The process endpoint always requires the header regardless of the flag.
 
 ## Restart
 
@@ -67,6 +76,7 @@ Duplicate pending work items are suppressed for the same repo, event type, commi
 | `ENABLE_GITHUB_CONTEXT_HYDRATION` | `false` | Fetches read-only commit or branch comparison context. |
 | `ENABLE_OPENAI_REVIEW` | `false` | Requests validated OpenAI `ReviewDecision` JSON. Requires `OPENAI_API_KEY`. |
 | `ENABLE_GITHUB_WRITEBACK` | `false` | Posts a comment and one label after processing. Requires GitHub token permissions. |
+| `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS` | `false` | Requires `X-Orchestrator-Admin-Token` on read-only `/debug/*` routes. |
 
 `ENABLE_GITHUB_WRITEBACK=true` is the only flag that enables GitHub writes, and those writes remain limited to issue/PR comments and labels.
 
