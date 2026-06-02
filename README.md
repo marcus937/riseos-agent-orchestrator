@@ -29,10 +29,23 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 
 ## Local Run
 
+Install dependencies:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+```
+
+Run tests:
+
+```bash
+pytest
+```
+
+Start the dev server:
+
+```bash
 export GITHUB_WEBHOOK_SECRET='dev-secret'
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
