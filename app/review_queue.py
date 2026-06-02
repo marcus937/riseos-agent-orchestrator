@@ -36,6 +36,8 @@ class ReviewProcessResponse(BaseModel):
     intended_next_actions: list[str]
     changed_files: list[str] = Field(default_factory=list)
     diff_summary: str | None = None
+    diff_patches: list[dict[str, object]] = Field(default_factory=list)
+    patch_truncated: bool = False
     github_context_available: bool = False
     github_context_error: str | None = None
     github_writeback_attempted: bool = False
@@ -192,6 +194,8 @@ def process_review_work_item(
     decision: ReviewDecision | None = None,
     changed_files: list[str] | None = None,
     diff_summary: str | None = None,
+    diff_patches: list[dict[str, object]] | None = None,
+    patch_truncated: bool = False,
     github_context_available: bool = False,
     github_context_error: str | None = None,
     github_writeback_attempted: bool = False,
@@ -213,6 +217,8 @@ def process_review_work_item(
         intended_next_actions=_intended_next_actions(decision),
         changed_files=changed_files or [],
         diff_summary=diff_summary,
+        diff_patches=diff_patches or [],
+        patch_truncated=patch_truncated,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
         github_writeback_attempted=github_writeback_attempted,
