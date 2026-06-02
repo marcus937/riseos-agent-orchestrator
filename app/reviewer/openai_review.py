@@ -3,6 +3,7 @@ from typing import Protocol
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.reviewer.context_loader import load_bb_architect_context
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel
 from app.reviewer.openai import OpenAIReviewer
 from app.review_queue import ReviewWorkItem
@@ -72,7 +73,7 @@ async def request_openai_review_decision(
         changed_files=changed_files,
         diff=diff_summary or "No diff summary available.",
         diff_patches=diff_patches or [],
-        architecture_context=_architecture_context(settings),
+        architecture_context=_architecture_context(item, settings),
     )
     try:
         decision = await reviewer.request_review_decision(prompt)
@@ -141,8 +142,8 @@ def _task_context(
     }
 
 
-def _architecture_context(settings: Settings) -> dict[str, object]:
-    return {
+def _architecture_context(item: ReviewWorkItem, settings: Settings) -> dict[str, object]:
+    context: dict[str, object] = {
         "work_branch": settings.work_branch,
         "base_branch": settings.base_branch,
         "branch_policy": f"Use {settings.work_branch} only for agent work. Do not change branches.",
@@ -150,6 +151,12 @@ def _architecture_context(settings: Settings) -> dict[str, object]:
         "production_write_policy": "Do not write files to repositories or mutate branches.",
         "human_approval_boundary": "Human approval is required before any merge.",
     }
+    if settings.enable_bb_context_pack:
+        context["bb_architect_context"] = load_bb_architect_context(
+            item.repo_full_name,
+            max_chars=settings.bb_context_max_chars,
+        )
+    return context
 
 
 def _blocked_decision(error: str) -> ReviewDecision:
