@@ -47,13 +47,24 @@ def _storage() -> SQLiteStateStore | None:
     return getattr(app.state, "storage", None)
 
 
+def _require_debug_read_access(
+    x_orchestrator_admin_token: Annotated[str | None, Header(alias="X-Orchestrator-Admin-Token")] = None,
+    settings: Settings = Depends(get_settings),
+) -> None:
+    if not settings.require_admin_token_for_debug_reads:
+        return
+    _require_admin_token(settings, x_orchestrator_admin_token)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/debug/recent-events", response_model=list[EventRecord])
-async def recent_events() -> list[EventRecord]:
+async def recent_events(
+    _: None = Depends(_require_debug_read_access),
+) -> list[EventRecord]:
     storage = _storage()
     if storage is not None:
         return storage.recent_events()
@@ -61,7 +72,9 @@ async def recent_events() -> list[EventRecord]:
 
 
 @app.get("/debug/health", response_model=DebugHealth)
-async def debug_health() -> DebugHealth:
+async def debug_health(
+    _: None = Depends(_require_debug_read_access),
+) -> DebugHealth:
     storage = _storage()
     if storage is not None:
         return event_store.debug_health(storage.review_queue_counters(), accepted_count=storage.event_count())
@@ -69,7 +82,9 @@ async def debug_health() -> DebugHealth:
 
 
 @app.get("/debug/review-queue", response_model=list[ReviewWorkItem])
-async def debug_review_queue() -> list[ReviewWorkItem]:
+async def debug_review_queue(
+    _: None = Depends(_require_debug_read_access),
+) -> list[ReviewWorkItem]:
     storage = _storage()
     if storage is not None:
         return storage.list_review_work_items()
@@ -77,7 +92,10 @@ async def debug_review_queue() -> list[ReviewWorkItem]:
 
 
 @app.get("/debug/review-queue/{item_id}", response_model=ReviewWorkItem)
-async def debug_review_queue_item(item_id: str) -> ReviewWorkItem:
+async def debug_review_queue_item(
+    item_id: str,
+    _: None = Depends(_require_debug_read_access),
+) -> ReviewWorkItem:
     storage = _storage()
     item = storage.get_review_work_item(item_id) if storage is not None else review_queue.get_item(item_id)
     if item is None:
@@ -215,7 +233,7 @@ async def github_webhook(
     workflow = build_review_workflow(parsed)
     event_record = event_store.record_accepted(parsed)
     log_webhook_accepted(parsed)
-    _create_review_work_item(parsed, workflow.review_context is not None, settings)
+    work_item = _create_review_work_item(parsed, workflow.review_context is not None, settings)
     storage = _storage()
     if storage is not None:
         storage.save_event_record(event_record)
