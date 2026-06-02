@@ -33,8 +33,8 @@ class UnsupportedGitHubEventError(ValueError):
     pass
 
 
-COMMIT_SHA_PATTERN = re.compile(
-    r"(?im)^\s*(?:commit(?:[\s_-]+sha)?|sha)\s*:\s*([0-9a-f]{7,40})\b"
+COMMENT_COMMIT_SHA_PATTERN = re.compile(
+    r"(?im)^\s*(?:commit(?:[\s_-]+sha)?|sha)\s*:\s*([0-9a-f]{7,40})"
 )
 
 
@@ -74,7 +74,7 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
             pull_request_number=issue.get("number") if issue.get("pull_request") else None,
             labels=[str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")],
             comment_body=comment_body,
-            head_sha=_extract_commit_sha(comment_body),
+            head_sha=extract_commit_sha_from_comment(comment_body),
         )
 
     if event_type == GitHubEventType.PUSH:
@@ -98,10 +98,10 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     )
 
 
-def _extract_commit_sha(body: str | None) -> str | None:
+def extract_commit_sha_from_comment(body: str | None) -> str | None:
     if not body:
         return None
-    match = COMMIT_SHA_PATTERN.search(body)
+    match = COMMENT_COMMIT_SHA_PATTERN.search(body)
     return match.group(1) if match else None
 
 
