@@ -25,8 +25,8 @@ class ReviewDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     risk_level: RiskLevel
     summary: str
-    required_changes: list[str] = Field(default_factory=list)
-    next_task_prompt: str | None = None
+    required_changes: list[str]
+    next_task_prompt: str | None
     human_review_required: bool
 
     @field_validator("summary")
