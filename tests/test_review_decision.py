@@ -4,7 +4,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel, build_review_prompt
-from app.reviewer.openai import OpenAIReviewDisabledError, OpenAIReviewer
+from app.reviewer.openai import OpenAIReviewDisabledError, OpenAIReviewer, review_decision_json_schema
 
 
 class FakeOpenAIResponse:
@@ -46,6 +46,36 @@ def test_valid_decision_parses() -> None:
     assert decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW
     assert decision.risk_level == RiskLevel.LOW
     assert decision.human_review_required is True
+
+
+def test_required_changes_is_required() -> None:
+    try:
+        ReviewDecision.model_validate(
+            {
+                "decision": "APPROVED_FOR_HUMAN_REVIEW",
+                "confidence": 0.82,
+                "risk_level": "LOW",
+                "summary": "Ready for Marcus to review.",
+                "next_task_prompt": None,
+                "human_review_required": True,
+            }
+        )
+    except ValidationError as exc:
+        assert "required_changes" in str(exc)
+    else:
+        raise AssertionError("ValidationError was not raised")
+
+
+def test_response_format_schema_requires_every_property() -> None:
+    schema = review_decision_json_schema()
+    properties = schema["properties"]
+    required = set(schema["required"])
+
+    assert required == set(properties)
+    assert "required_changes" in required
+    assert properties["required_changes"]["type"] == "array"
+    assert "next_task_prompt" in required
+    assert {"type": "null"} in properties["next_task_prompt"]["anyOf"]
 
 
 def test_invalid_decision_is_rejected() -> None:
@@ -125,3 +155,5 @@ def test_openai_reviewer_accepts_valid_mocked_json_when_enabled() -> None:
 
     assert decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW
     assert http_client.posts[0]["json"]["model"] == "test-model"
+    schema = http_client.posts[0]["json"]["text"]["format"]["schema"]
+    assert set(schema["required"]) == set(schema["properties"])
