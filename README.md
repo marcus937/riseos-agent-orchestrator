@@ -88,6 +88,38 @@ PY
 
 Send the payload with `X-GitHub-Event: issue_comment` and the generated `X-Hub-Signature-256` header.
 
+
+## Webhook Dry-Run Review Behavior
+
+The webhook endpoint accepts supported GitHub events and returns a dry-run review stub when review is needed. It does not call GitHub live, merge, write files, or change branches.
+
+Review-needed triggers:
+
+- `push` to `refs/heads/agent-integration` returns `task_state: review_needed` with the pushed commit SHA.
+- `issue_comment` containing `Status: Done` returns `task_state: review_needed` with the issue number.
+- `pull_request` with action `opened` or `synchronize` from `agent-integration` returns `task_state: review_needed` with the PR number and head SHA.
+
+Example dry-run response shape:
+
+```json
+{
+  "status": "accepted",
+  "event_accepted": true,
+  "event_type": "push",
+  "repository": "marcus937/riseos-agent-orchestrator",
+  "repo": "marcus937/riseos-agent-orchestrator",
+  "task_state": "review_needed",
+  "commit_sha": "abc123",
+  "review_context": {
+    "repo": "marcus937/riseos-agent-orchestrator",
+    "commit_sha": "abc123",
+    "event_type": "push",
+    "trigger": "push_agent_integration"
+  },
+  "next_intended_action": "Build review prompt and prepare BB/Jarvis Architect review stub."
+}
+```
+
 ## Deployment Notes
 
 Deploy behind HTTPS. Configure the GitHub webhook secret in the hosting secret manager. Point GitHub webhooks at `POST /webhooks/github`. Keep GitHub App credentials and OpenAI credentials in managed secrets only.
