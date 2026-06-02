@@ -1,3 +1,4 @@
+import re
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -32,6 +33,11 @@ class UnsupportedGitHubEventError(ValueError):
     pass
 
 
+COMMIT_SHA_PATTERN = re.compile(
+    r"(?im)^\s*(?:commit(?:[\s_-]+sha)?|sha)\s*:\s*([0-9a-f]{7,40})\b"
+)
+
+
 def _repo_name(payload: dict[str, Any]) -> str | None:
     repo = payload.get("repository") or {}
     full_name = repo.get("full_name")
@@ -61,12 +67,14 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     if event_type == GitHubEventType.ISSUE_COMMENT:
         issue = payload.get("issue") or {}
         labels = issue.get("labels") or []
+        comment_body = (payload.get("comment") or {}).get("body")
         return ParsedGitHubEvent(
             **base,
             issue_number=issue.get("number"),
             pull_request_number=issue.get("number") if issue.get("pull_request") else None,
             labels=[str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")],
-            comment_body=(payload.get("comment") or {}).get("body"),
+            comment_body=comment_body,
+            head_sha=_extract_commit_sha(comment_body),
         )
 
     if event_type == GitHubEventType.PUSH:
@@ -88,6 +96,13 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
         base_ref=(pull_request.get("base") or {}).get("ref"),
         labels=[str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")],
     )
+
+
+def _extract_commit_sha(body: str | None) -> str | None:
+    if not body:
+        return None
+    match = COMMIT_SHA_PATTERN.search(body)
+    return match.group(1) if match else None
 
 
 class WebhookAcceptedResponse(BaseModel):
