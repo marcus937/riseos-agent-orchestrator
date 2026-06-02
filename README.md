@@ -32,6 +32,8 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | `ENABLE_GITHUB_WRITEBACK` | No | Set to `true` to post dry-run review comments and labels. Defaults to `false`. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
 | `ORCHESTRATOR_DB_PATH` | No | SQLite path for persisted webhook events and review queue items. If unset or unavailable, the service uses in-memory state. |
+| `ORCHESTRATOR_ADMIN_TOKEN` | Process endpoint | Required for `POST /debug/review-queue/{id}/process`. |
+| `ORCHESTRATOR_MAX_REVIEW_ITEMS` | No | Max persisted review queue items. Defaults to `500`; oldest processed items may be pruned. |
 
 ## GitHub Token Permissions
 
@@ -152,10 +154,13 @@ curl http://localhost:8000/debug/review-queue/<work-item-id>
 Process one work item in dry-run mode:
 
 ```bash
-curl -X POST http://localhost:8000/debug/review-queue/<work-item-id>/process
+curl -X POST http://localhost:8000/debug/review-queue/<work-item-id>/process \
+  -H "X-Orchestrator-Admin-Token: $ORCHESTRATOR_ADMIN_TOKEN"
 ```
 
 The processor temporarily moves `pending_review` items to `reviewing`, then sets a final dry-run status. Missing `repo_full_name`, missing both `commit_sha` and `pr_number`, or unsupported event types become `blocked`. Valid work items become `approved_for_human_review`.
+
+Read-only debug endpoints are public for now. The processing endpoint requires `ORCHESTRATOR_ADMIN_TOKEN`. Duplicate pending queue items are suppressed for the same repo, event type, commit SHA, PR number, and issue number.
 
 By default, processing does not call GitHub or OpenAI. To include read-only GitHub context in the dry-run response, set `ENABLE_GITHUB_CONTEXT_HYDRATION=true` and provide `GITHUB_TOKEN`. Commit work items fetch commit metadata. PR work items compare `BASE_BRANCH` to the work item branch when branch context is available. Hydration never comments, labels, mutates repositories, or merges.
 
