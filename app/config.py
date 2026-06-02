@@ -17,6 +17,7 @@ class Settings:
     orchestrator_db_path: str | None = None
     orchestrator_admin_token: str | None = None
     orchestrator_max_review_items: int = 500
+    require_admin_token_for_debug_reads: bool = False
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     work_branch: str = "agent-integration"
@@ -37,6 +38,7 @@ def get_settings() -> Settings:
         orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
         orchestrator_admin_token=os.getenv("ORCHESTRATOR_ADMIN_TOKEN"),
         orchestrator_max_review_items=_int_env("ORCHESTRATOR_MAX_REVIEW_ITEMS", 500),
+        require_admin_token_for_debug_reads=os.getenv("REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS", "").lower() == "true",
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
         enable_github_writeback=os.getenv("ENABLE_GITHUB_WRITEBACK", "").lower() == "true",
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
