@@ -136,6 +136,30 @@ def test_prompt_includes_task_files_diff_and_guardrails() -> None:
     assert "ESCALATE_TO_MARCUS" in prompt
 
 
+def test_prompt_includes_diff_patch_content() -> None:
+    prompt = build_review_prompt(
+        task_context={"repo": "riseos-agent-orchestrator"},
+        changed_files=["tests/test_webhooks.py"],
+        diff="commit abc123: 1 changed file(s), +1/-1.",
+        architecture_context="Human approval required before merge.",
+        diff_patches=[
+            {
+                "filename": "tests/test_webhooks.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -338,7 +338,7 @@\n-old\n+new",
+            }
+        ],
+    )
+
+    assert "Diff patches:" in prompt
+    assert "tests/test_webhooks.py (modified, +1/-1)" in prompt
+    assert "@@ -338,7 +338,7 @@" in prompt
+    assert "-old" in prompt
+    assert "+new" in prompt
+
+
 def test_openai_reviewer_does_not_call_when_disabled() -> None:
     reviewer = OpenAIReviewer(api_key="test-key", enabled=False)
 
