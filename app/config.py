@@ -15,6 +15,8 @@ class Settings:
     openai_review_model: str = "gpt-5.5-thinking"
     enable_openai_review: bool = False
     orchestrator_db_path: str | None = None
+    orchestrator_admin_token: str | None = None
+    orchestrator_max_review_items: int = 500
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     work_branch: str = "agent-integration"
@@ -33,8 +35,21 @@ def get_settings() -> Settings:
         openai_review_model=os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.5-thinking"),
         enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
         orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
+        orchestrator_admin_token=os.getenv("ORCHESTRATOR_ADMIN_TOKEN"),
+        orchestrator_max_review_items=_int_env("ORCHESTRATOR_MAX_REVIEW_ITEMS", 500),
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
         enable_github_writeback=os.getenv("ENABLE_GITHUB_WRITEBACK", "").lower() == "true",
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
     )
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
