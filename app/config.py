@@ -12,6 +12,7 @@ class Settings:
     github_app_id: str | None = None
     github_app_private_key_path: str | None = None
     openai_api_key: str | None = None
+    enable_openai_review: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -23,4 +24,5 @@ def get_settings() -> Settings:
         github_app_id=os.getenv("GITHUB_APP_ID"),
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
+        enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
     )
