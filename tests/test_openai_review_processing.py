@@ -28,9 +28,10 @@ class FakeReviewer:
         task_context: dict[str, object] | str,
         changed_files: list[str],
         diff: str,
+        diff_patches: list[dict[str, object]] | None = None,
         architecture_context: dict[str, object] | str | None = None,
     ) -> str:
-        prompt = f"{task_context}\n{changed_files}\n{diff}\n{architecture_context}"
+        prompt = f"{task_context}\n{changed_files}\n{diff}\n{diff_patches}\n{architecture_context}"
         self.prompts.append(prompt)
         return prompt
 
@@ -172,6 +173,15 @@ def test_valid_mocked_openai_json_produces_review_decision() -> None:
             _settings(enabled=True),
             changed_files=["app/main.py"],
             diff_summary="commit abc123: 1 changed file(s), +1/-0.",
+            diff_patches=[
+                {
+                    "filename": "app/main.py",
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 0,
+                    "patch": "@@ -1 +1 @@\n-old\n+new",
+                }
+            ],
             github_context_available=True,
             github_context_error=None,
             reviewer=reviewer,
@@ -182,6 +192,37 @@ def test_valid_mocked_openai_json_produces_review_decision() -> None:
     assert result.decision is not None
     assert result.decision.decision == "APPROVED_FOR_HUMAN_REVIEW"
     assert result.reviewer_model == "mock-review-model"
+
+
+def test_openai_prompt_includes_patch_content() -> None:
+    reviewer = FakeReviewer(decision=_needs_changes_decision())
+
+    result = run(
+        request_openai_review_decision(
+            _item(),
+            _settings(enabled=True),
+            changed_files=["tests/test_webhooks.py"],
+            diff_summary="commit abc123: 1 changed file(s), +1/-1.",
+            diff_patches=[
+                {
+                    "filename": "tests/test_webhooks.py",
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 1,
+                    "patch": "@@ -338,7 +338,7 @@\n-old\n+new",
+                }
+            ],
+            patch_truncated=True,
+            github_context_available=True,
+            github_context_error=None,
+            reviewer=reviewer,
+        )
+    )
+
+    assert result.success is True
+    assert "tests/test_webhooks.py" in reviewer.prompts[0]
+    assert "@@ -338,7 +338,7 @@" in reviewer.prompts[0]
+    assert "patch_truncated" in reviewer.prompts[0]
 
 
 def test_mocked_openai_json_missing_required_changes_becomes_blocked() -> None:
