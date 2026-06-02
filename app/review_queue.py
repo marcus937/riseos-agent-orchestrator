@@ -41,6 +41,10 @@ class ReviewProcessResponse(BaseModel):
     github_writeback_attempted: bool = False
     github_writeback_success: bool = False
     github_writeback_error: str | None = None
+    openai_review_attempted: bool = False
+    openai_review_success: bool = False
+    openai_review_error: str | None = None
+    reviewer_model: str | None = None
     dry_run: bool = True
 
 
@@ -150,6 +154,7 @@ def build_dry_run_review_decision(item: ReviewWorkItem) -> ReviewDecision:
 def process_review_work_item(
     item: ReviewWorkItem,
     *,
+    decision: ReviewDecision | None = None,
     changed_files: list[str] | None = None,
     diff_summary: str | None = None,
     github_context_available: bool = False,
@@ -157,11 +162,15 @@ def process_review_work_item(
     github_writeback_attempted: bool = False,
     github_writeback_success: bool = False,
     github_writeback_error: str | None = None,
+    openai_review_attempted: bool = False,
+    openai_review_success: bool = False,
+    openai_review_error: str | None = None,
+    reviewer_model: str | None = None,
 ) -> ReviewProcessResponse:
     if item.status == ReviewWorkItemStatus.PENDING_REVIEW:
         item.status = ReviewWorkItemStatus.REVIEWING
 
-    decision = build_dry_run_review_decision(item)
+    decision = decision or build_dry_run_review_decision(item)
     item.status = _status_from_decision(decision)
     return ReviewProcessResponse(
         work_item=item,
@@ -174,6 +183,10 @@ def process_review_work_item(
         github_writeback_attempted=github_writeback_attempted,
         github_writeback_success=github_writeback_success,
         github_writeback_error=github_writeback_error,
+        openai_review_attempted=openai_review_attempted,
+        openai_review_success=openai_review_success,
+        openai_review_error=openai_review_error,
+        reviewer_model=reviewer_model,
         dry_run=True,
     )
 
