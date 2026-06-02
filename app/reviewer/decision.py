@@ -55,7 +55,8 @@ def build_review_prompt(
 
     files = "\n".join(f"- {path}" for path in changed_files) if changed_files else "- No files reported"
     patches = _format_diff_patches(diff_patches or [])
-    architecture = architecture_context if architecture_context is not None else "Not provided"
+    bb_context = _extract_bb_context(architecture_context)
+    architecture = _format_architecture_context(architecture_context)
     return (
         "You are BB/Jarvis Architect reviewing completed coding-agent work.\n"
         "Return one structured review decision only.\n\n"
@@ -66,17 +67,38 @@ def build_review_prompt(
         "- ESCALATE_TO_MARCUS\n\n"
         "Required fields: decision, confidence, risk_level, summary, required_changes, "
         "next_task_prompt, human_review_required.\n\n"
-        "Guardrails:\n"
+        f"{bb_context}"
+        "Safety guardrails:\n"
         "- No auto-merge.\n"
         "- No production writes.\n"
         "- No branch changes.\n"
-        "- Human approval is required before merge.\n\n"
+        "- Do not approve changes that violate secrets, service ownership, branch mutation, "
+        "or production-write rules.\n"
+        "- If context is insufficient, request changes instead of guessing.\n\n"
+        "Human approval boundary:\n"
+        "- Human approval is required before merge.\n"
+        "- Your decision may approve work for human review only; it must not merge or imply merge authority.\n\n"
         f"Task context:\n{task_context}\n\n"
         f"Changed files:\n{files}\n\n"
-        f"Diff:\n{diff}\n\n"
+        f"Diff summary:\n{diff}\n\n"
         f"Diff patches:\n{patches}\n\n"
         f"Architecture context:\n{architecture}"
     )
+
+
+def _extract_bb_context(architecture_context: dict[str, Any] | str | None) -> str:
+    if not isinstance(architecture_context, dict):
+        return ""
+    context_pack = architecture_context.get("bb_architect_context")
+    if not isinstance(context_pack, str) or not context_pack.strip():
+        return ""
+    return f"BB architect context:\n{context_pack}\n\n"
+
+
+def _format_architecture_context(architecture_context: dict[str, Any] | str | None) -> dict[str, Any] | str:
+    if not isinstance(architecture_context, dict):
+        return architecture_context if architecture_context is not None else "Not provided"
+    return {key: value for key, value in architecture_context.items() if key != "bb_architect_context"}
 
 
 def _format_diff_patches(diff_patches: list[dict[str, Any]]) -> str:
