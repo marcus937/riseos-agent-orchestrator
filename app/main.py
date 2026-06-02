@@ -130,6 +130,8 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     log_review_processing_started(item)
     changed_files: list[str] = []
     diff_summary: str | None = None
+    diff_patches: list[dict[str, object]] = []
+    patch_truncated = False
     github_context_available = False
     github_context_error: str | None = None
 
@@ -148,6 +150,8 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
 
         changed_files = github_context.changed_files
         diff_summary = github_context.diff_summary
+        diff_patches = github_context.diff_patches
+        patch_truncated = github_context.patch_truncated
         github_context_available = github_context.github_context_available
         github_context_error = github_context.github_context_error
 
@@ -158,6 +162,8 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         settings,
         changed_files=changed_files,
         diff_summary=diff_summary,
+        diff_patches=diff_patches,
+        patch_truncated=patch_truncated,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
     )
@@ -173,6 +179,8 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         decision=openai_review.decision,
         changed_files=changed_files,
         diff_summary=diff_summary,
+        diff_patches=diff_patches,
+        patch_truncated=patch_truncated,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
         openai_review_attempted=openai_review.attempted,
