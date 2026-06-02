@@ -7,6 +7,7 @@ from app.clients.github import GitHubClient
 from app.event_store import DebugHealth, EventRecord, event_store
 from app.github_context import hydrate_github_context
 from app.github_events import UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
+from app.github_writeback import writeback_review_decision
 from app.review_queue import ReviewProcessResponse, ReviewWorkItem, process_review_work_item, review_queue
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
@@ -86,25 +87,39 @@ async def process_debug_review_queue_item(
 
 async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
     if not settings.enable_github_context_hydration:
-        return process_review_work_item(item)
+        response = process_review_work_item(item)
+    else:
+        github_client = GitHubClient(token=settings.github_token)
+        try:
+            github_context = await hydrate_github_context(
+                item,
+                github_client,
+                base_branch=settings.base_branch,
+            )
+        finally:
+            await github_client.aclose()
+
+        response = process_review_work_item(
+            item,
+            changed_files=github_context.changed_files,
+            diff_summary=github_context.diff_summary,
+            github_context_available=github_context.github_context_available,
+            github_context_error=github_context.github_context_error,
+        )
+
+    if not settings.enable_github_writeback:
+        return response
 
     github_client = GitHubClient(token=settings.github_token)
     try:
-        github_context = await hydrate_github_context(
-            item,
-            github_client,
-            base_branch=settings.base_branch,
-        )
+        writeback = await writeback_review_decision(response, github_client)
     finally:
         await github_client.aclose()
 
-    return process_review_work_item(
-        item,
-        changed_files=github_context.changed_files,
-        diff_summary=github_context.diff_summary,
-        github_context_available=github_context.github_context_available,
-        github_context_error=github_context.github_context_error,
-    )
+    response.github_writeback_attempted = writeback.attempted
+    response.github_writeback_success = writeback.success
+    response.github_writeback_error = writeback.error
+    return response
 
 
 @app.post("/webhooks/github", response_model=WebhookAcceptedResponse)
