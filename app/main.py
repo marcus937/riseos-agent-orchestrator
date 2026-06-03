@@ -16,6 +16,7 @@ from app.operational_logging import (
     log_openai_review_result,
     log_queue_item_created,
     log_review_processing_started,
+    log_slack_issue_dispatch_result,
     log_webhook_accepted,
 )
 from app.reviewer.decision import ReviewDecisionType
@@ -255,7 +256,8 @@ async def github_webhook(
     event_record = event_store.record_accepted(parsed)
     log_webhook_accepted(parsed)
     work_item = _create_review_work_item(parsed, workflow.review_context is not None, settings)
-    await dispatch_ready_issue_to_slack(parsed, settings)
+    slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings)
+    log_slack_issue_dispatch_result(parsed, slack_dispatch)
     storage = _storage()
     if storage is not None:
         storage.save_event_record(event_record)
