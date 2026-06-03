@@ -71,7 +71,7 @@ def test_pr_target_posts_comment_and_label() -> None:
     assert client.comments[0][1] == 7
     assert "## Review Decision" in client.comments[0][2]
     assert "Dry-run review processor accepted this work item for human review." in client.comments[0][2]
-    assert client.labels == [("riseos/example", 7, "agent-approved-human-review")]
+    assert client.labels == [("riseos/example", 7, "bb2-approved")]
 
 
 def test_issue_target_posts_comment_and_label() -> None:
@@ -93,7 +93,7 @@ def test_issue_target_posts_comment_and_label() -> None:
 
     assert result.success is True
     assert client.comments[0][1] == 42
-    assert client.labels == [("riseos/example", 42, "agent-approved-human-review")]
+    assert client.labels == [("riseos/example", 42, "bb2-approved")]
 
 
 def test_missing_issue_or_pr_skips_cleanly() -> None:
