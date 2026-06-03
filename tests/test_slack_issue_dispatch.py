@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -9,11 +10,13 @@ from app.config import Settings, get_settings
 from app.event_store import event_store
 from app.github_events import GitHubEventType, parse_github_event
 from app.main import app
+from app.operational_logging import log_slack_issue_dispatch_result
 from app.review_queue import review_queue
 from app.security import build_signature
 from app.slack_issue_dispatch import (
     AGENT_READY_LABEL,
     InMemoryDispatchedIssueRegistry,
+    SlackIssueDispatchResult,
     build_circuit_slack_message,
     dispatch_ready_issue_to_slack,
 )
@@ -59,17 +62,20 @@ def issue_payload(
     state: str = "open",
     labels: list[str] | None = None,
     action_label: str | None = None,
+    title: str = "Architecture plan: shared memory layer",
+    issue_url: str | None = None,
 ) -> dict[str, Any]:
     labels = labels or [AGENT_READY_LABEL]
+    issue_url = issue_url or f"https://github.com/{repo}/issues/{issue_number}"
     payload: dict[str, Any] = {
         "action": action,
         "repository": {"full_name": repo},
         "sender": {"login": "marcus"},
         "issue": {
             "number": issue_number,
-            "title": "Architecture plan: shared memory layer",
+            "title": title,
             "state": state,
-            "html_url": f"https://github.com/{repo}/issues/{issue_number}",
+            "html_url": issue_url,
             "labels": [{"name": label} for label in labels],
         },
     }
@@ -135,6 +141,23 @@ def test_labeled_agent_ready_issue_dispatches_to_slack() -> None:
     assert len(client.messages) == 1
 
 
+def test_dispatch_allows_exact_approved_full_repo_name() -> None:
+    parsed = parse_github_event("issues", issue_payload(repo="marcus937/Rylinn-Field-App-Codex"))
+    client = FakeSlackClient()
+
+    result = run(
+        dispatch_ready_issue_to_slack(
+            parsed,
+            Settings(slack_webhook_url="https://hooks.slack.test/services/test"),
+            client=client,
+            registry=InMemoryDispatchedIssueRegistry(),
+        )
+    )
+
+    assert result.success is True
+    assert result.issue_key == "marcus937/Rylinn-Field-App-Codex#11"
+
+
 def test_dispatch_ignores_closed_issues() -> None:
     parsed = parse_github_event("issues", issue_payload(state="closed"))
     client = FakeSlackClient()
@@ -170,8 +193,8 @@ def test_dispatch_requires_agent_ready_label() -> None:
     assert client.messages == []
 
 
-def test_dispatch_requires_approved_repo() -> None:
-    parsed = parse_github_event("issues", issue_payload(repo="marcus937/not-approved"))
+def test_dispatch_requires_exact_approved_repo_full_name() -> None:
+    parsed = parse_github_event("issues", issue_payload(repo="evil/Project-Jarvis"))
     client = FakeSlackClient()
 
     result = run(
@@ -217,14 +240,55 @@ def test_message_includes_required_fields() -> None:
     assert "no merge, no deploy, and no branch mutation" in message
 
 
+def test_message_sanitizes_slack_control_sequences() -> None:
+    parsed = parse_github_event(
+        "issues",
+        issue_payload(
+            title="Ping <!channel> <@U123> & <danger>",
+            labels=[AGENT_READY_LABEL, "<!here>", "<@U123>"],
+            issue_url="https://github.com/marcus937/Project-Jarvis/issues/11?x=<@U999>&y=<&>",
+        ),
+    )
+
+    message = build_circuit_slack_message(parsed, channel="#project_riseos")
+
+    assert "<!channel>" not in message
+    assert "<!here>" not in message
+    assert "<@U123>" not in message
+    assert "<@U999>" not in message
+    assert "&lt;!channel&gt;" in message
+    assert "&lt;!here&gt;" in message
+    assert "&lt;@U123&gt;" in message
+    assert "&lt;@U999&gt;" in message
+    assert "&amp;" in message
+
+
+def test_slack_dispatch_logging_uses_structured_event_names(caplog: Any) -> None:
+    parsed = parse_github_event("issues", issue_payload())
+    caplog.set_level(logging.INFO, logger="riseos_agent_orchestrator")
+
+    cases = [
+        (SlackIssueDispatchResult(attempted=True, success=True, issue_key="marcus937/Project-Jarvis#11"), "slack_issue_dispatch_succeeded"),
+        (SlackIssueDispatchResult(attempted=True, success=False, issue_key="marcus937/Project-Jarvis#11", error="boom"), "slack_issue_dispatch_failed"),
+        (SlackIssueDispatchResult(issue_key="marcus937/Project-Jarvis#11", skipped_reason="Issue was already dispatched."), "slack_issue_dispatch_duplicate_suppressed"),
+        (SlackIssueDispatchResult(issue_key="marcus937/Project-Jarvis#11", skipped_reason="Slack dispatch is not configured."), "slack_issue_dispatch_missing_config"),
+        (SlackIssueDispatchResult(issue_key="evil/Project-Jarvis#11", skipped_reason="Repository is not approved for Circuit Slack dispatch."), "slack_issue_dispatch_invalid_repo"),
+    ]
+
+    for result, expected_event in cases:
+        caplog.clear()
+        log_slack_issue_dispatch_result(parsed, result)
+        assert f'"event": "{expected_event}"' in caplog.text
+
+
 def test_signed_issues_webhook_invokes_slack_dispatch(monkeypatch: Any) -> None:
     secret = "test-secret"
     client = client_with_secret(secret)
     dispatched: list[tuple[str | None, int | None]] = []
 
-    async def fake_dispatch(parsed: Any, settings: Settings) -> Any:
+    async def fake_dispatch(parsed: Any, settings: Settings) -> SlackIssueDispatchResult:
         dispatched.append((parsed.repository, parsed.issue_number))
-        return None
+        return SlackIssueDispatchResult(attempted=True, success=True, issue_key=f"{parsed.repository}#{parsed.issue_number}")
 
     monkeypatch.setattr(main_module, "dispatch_ready_issue_to_slack", fake_dispatch)
     body = json.dumps(issue_payload()).encode("utf-8")
@@ -241,9 +305,9 @@ def test_unsigned_issues_webhook_is_rejected_before_slack_dispatch(monkeypatch: 
     client = client_with_secret()
     dispatched: list[tuple[str | None, int | None]] = []
 
-    async def fake_dispatch(parsed: Any, settings: Settings) -> Any:
+    async def fake_dispatch(parsed: Any, settings: Settings) -> SlackIssueDispatchResult:
         dispatched.append((parsed.repository, parsed.issue_number))
-        return None
+        return SlackIssueDispatchResult(attempted=True, success=True, issue_key=f"{parsed.repository}#{parsed.issue_number}")
 
     monkeypatch.setattr(main_module, "dispatch_ready_issue_to_slack", fake_dispatch)
 
