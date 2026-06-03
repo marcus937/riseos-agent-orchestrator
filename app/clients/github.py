@@ -61,6 +61,30 @@ class GitHubClient:
         self._require_value(head, "head")
         return await self._request("GET", f"/repos/{repo_full_name}/compare/{base}...{head}")
 
+    async def list_open_issues(
+        self,
+        repo_full_name: str,
+        *,
+        labels: list[str] | None = None,
+        sort: str = "created",
+        direction: str = "asc",
+    ) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/issues",
+            params={
+                "state": "open",
+                "labels": ",".join(labels or []),
+                "sort": sort,
+                "direction": direction,
+                "per_page": 100,
+            },
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/issues", 200, "Expected list response.")
+        return payload
+
     async def post_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> GitHubResponse:
         self._require_value(repo_full_name, "repo_full_name")
         self._require_issue_number(issue_number)
