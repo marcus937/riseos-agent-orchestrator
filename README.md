@@ -28,6 +28,8 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | `OPENAI_API_KEY` | OpenAI review | Required only when `ENABLE_OPENAI_REVIEW=true`. |
 | `OPENAI_REVIEW_MODEL` | No | Model for BB/Jarvis Architect review decisions. Defaults to `gpt-5.5-thinking`. |
 | `ENABLE_OPENAI_REVIEW` | No | Set to `true` to request validated OpenAI `ReviewDecision` JSON. Defaults to `false`. |
+| `ENABLE_BB_CONTEXT_PACK` | No | Set to `false` to omit BB Architect context packs from OpenAI review prompts. Defaults to `true`. |
+| `BB_CONTEXT_MAX_CHARS` | No | Maximum BB context pack characters included in the prompt. Defaults to `20000`. |
 | `ENABLE_GITHUB_CONTEXT_HYDRATION` | No | Set to `true` to let dry-run processing fetch read-only commit or compare context from GitHub. Defaults to `false`. |
 | `ENABLE_GITHUB_WRITEBACK` | No | Set to `true` to post dry-run review comments and labels. Defaults to `false`. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
@@ -172,7 +174,7 @@ Read-only debug endpoints are public by default for local testing. Set `REQUIRE_
 
 By default, processing does not call GitHub or OpenAI. To include read-only GitHub context in the dry-run response, set `ENABLE_GITHUB_CONTEXT_HYDRATION=true` and provide `GITHUB_TOKEN`. Commit work items fetch commit metadata. PR work items compare `BASE_BRANCH` to the work item branch when branch context is available. Hydration never comments, labels, mutates repositories, or merges.
 
-OpenAI BB/Jarvis Architect review generation is disabled by default. When `ENABLE_OPENAI_REVIEW=true`, `OPENAI_API_KEY` is required and the processor asks `OPENAI_REVIEW_MODEL` for structured JSON matching `ReviewDecision`. The prompt includes the work item, changed files, diff summary, hydrated GitHub context, branch policy, no-auto-merge policy, and the human approval boundary. Invalid or unvalidated model output becomes a `BLOCKED` dry-run decision with `openai_review_error`.
+OpenAI BB/Jarvis Architect review generation is disabled by default. When `ENABLE_OPENAI_REVIEW=true`, `OPENAI_API_KEY` is required and the processor asks `OPENAI_REVIEW_MODEL` for structured JSON matching `ReviewDecision`. The prompt includes the BB Architect context pack when `ENABLE_BB_CONTEXT_PACK=true`, plus the work item, changed files, diff summary, diff patches, hydrated GitHub context, branch policy, no-auto-merge policy, and the human approval boundary. `BB_CONTEXT_MAX_CHARS` bounds the included context pack. Set `ENABLE_BB_CONTEXT_PACK=false` to preserve the previous prompt shape without BB context. Invalid or unvalidated model output becomes a `BLOCKED` dry-run decision with `openai_review_error`.
 
 GitHub writeback is also disabled by default. When `ENABLE_GITHUB_WRITEBACK=true`, processing may call only `post_issue_comment` and `apply_label`. The comment target is the PR number when present, otherwise the issue number. If no issue or PR number is available, writeback is skipped and `github_writeback_error` explains why. Labels map to the structured decision: `agent-approved-human-review`, `agent-needs-changes`, `agent-blocked`, or `agent-escalate-marcus`.
 
