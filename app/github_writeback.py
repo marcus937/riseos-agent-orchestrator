@@ -2,8 +2,8 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from app.reviewer.decision import ReviewDecisionType
 from app.review_queue import ReviewProcessResponse
+from app.task_dispatch import BB2_DECISION_LABELS
 
 
 class GitHubWritebackClient(Protocol):
@@ -22,12 +22,7 @@ class GitHubWritebackResult(BaseModel):
     label: str | None = None
 
 
-DECISION_LABELS = {
-    ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW: "agent-approved-human-review",
-    ReviewDecisionType.NEEDS_CHANGES: "agent-needs-changes",
-    ReviewDecisionType.BLOCKED: "agent-blocked",
-    ReviewDecisionType.ESCALATE_TO_MARCUS: "agent-escalate-marcus",
-}
+DECISION_LABELS = BB2_DECISION_LABELS
 
 
 async def writeback_review_decision(
