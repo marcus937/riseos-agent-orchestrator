@@ -64,6 +64,13 @@ def test_openai_prompt_includes_bb_context_when_enabled() -> None:
     assert "Review Rubric" in reviewer.prompt
     assert "Branch Policy" in reviewer.prompt
     assert "Project Jarvis Repo Profile" in reviewer.prompt
+    assert "Verify architecture alignment before code quality" in reviewer.prompt
+    assert "Challenge assumptions" in reviewer.prompt
+    assert "Require evidence for runtime claims" in reviewer.prompt
+    assert "code inspected, code executed, and tests executed" in reviewer.prompt
+    assert "VERIFIED" in reviewer.prompt
+    assert "ASSUMED" in reviewer.prompt
+    assert "UNVERIFIED" in reviewer.prompt
     assert "app/services_refactor/chat_service.py" in reviewer.prompt
     assert "Diff summary:\n1 changed file" in reviewer.prompt
     assert "@@ -1 +1 @@" in reviewer.prompt
