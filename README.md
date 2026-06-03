@@ -114,16 +114,18 @@ The `issues` webhook can notify Slack when a Circuit-ready issue enters the queu
 Dispatch rules:
 
 - Event must be `issues` with action `opened` or `labeled`.
-- Repository must be approved: `Project-Jarvis`, `jarvis-mission-control`, `riseos-agent-orchestrator`, or `Rylinn-Field-App-Codex`.
+- Repository must exactly match an approved full name: `marcus937/Project-Jarvis`, `marcus937/jarvis-mission-control`, `marcus937/riseos-agent-orchestrator`, or `marcus937/Rylinn-Field-App-Codex`.
 - Issue must be open.
 - Issue must have label `agent-ready`.
 - For `labeled` actions, the added label must be `agent-ready`.
 - Already-dispatched issue IDs are deduplicated in process memory.
 - Slack message posts to `SLACK_CHANNEL`, defaulting to `#project_riseos`.
 
-Slack messages mention `@circuit-forge` and include repo, issue number, title, labels, URL, branch rule, and no-merge/no-deploy reminder.
+Slack messages mention `@circuit-forge` and include repo, issue number, title, labels, URL, branch rule, and no-merge/no-deploy reminder. User-controlled issue fields are escaped before posting so Slack control sequences such as channel-wide or user mentions are rendered as text.
 
 This dispatcher is notification-only. It does not close issues, mutate branches, open PRs, merge, deploy, or write repository files.
+
+Follow-up recommendation: Priority 3A Persistent Dispatch Registry should move deduplication from process memory to persisted storage so service restarts cannot re-notify the same issue.
 
 ## Debug Review Queue
 
