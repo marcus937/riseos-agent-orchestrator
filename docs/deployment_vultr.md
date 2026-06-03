@@ -64,6 +64,8 @@ GITHUB_TOKEN=replace-with-fine-grained-token-if-needed
 OPENAI_API_KEY=
 OPENAI_REVIEW_MODEL=gpt-5.5-thinking
 ENABLE_OPENAI_REVIEW=false
+ENABLE_BB_CONTEXT_PACK=true
+BB_CONTEXT_MAX_CHARS=20000
 ENABLE_GITHUB_CONTEXT_HYDRATION=false
 ENABLE_GITHUB_WRITEBACK=false
 WORK_BRANCH=agent-integration
@@ -75,6 +77,8 @@ REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=false
 ```
 
 Do not commit real values. `ENABLE_OPENAI_REVIEW=false` keeps review processing deterministic and prevents live OpenAI calls. When it is set to `true`, `OPENAI_API_KEY` is required and `OPENAI_REVIEW_MODEL` is used to request validated `ReviewDecision` JSON.
+
+`ENABLE_BB_CONTEXT_PACK=true` adds BB Architect context packs to OpenAI review prompts, including the global architect prompt, review rubric, branch policy, and a matching repo profile when available. `BB_CONTEXT_MAX_CHARS=20000` bounds the context included in the prompt. Set `ENABLE_BB_CONTEXT_PACK=false` to omit this context and preserve the previous prompt shape.
 
 `ORCHESTRATOR_DB_PATH` enables SQLite persistence for accepted webhook events and review queue items. The service creates the database file and tables at startup. Keep `/var/lib/riseos-agent-orchestrator` owned by `riseos:riseos` so the systemd service can write there.
 
@@ -223,6 +227,7 @@ sudo systemctl restart riseos-agent-orchestrator
 
 - Keep `ENABLE_OPENAI_REVIEW=false` unless live OpenAI review decision generation is intentionally enabled.
 - If `ENABLE_OPENAI_REVIEW=true`, invalid model output becomes a `BLOCKED` dry-run decision and human approval remains required.
+- Keep `ENABLE_BB_CONTEXT_PACK=true` unless OpenAI review prompts should omit BB Architect context.
 - Keep `ENABLE_GITHUB_CONTEXT_HYDRATION=false` unless read-only GitHub context hydration is intentionally enabled.
 - Keep `ENABLE_GITHUB_WRITEBACK=false` unless comment/label writeback is intentionally enabled.
 - GitHub webhook writes remain disabled by default.
