@@ -70,6 +70,10 @@ class TaskDispatchResult(BaseModel):
     assignment_body: str | None = None
 
 
+def should_dispatch_next_task(decision: ReviewDecisionType) -> bool:
+    return decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW
+
+
 async def list_agent_ready_issues(repo_full_name: str, client: TaskDispatchClient) -> list[AgentTaskIssue]:
     issues = await client.list_open_issues(
         repo_full_name,
