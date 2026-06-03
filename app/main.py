@@ -18,6 +18,7 @@ from app.operational_logging import (
     log_review_processing_started,
     log_webhook_accepted,
 )
+from app.reviewer.decision import ReviewDecisionType
 from app.reviewer.openai_review import request_openai_review_decision
 from app.review_queue import (
     ReviewProcessResponse,
@@ -29,6 +30,7 @@ from app.review_queue import (
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
 from app.storage import SQLiteStateStore, build_sqlite_store
+from app.task_dispatch import dispatch_next_agent_task
 
 
 app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
@@ -196,16 +198,26 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     github_client = GitHubClient(token=settings.github_token)
     try:
         writeback = await writeback_review_decision(response, github_client)
+        response.github_writeback_attempted = writeback.attempted
+        response.github_writeback_success = writeback.success
+        response.github_writeback_error = writeback.error
+        if writeback.success and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
+            task_dispatch = await dispatch_next_agent_task(
+                response.work_item.repo_full_name,
+                github_client,
+                enabled=settings.enable_task_dispatch,
+            )
+            response.task_dispatch_attempted = task_dispatch.attempted
+            response.task_dispatch_success = task_dispatch.success
+            response.task_dispatch_issue_number = task_dispatch.issue_number
+            response.task_dispatch_error = task_dispatch.error
     finally:
         await github_client.aclose()
 
-    response.github_writeback_attempted = writeback.attempted
-    response.github_writeback_success = writeback.success
-    response.github_writeback_error = writeback.error
     log_github_writeback_result(
-        attempted=writeback.attempted,
-        success=writeback.success,
-        error=writeback.error,
+        attempted=response.github_writeback_attempted,
+        success=response.github_writeback_success,
+        error=response.github_writeback_error,
     )
     return response
 
