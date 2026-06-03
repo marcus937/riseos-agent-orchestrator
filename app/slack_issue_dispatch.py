@@ -9,11 +9,11 @@ from app.config import Settings
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 
 AGENT_READY_LABEL = "agent-ready"
-APPROVED_REPO_NAMES = {
-    "project-jarvis",
-    "jarvis-mission-control",
-    "riseos-agent-orchestrator",
-    "rylinn-field-app-codex",
+APPROVED_REPO_FULL_NAMES = {
+    "marcus937/Project-Jarvis",
+    "marcus937/jarvis-mission-control",
+    "marcus937/riseos-agent-orchestrator",
+    "marcus937/Rylinn-Field-App-Codex",
 }
 DEFAULT_BRANCH_RULE = "agent-integration only"
 
@@ -119,13 +119,13 @@ async def dispatch_ready_issue_to_slack(
 
 
 def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> str:
-    labels = ", ".join(parsed.labels) if parsed.labels else "none"
-    title = parsed.issue_title or f"Issue #{parsed.issue_number}"
-    issue_url = parsed.issue_url or "No issue URL provided."
-    repo = parsed.repository or "unknown repo"
+    labels = ", ".join(_sanitize_slack_text(label) for label in parsed.labels) if parsed.labels else "none"
+    title = _sanitize_slack_text(parsed.issue_title or f"Issue #{parsed.issue_number}")
+    issue_url = _sanitize_slack_text(parsed.issue_url or "No issue URL provided.")
+    repo = _sanitize_slack_text(parsed.repository or "unknown repo")
     return (
         "@circuit-forge Circuit task ready\n"
-        f"Channel: {channel}\n"
+        f"Channel: {_sanitize_slack_text(channel)}\n"
         f"Repo: {repo}\n"
         f"Issue: #{parsed.issue_number} - {title}\n"
         f"Labels: {labels}\n"
@@ -152,13 +152,14 @@ def _skip_reason(parsed: ParsedGitHubEvent) -> str | None:
 
 
 def _is_approved_repo(repo_full_name: str | None) -> bool:
-    if not repo_full_name:
-        return False
-    repo_name = repo_full_name.rsplit("/", 1)[-1].lower()
-    return repo_name in APPROVED_REPO_NAMES
+    return repo_full_name in APPROVED_REPO_FULL_NAMES
 
 
 def _issue_key(parsed: ParsedGitHubEvent) -> str | None:
     if not parsed.repository or parsed.issue_number is None:
         return None
     return f"{parsed.repository}#{parsed.issue_number}"
+
+
+def _sanitize_slack_text(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
