@@ -29,6 +29,7 @@ from app.review_queue import (
 )
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
+from app.slack_issue_dispatch import dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
 from app.task_dispatch import dispatch_next_agent_task
 
@@ -254,6 +255,7 @@ async def github_webhook(
     event_record = event_store.record_accepted(parsed)
     log_webhook_accepted(parsed)
     work_item = _create_review_work_item(parsed, workflow.review_context is not None, settings)
+    await dispatch_ready_issue_to_slack(parsed, settings)
     storage = _storage()
     if storage is not None:
         storage.save_event_record(event_record)
