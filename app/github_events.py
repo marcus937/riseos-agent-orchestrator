@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 class GitHubEventType(StrEnum):
     ISSUE_COMMENT = "issue_comment"
+    ISSUES = "issues"
     PUSH = "push"
     PULL_REQUEST = "pull_request"
 
@@ -17,6 +18,10 @@ class ParsedGitHubEvent(BaseModel):
     repository: str | None = None
     sender: str | None = None
     issue_number: int | None = None
+    issue_title: str | None = None
+    issue_url: str | None = None
+    issue_state: str | None = None
+    action_label: str | None = None
     pull_request_number: int | None = None
     ref: str | None = None
     before: str | None = None
@@ -50,6 +55,17 @@ def _sender_login(payload: dict[str, Any]) -> str | None:
     return str(login) if login else None
 
 
+def _label_names(raw_labels: Any) -> list[str]:
+    labels = raw_labels or []
+    return [str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")]
+
+
+def _action_label(payload: dict[str, Any]) -> str | None:
+    label = payload.get("label") or {}
+    name = label.get("name")
+    return str(name) if name else None
+
+
 def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHubEvent:
     try:
         event_type = GitHubEventType(event_name)
@@ -66,15 +82,29 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
 
     if event_type == GitHubEventType.ISSUE_COMMENT:
         issue = payload.get("issue") or {}
-        labels = issue.get("labels") or []
         comment_body = (payload.get("comment") or {}).get("body")
         return ParsedGitHubEvent(
             **base,
             issue_number=issue.get("number"),
+            issue_title=issue.get("title"),
+            issue_url=issue.get("html_url"),
+            issue_state=issue.get("state"),
             pull_request_number=issue.get("number") if issue.get("pull_request") else None,
-            labels=[str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")],
+            labels=_label_names(issue.get("labels")),
             comment_body=comment_body,
             head_sha=extract_commit_sha_from_comment(comment_body),
+        )
+
+    if event_type == GitHubEventType.ISSUES:
+        issue = payload.get("issue") or {}
+        return ParsedGitHubEvent(
+            **base,
+            issue_number=issue.get("number"),
+            issue_title=issue.get("title"),
+            issue_url=issue.get("html_url"),
+            issue_state=issue.get("state"),
+            action_label=_action_label(payload),
+            labels=_label_names(issue.get("labels")),
         )
 
     if event_type == GitHubEventType.PUSH:
@@ -87,14 +117,13 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
         )
 
     pull_request = payload.get("pull_request") or {}
-    labels = pull_request.get("labels") or []
     return ParsedGitHubEvent(
         **base,
         pull_request_number=pull_request.get("number") or payload.get("number"),
         head_sha=(pull_request.get("head") or {}).get("sha"),
         head_ref=(pull_request.get("head") or {}).get("ref"),
         base_ref=(pull_request.get("base") or {}).get("ref"),
-        labels=[str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")],
+        labels=_label_names(pull_request.get("labels")),
     )
 
 
