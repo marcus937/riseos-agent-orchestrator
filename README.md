@@ -2,21 +2,24 @@
 
 Planning-first external automation layer for RiseOS coding agents.
 
-The orchestrator accepts GitHub webhooks, verifies GitHub signatures, persists review queue items, hydrates read-only GitHub context, can request BB/Jarvis Architect review decisions from OpenAI, and can optionally write review comments and labels back to GitHub. It does not implement auto-merge behavior, branch mutation, or repository file writes.
+The orchestrator accepts GitHub webhooks, verifies GitHub signatures, persists review queue items, hydrates read-only GitHub context, can request BB/Jarvis Architect review decisions from OpenAI, can optionally write review comments and labels back to GitHub, and can notify Slack when approved `agent-ready` issues are queued. It does not implement auto-merge behavior, branch mutation, deploy behavior, or repository file writes.
 
 ## Guardrails
 
 - No auto-merge behavior.
+- No deploy behavior.
 - No branch mutation.
 - No repository file writes.
 - No issue closing by the orchestrator.
 - Production secrets are not committed.
 - GitHub writes are limited to comments and labels when explicitly enabled.
+- Slack dispatch is notification-only.
 - Human approval remains required before merge.
 
 ## Supported Events
 
 - `issue_comment`
+- `issues`
 - `push`
 - `pull_request`
 
@@ -36,6 +39,9 @@ The orchestrator accepts GitHub webhooks, verifies GitHub signatures, persists r
 | `ENABLE_GITHUB_CONTEXT_HYDRATION` | No | Set to `true` to fetch read-only commit or compare context from GitHub. Defaults to `false`. |
 | `ENABLE_GITHUB_WRITEBACK` | No | Set to `true` to post review comments and labels. Defaults to `false`. |
 | `ENABLE_TASK_DISPATCH` | No | Set to `true` to let approved BB2 reviews assign the next queued GitHub Issue task. Requires `ENABLE_GITHUB_WRITEBACK=true`. Defaults to `false`. |
+| `SLACK_WEBHOOK_URL` | Slack dispatch | Incoming webhook URL for Slack issue notifications. If unset, `SLACK_BOT_TOKEN` can be used instead. |
+| `SLACK_BOT_TOKEN` | Slack dispatch | Slack bot token used with `chat.postMessage` when no webhook URL is configured. |
+| `SLACK_CHANNEL` | No | Slack channel for Circuit notifications. Defaults to `#project_riseos`. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
 | `ORCHESTRATOR_DB_PATH` | No | SQLite path for persisted webhook events and review queue items. If unset or unavailable, the service uses in-memory state. |
 | `ORCHESTRATOR_ADMIN_TOKEN` | Process endpoint | Required for `POST /debug/review-queue/{id}/process`. |
@@ -91,7 +97,7 @@ mkdir -p "$(dirname "$ORCHESTRATOR_DB_PATH")"
 
 ## Webhook Dry-Run Review Behavior
 
-The webhook endpoint accepts supported GitHub events and returns a dry-run review stub when review is needed. It does not call GitHub live, merge, write files, or change branches.
+The webhook endpoint accepts supported GitHub events and returns a dry-run review stub when review is needed. It does not call GitHub live, merge, deploy, write files, or change branches.
 
 Review-needed triggers:
 
@@ -99,7 +105,25 @@ Review-needed triggers:
 - `issue_comment` containing `Status: Done` returns `task_state: review_needed` with the issue number.
 - `pull_request` with action `opened` or `synchronize` returns `task_state: review_needed` with the PR number and head SHA.
 
-Review-needed events create `ReviewWorkItem` records. This queue is dry-run safe by default. It does not call OpenAI, comment on GitHub, apply labels, dispatch tasks, mutate repositories, or merge anything unless the relevant feature flags are explicitly enabled.
+Review-needed events create `ReviewWorkItem` records. This queue is dry-run safe by default. It does not call OpenAI, comment on GitHub, apply labels, dispatch tasks, mutate repositories, deploy, or merge anything unless the relevant feature flags are explicitly enabled.
+
+## GitHub Issue To Slack Circuit Dispatcher
+
+The `issues` webhook can notify Slack when a Circuit-ready issue enters the queue. The HMAC signature is verified with the same `GITHUB_WEBHOOK_SECRET` logic before any Slack dispatch is considered.
+
+Dispatch rules:
+
+- Event must be `issues` with action `opened` or `labeled`.
+- Repository must be approved: `Project-Jarvis`, `jarvis-mission-control`, `riseos-agent-orchestrator`, or `Rylinn-Field-App-Codex`.
+- Issue must be open.
+- Issue must have label `agent-ready`.
+- For `labeled` actions, the added label must be `agent-ready`.
+- Already-dispatched issue IDs are deduplicated in process memory.
+- Slack message posts to `SLACK_CHANNEL`, defaulting to `#project_riseos`.
+
+Slack messages mention `@circuit-forge` and include repo, issue number, title, labels, URL, branch rule, and no-merge/no-deploy reminder.
+
+This dispatcher is notification-only. It does not close issues, mutate branches, open PRs, merge, deploy, or write repository files.
 
 ## Debug Review Queue
 
@@ -188,6 +212,6 @@ If no eligible issue is found, `task_dispatch_error` is `No queued agent-ready i
 
 ## Deployment Notes
 
-Deploy behind HTTPS. Configure the GitHub webhook secret in the hosting secret manager. Point GitHub webhooks at `POST /webhooks/github`. Keep GitHub App credentials and OpenAI credentials in managed secrets only.
+Deploy behind HTTPS. Configure the GitHub webhook secret in the hosting secret manager. Point GitHub webhooks at `POST /webhooks/github`. Keep GitHub App credentials, OpenAI credentials, and Slack credentials in managed secrets only.
 
-For the MVP, enabled GitHub writeback and task dispatch may only comment on issues/PRs or apply labels. Human review remains required for merges.
+For the MVP, enabled GitHub writeback and task dispatch may only comment on issues/PRs or apply labels. Slack dispatch may only post notifications. Human review remains required for merges.
