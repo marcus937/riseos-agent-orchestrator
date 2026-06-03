@@ -4,6 +4,7 @@ from typing import Any
 
 from app.github_events import ParsedGitHubEvent
 from app.review_queue import ReviewWorkItem
+from app.slack_issue_dispatch import SlackIssueDispatchResult
 
 
 logger = logging.getLogger("riseos_agent_orchestrator")
@@ -80,3 +81,32 @@ def log_github_writeback_result(*, attempted: bool, success: bool, error: str | 
         success=success,
         error=error,
     )
+
+
+def log_slack_issue_dispatch_result(parsed: ParsedGitHubEvent, result: SlackIssueDispatchResult) -> None:
+    event_name = _slack_dispatch_event_name(result)
+    log_event(
+        event_name,
+        attempted=result.attempted,
+        success=result.success,
+        issue_key=result.issue_key,
+        repo_full_name=parsed.repository,
+        issue_number=parsed.issue_number,
+        action=parsed.action,
+        skipped_reason=result.skipped_reason,
+        error=result.error,
+    )
+
+
+def _slack_dispatch_event_name(result: SlackIssueDispatchResult) -> str:
+    if result.success:
+        return "slack_issue_dispatch_succeeded"
+    if result.error:
+        return "slack_issue_dispatch_failed"
+    if result.skipped_reason == "Issue was already dispatched.":
+        return "slack_issue_dispatch_duplicate_suppressed"
+    if result.skipped_reason == "Slack dispatch is not configured.":
+        return "slack_issue_dispatch_missing_config"
+    if result.skipped_reason == "Repository is not approved for Circuit Slack dispatch.":
+        return "slack_issue_dispatch_invalid_repo"
+    return "slack_issue_dispatch_skipped"
