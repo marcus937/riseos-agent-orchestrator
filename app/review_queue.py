@@ -43,6 +43,10 @@ class ReviewProcessResponse(BaseModel):
     github_writeback_attempted: bool = False
     github_writeback_success: bool = False
     github_writeback_error: str | None = None
+    task_dispatch_attempted: bool = False
+    task_dispatch_success: bool = False
+    task_dispatch_issue_number: int | None = None
+    task_dispatch_error: str | None = None
     openai_review_attempted: bool = False
     openai_review_success: bool = False
     openai_review_error: str | None = None
@@ -243,7 +247,7 @@ def _blocked_reason(item: ReviewWorkItem) -> str | None:
 
 
 def _status_from_decision(decision: ReviewDecision) -> ReviewWorkItemStatus:
-    if decision.decision == ReviewDecisionType.BLOCKED:
+    if decision.decision in {ReviewDecisionType.BLOCKED, ReviewDecisionType.ESCALATE_TO_MARCUS}:
         return ReviewWorkItemStatus.BLOCKED
     if decision.decision == ReviewDecisionType.NEEDS_CHANGES:
         return ReviewWorkItemStatus.NEEDS_CHANGES
@@ -251,7 +255,7 @@ def _status_from_decision(decision: ReviewDecision) -> ReviewWorkItemStatus:
 
 
 def _intended_next_actions(decision: ReviewDecision) -> list[str]:
-    if decision.decision == ReviewDecisionType.BLOCKED:
+    if decision.decision in {ReviewDecisionType.BLOCKED, ReviewDecisionType.ESCALATE_TO_MARCUS}:
         return ["Keep the item blocked until required context is supplied."]
     if decision.decision == ReviewDecisionType.NEEDS_CHANGES:
         return ["Prepare a follow-up task prompt for the coding agent.", "Wait for human approval before any merge."]
