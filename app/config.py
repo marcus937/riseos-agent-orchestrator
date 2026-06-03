@@ -23,6 +23,9 @@ class Settings:
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
+    slack_webhook_url: str | None = None
+    slack_bot_token: str | None = None
+    slack_channel: str = "#project_riseos"
     work_branch: str = "agent-integration"
     base_branch: str = "main"
 
@@ -47,6 +50,9 @@ def get_settings() -> Settings:
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
         enable_github_writeback=os.getenv("ENABLE_GITHUB_WRITEBACK", "").lower() == "true",
         enable_task_dispatch=os.getenv("ENABLE_TASK_DISPATCH", "").lower() == "true",
+        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
+        slack_channel=os.getenv("SLACK_CHANNEL", "#project_riseos"),
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
     )
