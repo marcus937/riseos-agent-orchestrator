@@ -9,6 +9,12 @@ def test_context_loader_includes_global_context() -> None:
     assert "BB is the Project Jarvis architect and reviewer" in context
     assert "Review Rubric" in context
     assert "Branch Policy" in context
+    assert "Verify architecture alignment before code quality" in context
+    assert "Challenge assumptions" in context
+    assert "code inspected, code executed, and tests executed" in context
+    assert "VERIFIED" in context
+    assert "ASSUMED" in context
+    assert "UNVERIFIED" in context
 
 
 def test_context_loader_selects_correct_repo_profile() -> None:
