@@ -66,6 +66,75 @@ def test_find_pending_duplicate_returns_existing_item(tmp_path) -> None:
     assert duplicate.id == item.id
 
 
+def test_find_pending_duplicate_returns_claimed_item(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    parsed = parse_github_event(
+        "push",
+        {
+            "repository": {"full_name": "riseos/example"},
+            "ref": "refs/heads/agent-integration",
+            "after": "abc123",
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    candidate = review_work_item_from_parsed(parsed)
+    store = SQLiteStateStore(str(db_path))
+    store.save_review_work_item(item)
+    claimed = store.claim_review_work_item(item.id)
+
+    duplicate = store.find_pending_duplicate(candidate)
+
+    assert claimed is not None
+    assert claimed.status == ReviewWorkItemStatus.REVIEWING
+    assert duplicate is not None
+    assert duplicate.id == item.id
+
+
+def test_claim_review_work_item_transitions_pending_to_reviewing(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "def456"}},
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    store = SQLiteStateStore(str(db_path))
+    store.save_review_work_item(item)
+
+    claimed = store.claim_review_work_item(item.id)
+    second_claim = store.claim_review_work_item(item.id)
+
+    assert claimed is not None
+    assert claimed.status == ReviewWorkItemStatus.REVIEWING
+    assert second_claim is None
+    assert store.review_queue_counters().reviewing_count == 1
+
+
+def test_reset_review_work_item_for_retry_returns_claimed_item_to_pending(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "def456"}},
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    store = SQLiteStateStore(str(db_path))
+    store.save_review_work_item(item)
+    store.claim_review_work_item(item.id)
+
+    reset = store.reset_review_work_item_for_retry(item.id)
+
+    assert reset is not None
+    assert reset.status == ReviewWorkItemStatus.PENDING_REVIEW
+    assert store.review_queue_counters().pending_review_count == 1
+
+
 def test_queue_limit_prunes_oldest_processed_items(tmp_path) -> None:
     db_path = tmp_path / "orchestrator.db"
     store = SQLiteStateStore(str(db_path), max_review_items=2)
