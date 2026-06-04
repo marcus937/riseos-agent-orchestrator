@@ -13,7 +13,7 @@
 | Event parser | Normalizes `issue_comment`, `push`, and `pull_request` payloads. |
 | Task state enum | Defines the lifecycle used by agent orchestration. |
 | GitHub client | Supports commit fetch, branch compare, comments, and labels. |
-| OpenAI reviewer placeholder | Builds review prompts and gates future OpenAI review calls. |
+| OpenAI reviewer | Feature-flagged BB/Jarvis Architect review decision generation. |
 
 ## Task States
 
@@ -30,20 +30,23 @@
 
 After a coding agent finishes work, the orchestrator builds a BB/Jarvis Architect review prompt from task context, changed files, diff, and architecture context. The expected decision contract includes `decision`, `confidence`, `risk_level`, `summary`, `required_changes`, `next_task_prompt`, and `human_review_required`.
 
-Allowed decisions are `APPROVED_FOR_HUMAN_REVIEW`, `NEEDS_CHANGES`, `BLOCKED`, and `ESCALATE_TO_MARCUS`. Human review is always required before merge. The reviewer placeholder does not call OpenAI unless `OPENAI_API_KEY` is set and `ENABLE_OPENAI_REVIEW=true`; even then, the live OpenAI call remains a future integration.
+Allowed decisions are `APPROVED_FOR_HUMAN_REVIEW`, `NEEDS_CHANGES`, `BLOCKED`, and `ESCALATE_TO_MARCUS`. Human review is always required before merge. The deterministic dry-run decision remains the default. When `ENABLE_OPENAI_REVIEW=true`, `OPENAI_API_KEY` is required and `OPENAI_REVIEW_MODEL` is used to request structured JSON that validates against `ReviewDecision`. Invalid model output becomes a `BLOCKED` decision with `openai_review_error`.
+
+The OpenAI prompt includes the `ReviewWorkItem`, changed files, diff summary, hydrated GitHub context, branch policy, no-auto-merge policy, and the human approval boundary. If `ENABLE_GITHUB_WRITEBACK=true` is also enabled, the GitHub comment and status label use only the validated `ReviewDecision`.
 
 ## Write Policy
 
-The orchestrator must not merge PRs, push commits, modify branches, or edit repository files. Future GitHub writes are limited to issue comments and labels.
+The orchestrator must not merge PRs, push commits, modify branches, or edit repository files. GitHub writes are disabled by default and remain limited to issue comments and labels when explicitly enabled.
 
 ## Request Flow
 
 1. GitHub sends a webhook to `/webhooks/github`.
 2. The service verifies the HMAC signature using `GITHUB_WEBHOOK_SECRET`.
 3. The event parser validates the event type and extracts routing context.
-4. Future orchestration logic can create a task decision.
-5. Future write actions can post comments or labels only.
+4. Review-needed events create a `ReviewWorkItem`.
+5. Processing the work item creates either a deterministic dry-run decision or a validated OpenAI decision.
+6. Optional writeback can post comments or labels only.
 
 ## Runtime Caveats
 
-This MVP does not include durable storage, queue workers, production GitHub App auth, or live OpenAI calls. Those belong in later increments after the workflow contract is reviewed.
+This MVP does not include queue workers or production GitHub App auth. SQLite persistence is lightweight debug/state storage, not a full job system. OpenAI review and GitHub writeback are both disabled by default and must be enabled intentionally through environment flags.

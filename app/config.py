@@ -12,7 +12,23 @@ class Settings:
     github_app_id: str | None = None
     github_app_private_key_path: str | None = None
     openai_api_key: str | None = None
+    openai_review_model: str = "gpt-5.5-thinking"
     enable_openai_review: bool = False
+    enable_bb_context_pack: bool = True
+    bb_context_max_chars: int = 20000
+    orchestrator_db_path: str | None = None
+    orchestrator_admin_token: str | None = None
+    orchestrator_max_review_items: int = 500
+    require_admin_token_for_debug_reads: bool = False
+    enable_auto_review_processing: bool = False
+    enable_github_context_hydration: bool = False
+    enable_github_writeback: bool = False
+    enable_task_dispatch: bool = False
+    slack_webhook_url: str | None = None
+    slack_bot_token: str | None = None
+    slack_channel: str = "#project_riseos"
+    work_branch: str = "agent-integration"
+    base_branch: str = "main"
 
 
 @lru_cache(maxsize=1)
@@ -24,5 +40,32 @@ def get_settings() -> Settings:
         github_app_id=os.getenv("GITHUB_APP_ID"),
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
+        openai_review_model=os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.5-thinking"),
         enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
+        enable_bb_context_pack=os.getenv("ENABLE_BB_CONTEXT_PACK", "true").lower() == "true",
+        bb_context_max_chars=_int_env("BB_CONTEXT_MAX_CHARS", 20000),
+        orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
+        orchestrator_admin_token=os.getenv("ORCHESTRATOR_ADMIN_TOKEN"),
+        orchestrator_max_review_items=_int_env("ORCHESTRATOR_MAX_REVIEW_ITEMS", 500),
+        require_admin_token_for_debug_reads=os.getenv("REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS", "").lower() == "true",
+        enable_auto_review_processing=os.getenv("ENABLE_AUTO_REVIEW_PROCESSING", "").lower() == "true",
+        enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
+        enable_github_writeback=os.getenv("ENABLE_GITHUB_WRITEBACK", "").lower() == "true",
+        enable_task_dispatch=os.getenv("ENABLE_TASK_DISPATCH", "").lower() == "true",
+        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
+        slack_channel=os.getenv("SLACK_CHANNEL", "#project_riseos"),
+        work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
+        base_branch=os.getenv("BASE_BRANCH", "main"),
     )
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
