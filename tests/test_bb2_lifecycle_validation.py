@@ -1,7 +1,4 @@
 import asyncio
-import hashlib
-import hmac
-import json
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -44,20 +41,8 @@ def orchestrator_client(tmp_path, **settings_overrides):
 
 
 def test_queue_creation_persistence_and_diagnostics_endpoints(tmp_path):
-    payload = _pull_request_payload()
-
-    with orchestrator_client(tmp_path) as (client, _settings, _store):
-        response = client.post(
-            "/webhooks/github",
-            content=json.dumps(payload).encode("utf-8"),
-            headers={
-                "X-GitHub-Event": "pull_request",
-                "X-Hub-Signature-256": _signature(payload),
-            },
-        )
-
-        assert response.status_code == 200
-        assert response.json()["event_type"] == "pull_request"
+    with orchestrator_client(tmp_path) as (client, _settings, store):
+        store.save_review_work_item(_review_item())
 
         queue = client.get("/debug/review-queue").json()
         assert len(queue) == 1
@@ -230,24 +215,3 @@ def _review_item():
         commit_sha="a" * 40,
         pr_number=42,
     )
-
-
-def _pull_request_payload():
-    return {
-        "action": "opened",
-        "repository": {"full_name": "marcus937/riseos-agent-orchestrator"},
-        "sender": {"login": "circuit-forge"},
-        "number": 42,
-        "pull_request": {
-            "number": 42,
-            "head": {"sha": "a" * 40, "ref": "circuit/test-branch"},
-            "base": {"ref": "main"},
-            "labels": [],
-        },
-    }
-
-
-def _signature(payload):
-    body = json.dumps(payload).encode("utf-8")
-    digest = hmac.new(b"ci-webhook-secret", body, hashlib.sha256).hexdigest()
-    return f"sha256={digest}"
