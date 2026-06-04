@@ -38,11 +38,11 @@ class GitHubClient:
         self,
         *,
         token: str | None = None,
-        api_base_url: str = "https://api.github.com",
+        api_base_url: str | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = token if token is not None else os.getenv("GITHUB_TOKEN", "")
-        self._api_base_url = api_base_url.rstrip("/")
+        self._api_base_url = (api_base_url or os.getenv("GITHUB_API_BASE_URL", "https://api.github.com")).rstrip("/")
         self._http_client = http_client
         self._owns_client = http_client is None
 
