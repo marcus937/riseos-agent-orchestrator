@@ -2,6 +2,7 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
+from app.clients.slack import MissingSlackConfigError, SlackClient
 from app.config import Settings, get_settings
 from app.github_events import UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.review_workflow import build_review_workflow
@@ -41,6 +42,9 @@ async def github_webhook(
         raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail=str(exc)) from exc
 
     workflow = build_review_workflow(parsed)
+    slack_task_posted = False
+    if workflow.requeue_context:
+        slack_task_posted = await _post_slack_requeue_task(settings, workflow.requeue_context)
 
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
@@ -53,5 +57,18 @@ async def github_webhook(
         pull_request_number=workflow.pull_request_number,
         commit_sha=workflow.commit_sha,
         review_context=workflow.review_context.model_dump(mode="json") if workflow.review_context else None,
+        requeue_context=workflow.requeue_context.model_dump(mode="json") if workflow.requeue_context else None,
+        slack_task_posted=slack_task_posted,
         next_intended_action=workflow.next_intended_action,
     )
+
+
+async def _post_slack_requeue_task(settings: Settings, requeue_context: Any) -> bool:
+    client = SlackClient(token=settings.slack_bot_token, channel=settings.slack_task_channel)
+    try:
+        await client.post_requeue_task(requeue_context)
+    except MissingSlackConfigError:
+        return False
+    finally:
+        await client.aclose()
+    return True
