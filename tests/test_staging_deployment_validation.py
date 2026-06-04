@@ -55,19 +55,39 @@ def test_build_pull_request_payload_is_non_production() -> None:
     assert json.dumps(payload)
 
 
+def test_build_mock_github_base_url_uses_localhost_port() -> None:
+    assert validation.build_mock_github_base_url("127.0.0.1", 9001) == "http://127.0.0.1:9001"
+
+
 def test_assert_mock_github_writeback_accepts_issue_comment_request() -> None:
     validation.assert_mock_github_writeback(
         [
             {
                 "method": "POST",
                 "path": "/repos/riseos/staging-validation/issues/33/comments",
-                "api_base_url": validation.MOCK_GITHUB_BASE_URL,
+                "api_base_url": "http://127.0.0.1:9101",
                 "body": {"body": "approved"},
             }
-        ]
+        ],
+        "http://127.0.0.1:9101",
     )
 
 
 def test_assert_mock_github_writeback_rejects_missing_request() -> None:
     with pytest.raises(validation.ValidationError, match="expected issue writeback"):
         validation.assert_mock_github_writeback([])
+
+
+def test_assert_mock_github_writeback_rejects_wrong_api_base_url() -> None:
+    with pytest.raises(validation.ValidationError, match="Unexpected GitHub API base URL"):
+        validation.assert_mock_github_writeback(
+            [
+                {
+                    "method": "POST",
+                    "path": "/repos/riseos/staging-validation/issues/33/comments",
+                    "api_base_url": "https://api.github.com",
+                    "body": {"body": "approved"},
+                }
+            ],
+            validation.MOCK_GITHUB_BASE_URL,
+        )
