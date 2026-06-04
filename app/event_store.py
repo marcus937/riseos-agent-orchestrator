@@ -12,6 +12,8 @@ from app.review_queue import ReviewQueueCounters
 class EventRecord(BaseModel):
     event_id: str
     github_event: GitHubEventType
+    diagnostic_stage: str = "webhook_accepted"
+    correlation_key: str | None = None
     repo_full_name: str | None = None
     branch: str | None = None
     commit_sha: str | None = None
@@ -83,6 +85,8 @@ def event_record_from_parsed(parsed: ParsedGitHubEvent) -> EventRecord:
     return EventRecord(
         event_id=str(uuid4()),
         github_event=parsed.event_type,
+        diagnostic_stage="webhook_accepted",
+        correlation_key=_correlation_key(parsed),
         repo_full_name=parsed.repository,
         branch=_branch_from_parsed(parsed),
         commit_sha=parsed.head_sha,
@@ -99,6 +103,17 @@ def _branch_from_parsed(parsed: ParsedGitHubEvent) -> str | None:
     if parsed.ref and parsed.ref.startswith("refs/heads/"):
         return parsed.ref.removeprefix("refs/heads/")
     return parsed.ref
+
+
+def _correlation_key(parsed: ParsedGitHubEvent) -> str:
+    repo = parsed.repository or "unknown-repo"
+    if parsed.pull_request_number:
+        return f"{repo}:pr:{parsed.pull_request_number}"
+    if parsed.issue_number:
+        return f"{repo}:issue:{parsed.issue_number}"
+    if parsed.head_sha:
+        return f"{repo}:commit:{parsed.head_sha}"
+    return f"{repo}:event:{parsed.event_type}"
 
 
 event_store = InMemoryEventStore()
