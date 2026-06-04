@@ -301,7 +301,7 @@ def test_writeback_uses_validated_openai_decision() -> None:
     result = run(writeback_review_decision(response, client))
 
     assert result.success is True
-    assert client.labels == [("riseos/example", 7, "agent-needs-changes")]
+    assert client.labels == [("riseos/example", 7, "bb2-needs-changes")]
     assert "NEEDS_CHANGES" in client.comments[0][2]
 
 
