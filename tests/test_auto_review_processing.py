@@ -4,20 +4,21 @@ from typing import Any
 
 from app.config import Settings
 from app.github_events import GitHubEventType
-from app.main import _auto_process_work_item
-from app.review_queue import ReviewProcessResponse, ReviewWorkItem, ReviewWorkItemStatus, process_review_work_item
+from app.main import _schedule_auto_process_work_item
+from app.review_queue import ReviewProcessResponse, ReviewWorkItem, ReviewWorkItemStatus, process_review_work_item, review_queue
+from app.review_worker import process_queued_review_item
 
 
 def run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-class FakeStorage:
+class FakeBackgroundTasks:
     def __init__(self) -> None:
-        self.saved_items: list[ReviewWorkItem] = []
+        self.tasks: list[tuple[Any, tuple[Any, ...]]] = []
 
-    def save_review_work_item(self, item: ReviewWorkItem) -> None:
-        self.saved_items.append(item)
+    def add_task(self, func: Any, *args: Any, **kwargs: Any) -> None:
+        self.tasks.append((func, args))
 
 
 def review_item() -> ReviewWorkItem:
@@ -32,27 +33,64 @@ def review_item() -> ReviewWorkItem:
     )
 
 
-def test_auto_processing_disabled_does_not_process_or_persist() -> None:
+def test_auto_processing_disabled_does_not_schedule_or_process() -> None:
     item = review_item()
-    storage = FakeStorage()
+    background_tasks = FakeBackgroundTasks()
 
-    result = run(_auto_process_work_item(item, Settings(enable_auto_review_processing=False), storage))
+    scheduled = _schedule_auto_process_work_item(
+        item,
+        Settings(enable_auto_review_processing=False),
+        None,
+        background_tasks,
+    )
 
-    assert result is None
+    assert scheduled is False
+    assert background_tasks.tasks == []
     assert item.status == ReviewWorkItemStatus.PENDING_REVIEW
-    assert storage.saved_items == []
 
 
-def test_auto_processing_runs_and_persists_processed_item(monkeypatch: Any) -> None:
+def test_auto_processing_schedules_background_worker_without_processing_inline() -> None:
+    item = review_queue.add_if_absent(review_item())
+    background_tasks = FakeBackgroundTasks()
+
+    scheduled = _schedule_auto_process_work_item(
+        item,
+        Settings(enable_auto_review_processing=True),
+        None,
+        background_tasks,
+    )
+
+    assert scheduled is True
+    assert item.status == ReviewWorkItemStatus.PENDING_REVIEW
+    assert len(background_tasks.tasks) == 1
+    task, args = background_tasks.tasks[0]
+    assert task is process_queued_review_item
+    assert args[0] == item.id
+    review_queue.reset()
+
+
+def test_background_worker_claims_and_persists_processed_item() -> None:
     async def fake_process(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
         return process_review_work_item(item)
 
-    monkeypatch.setattr("app.main._process_work_item", fake_process)
-    item = review_item()
-    storage = FakeStorage()
+    item = review_queue.add_if_absent(review_item())
 
-    result = run(_auto_process_work_item(item, Settings(enable_auto_review_processing=True), storage))
+    result = run(process_queued_review_item(item.id, Settings(enable_auto_review_processing=True), None, fake_process))
 
     assert result is not None
     assert result.work_item.status == ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW
-    assert storage.saved_items == [result.work_item]
+    assert review_queue.get_item(item.id).status == ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW
+    review_queue.reset()
+
+
+def test_background_worker_resets_claimed_item_for_retry_on_failure() -> None:
+    async def failing_process(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
+        raise RuntimeError("review service unavailable")
+
+    item = review_queue.add_if_absent(review_item())
+
+    result = run(process_queued_review_item(item.id, Settings(enable_auto_review_processing=True), None, failing_process))
+
+    assert result is None
+    assert review_queue.get_item(item.id).status == ReviewWorkItemStatus.PENDING_REVIEW
+    review_queue.reset()
