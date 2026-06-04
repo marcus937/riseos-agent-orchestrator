@@ -1,0 +1,99 @@
+name: Runtime Smoke Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/runtime-smoke-validation.yml"
+      - "app/**"
+      - "docs/runtime-validation.md"
+      - "pyproject.toml"
+      - "tests/test_runtime_validation.py"
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-smoke:
+    name: Isolated HTTP runtime smoke validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_ENV: ci
+      GITHUB_WEBHOOK_SECRET: ci-webhook-secret
+      ORCHESTRATOR_ADMIN_TOKEN: ci-admin-token
+      ENABLE_OPENAI_REVIEW: "false"
+      ENABLE_GITHUB_CONTEXT_HYDRATION: "false"
+      ENABLE_GITHUB_WRITEBACK: "false"
+      ENABLE_TASK_DISPATCH: "false"
+      REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS: "false"
+      RUNTIME_VALIDATION_BASE_URL: http://127.0.0.1:8000
+      RUNTIME_VALIDATION_ARTIFACT_DIR: runtime-validation-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Prepare artifact directories
+        run: |
+          mkdir -p "$RUNTIME_VALIDATION_ARTIFACT_DIR/logs"
+          mkdir -p "$RUNTIME_VALIDATION_ARTIFACT_DIR/http-responses"
+
+      - name: Validate runtime helper tests
+        run: pytest tests/test_runtime_validation.py --junitxml="$RUNTIME_VALIDATION_ARTIFACT_DIR/runtime-validation-helper-results.xml"
+
+      - name: Start application and execute HTTP smoke validation
+        run: |
+          python -m uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > "$RUNTIME_VALIDATION_ARTIFACT_DIR/logs/application.log" \
+            2> "$RUNTIME_VALIDATION_ARTIFACT_DIR/logs/startup.log" &
+          pid="$!"
+          echo "$pid" > "$RUNTIME_VALIDATION_ARTIFACT_DIR/app.pid"
+
+          set +e
+          python -m app.runtime_validation \
+            --base-url "$RUNTIME_VALIDATION_BASE_URL" \
+            --artifact-dir "$RUNTIME_VALIDATION_ARTIFACT_DIR" \
+            --readiness-timeout 60
+          smoke_exit=$?
+          set -e
+
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid"
+            if timeout 10s tail --pid="$pid" -f /dev/null; then
+              wait "$pid" || true
+              echo "Application exited after SIGTERM." > "$RUNTIME_VALIDATION_ARTIFACT_DIR/graceful-shutdown.txt"
+            else
+              echo "Application did not exit after SIGTERM; sending SIGKILL." > "$RUNTIME_VALIDATION_ARTIFACT_DIR/graceful-shutdown.txt"
+              kill -KILL "$pid" 2>/dev/null || true
+              wait "$pid" || true
+              exit 1
+            fi
+          else
+            echo "Application process was not running at shutdown check time." > "$RUNTIME_VALIDATION_ARTIFACT_DIR/graceful-shutdown.txt"
+          fi
+
+          exit "$smoke_exit"
+
+      - name: Upload runtime validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-smoke-validation-artifacts
+          path: runtime-validation-artifacts/**
+          if-no-files-found: warn
