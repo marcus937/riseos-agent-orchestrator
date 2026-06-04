@@ -13,6 +13,8 @@ class Settings:
     github_app_private_key_path: str | None = None
     openai_api_key: str | None = None
     enable_openai_review: bool = False
+    slack_bot_token: str | None = None
+    slack_task_channel: str | None = None
 
 
 @lru_cache(maxsize=1)
@@ -25,4 +27,6 @@ def get_settings() -> Settings:
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         enable_openai_review=os.getenv("ENABLE_OPENAI_REVIEW", "").lower() == "true",
+        slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
+        slack_task_channel=os.getenv("SLACK_TASK_CHANNEL"),
     )
