@@ -29,7 +29,20 @@ def log_webhook_accepted(parsed: ParsedGitHubEvent) -> None:
 
 def log_queue_item_created(item: ReviewWorkItem) -> None:
     log_event(
-        "queue_item_created",
+        "review_queued",
+        item_id=item.id,
+        repo_full_name=item.repo_full_name,
+        event_type=str(item.event_type),
+        commit_sha=item.commit_sha,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        status=str(item.status),
+    )
+
+
+def log_worker_claimed(item: ReviewWorkItem) -> None:
+    log_event(
+        "worker_claimed",
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -42,13 +55,41 @@ def log_queue_item_created(item: ReviewWorkItem) -> None:
 
 def log_review_processing_started(item: ReviewWorkItem) -> None:
     log_event(
-        "review_processing_started",
+        "review_started",
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
         commit_sha=item.commit_sha,
         issue_number=item.issue_number,
         pr_number=item.pr_number,
+    )
+
+
+def log_review_completed(item: ReviewWorkItem, *, decision: str | None = None) -> None:
+    log_event(
+        "review_completed",
+        item_id=item.id,
+        repo_full_name=item.repo_full_name,
+        event_type=str(item.event_type),
+        commit_sha=item.commit_sha,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        status=str(item.status),
+        decision=decision,
+    )
+
+
+def log_review_failed(item: ReviewWorkItem, *, error: str | None = None) -> None:
+    log_event(
+        "review_failed",
+        item_id=item.id,
+        repo_full_name=item.repo_full_name,
+        event_type=str(item.event_type),
+        commit_sha=item.commit_sha,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        status=str(item.status),
+        error=error,
     )
 
 
@@ -104,14 +145,14 @@ def log_openai_review_result(*, attempted: bool, success: bool, error: str | Non
 
 
 def log_github_writeback_attempted() -> None:
-    log_event("github_writeback_attempted", attempted=True)
+    log_event("github_writeback_started", attempted=True)
 
 
 def log_github_writeback_result(*, attempted: bool, success: bool, error: str | None) -> None:
     if not attempted:
         return
     log_event(
-        "github_writeback_succeeded" if success else "github_writeback_failed",
+        "github_writeback_completed",
         attempted=attempted,
         success=success,
         error=error,
