@@ -10,25 +10,27 @@ This repository includes a staging-only GitHub Actions workflow that validates t
 - The GitHub writeback client points at a local mock GitHub API through `GITHUB_API_BASE_URL`.
 - The token used by the validation run is a non-secret placeholder accepted only by the local mock API.
 - The mock GitHub API records writeback requests locally and exposes them only to the validation helper.
+- The workflow waits for the mock GitHub readiness endpoint before starting app validation.
 - No SSH, production deploy target, production secret, branch mutation, merge, or real GitHub write is used.
 
 ## What It Validates
 
 The validation helper starts from the deployed HTTP surface, not only unit tests:
 
-1. Waits for `/health` to report readiness.
-2. Sends a signed `pull_request` webhook to `/webhooks/github`.
-3. Lets the background worker claim the queued review item.
-4. Processes the review in dry-run mode.
-5. Executes GitHub writeback against the local mock API.
-6. Verifies these lifecycle markers:
+1. Waits for the mock GitHub API readiness endpoint.
+2. Waits for `/health` to report FastAPI readiness.
+3. Sends a signed `pull_request` webhook to `/webhooks/github`.
+4. Lets the background worker claim the queued review item.
+5. Processes the review in dry-run mode.
+6. Executes GitHub writeback against the local mock API.
+7. Verifies these lifecycle markers:
    - `worker_claimed_at`
    - `review_started_at`
    - `github_writeback_started_at`
    - `github_writeback_completed_at`
    - `review_completed_at`
-7. Fetches captured mock GitHub requests and fails if the expected issue writeback request is missing.
-8. Captures queue, lifecycle, worker, health, event, failure, app log, mock API log, and mock writeback request artifacts.
+8. Fetches captured mock GitHub requests and fails if the expected issue writeback request is missing.
+9. Captures queue, lifecycle, worker, health, event, failure, app log, mock API log, mock readiness, and mock writeback request artifacts.
 
 ## Artifact Bundle
 
@@ -37,11 +39,14 @@ The workflow uploads `staging-validation-artifacts`, including:
 - `health.json`
 - `webhook-response.json`
 - `diagnostics.json`
+- `mock-github-health.json`
 - `mock-github-requests.json`
 - `orchestrator.log`
 - `mock-github.log`
 - `orchestrator.db`
 - `pytest-results.xml`
+
+`mock-github-health.json` contains the mock readiness response and the local API base URL used by the mock server.
 
 `mock-github-requests.json` contains the HTTP method, request path, API base URL evidence, and payload for each captured mock GitHub writeback request.
 
