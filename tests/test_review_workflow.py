@@ -1,5 +1,5 @@
 from app.github_events import parse_github_event
-from app.review_workflow import REVIEW_NEXT_ACTION, build_review_workflow
+from app.review_workflow import REQUEUE_NEXT_ACTION, REVIEW_NEXT_ACTION, build_review_workflow
 from app.task_state import TaskState, transition_task_state
 
 
@@ -44,6 +44,54 @@ def test_status_done_issue_comment_requests_review() -> None:
     assert result.review_context is not None
     assert result.review_context.issue_number == 42
     assert result.review_context.trigger == "issue_comment_status_done"
+
+
+def test_needs_changes_issue_comment_builds_requeue_context() -> None:
+    parsed = parse_github_event(
+        "issue_comment",
+        {
+            "action": "created",
+            "repository": {"full_name": "marcus937/riseos-agent-orchestrator"},
+            "issue": {
+                "number": 12,
+                "html_url": "https://github.com/marcus937/riseos-agent-orchestrator/issues/12",
+                "labels": [{"name": "agent-ready"}, {"name": "bb-review-needed"}],
+            },
+            "comment": {"body": "NEEDS_CHANGES\n@circuit-forge retry this issue."},
+            "sender": {"login": "bb2"},
+        },
+    )
+
+    result = build_review_workflow(parsed)
+
+    assert result.task_state == TaskState.NEEDS_CHANGES
+    assert result.review_context is None
+    assert result.requeue_context is not None
+    assert result.requeue_context.repo == "marcus937/riseos-agent-orchestrator"
+    assert result.requeue_context.issue_number == 12
+    assert result.requeue_context.labels == ["agent-ready", "bb-review-needed"]
+    assert result.requeue_context.url == "https://github.com/marcus937/riseos-agent-orchestrator/issues/12"
+    assert result.requeue_context.comment_text == "NEEDS_CHANGES\n@circuit-forge retry this issue."
+    assert result.requeue_context.matched_keyword == "@circuit-forge"
+    assert result.next_intended_action == REQUEUE_NEXT_ACTION
+
+
+def test_architecture_blocked_issue_comment_requeues_as_blocked() -> None:
+    parsed = parse_github_event(
+        "issue_comment",
+        {
+            "action": "edited",
+            "repository": {"full_name": "marcus937/riseos-agent-orchestrator"},
+            "issue": {"number": 12},
+            "comment": {"body": "ARCHITECTURE_BLOCKED until Marcus reviews."},
+        },
+    )
+
+    result = build_review_workflow(parsed)
+
+    assert result.task_state == TaskState.BLOCKED
+    assert result.requeue_context is not None
+    assert result.requeue_context.matched_keyword == "architecture_blocked"
 
 
 def test_pull_request_opened_from_agent_integration_requests_review() -> None:
