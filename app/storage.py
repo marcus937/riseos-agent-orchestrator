@@ -132,7 +132,7 @@ class SQLiteStateStore:
             row = conn.execute(
                 """
                 SELECT * FROM review_work_items
-                WHERE status = ?
+                WHERE status IN (?, ?)
                   AND (repo_full_name IS ? OR repo_full_name = ?)
                   AND event_type = ?
                   AND (commit_sha IS ? OR commit_sha = ?)
@@ -143,6 +143,7 @@ class SQLiteStateStore:
                 """,
                 (
                     ReviewWorkItemStatus.PENDING_REVIEW.value,
+                    ReviewWorkItemStatus.REVIEWING.value,
                     repo_full_name,
                     repo_full_name,
                     event_type,
@@ -154,6 +155,38 @@ class SQLiteStateStore:
                     issue_number,
                 ),
             ).fetchone()
+        if row is None:
+            return None
+        return self._review_work_item_from_row(row)
+
+    def claim_review_work_item(self, item_id: str) -> ReviewWorkItem | None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE review_work_items
+                SET status = ?
+                WHERE id = ? AND status = ?
+                """,
+                (ReviewWorkItemStatus.REVIEWING.value, item_id, ReviewWorkItemStatus.PENDING_REVIEW.value),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute("SELECT * FROM review_work_items WHERE id = ?", (item_id,)).fetchone()
+        if row is None:
+            return None
+        return self._review_work_item_from_row(row)
+
+    def reset_review_work_item_for_retry(self, item_id: str) -> ReviewWorkItem | None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE review_work_items
+                SET status = ?
+                WHERE id = ? AND status = ?
+                """,
+                (ReviewWorkItemStatus.PENDING_REVIEW.value, item_id, ReviewWorkItemStatus.REVIEWING.value),
+            )
+            row = conn.execute("SELECT * FROM review_work_items WHERE id = ?", (item_id,)).fetchone()
         if row is None:
             return None
         return self._review_work_item_from_row(row)
