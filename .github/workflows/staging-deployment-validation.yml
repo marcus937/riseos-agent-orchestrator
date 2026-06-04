@@ -1,0 +1,103 @@
+name: Staging Deployment Validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  staging-validation:
+    name: Ephemeral FastAPI staging validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      APP_ENV: staging-validation
+      GITHUB_WEBHOOK_SECRET: staging-validation-secret
+      ORCHESTRATOR_ADMIN_TOKEN: staging-validation-admin-token
+      REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS: "true"
+      ENABLE_AUTO_REVIEW_PROCESSING: "true"
+      ENABLE_GITHUB_WRITEBACK: "true"
+      ENABLE_GITHUB_CONTEXT_HYDRATION: "false"
+      ENABLE_OPENAI_REVIEW: "false"
+      ENABLE_TASK_DISPATCH: "false"
+      GITHUB_TOKEN: staging-validation-token
+      GITHUB_API_BASE_URL: http://127.0.0.1:9001
+      ORCHESTRATOR_DB_PATH: ${{ runner.temp }}/staging-validation/orchestrator.db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Prepare artifact directory
+        run: mkdir -p "${{ runner.temp }}/staging-validation/artifacts"
+
+      - name: Python syntax validation
+        run: python -m compileall app scripts tests
+
+      - name: Run tests
+        run: pytest --junitxml="${{ runner.temp }}/staging-validation/artifacts/pytest-results.xml"
+
+      - name: Start mock GitHub API
+        run: |
+          python scripts/staging_deployment_validation.py mock-github \
+            --host 127.0.0.1 \
+            --port 9001 \
+            > "${{ runner.temp }}/staging-validation/artifacts/mock-github.log" 2>&1 &
+          echo $! > "${{ runner.temp }}/staging-validation/mock-github.pid"
+
+      - name: Start isolated orchestrator
+        run: |
+          uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > "${{ runner.temp }}/staging-validation/artifacts/orchestrator.log" 2>&1 &
+          echo $! > "${{ runner.temp }}/staging-validation/orchestrator.pid"
+
+      - name: Run staging validation
+        run: |
+          python scripts/staging_deployment_validation.py validate \
+            --base-url http://127.0.0.1:8000 \
+            --webhook-secret "$GITHUB_WEBHOOK_SECRET" \
+            --admin-token "$ORCHESTRATOR_ADMIN_TOKEN" \
+            --mock-github-base-url "$GITHUB_API_BASE_URL" \
+            --artifacts-dir "${{ runner.temp }}/staging-validation/artifacts"
+
+      - name: Stop isolated services
+        if: always()
+        run: |
+          for pidfile in "${{ runner.temp }}/staging-validation/orchestrator.pid" "${{ runner.temp }}/staging-validation/mock-github.pid"; do
+            if [ -f "$pidfile" ]; then
+              kill "$(cat "$pidfile")" 2>/dev/null || true
+            fi
+          done
+
+      - name: Copy database artifact
+        if: always()
+        run: |
+          if [ -f "$ORCHESTRATOR_DB_PATH" ]; then
+            cp "$ORCHESTRATOR_DB_PATH" "${{ runner.temp }}/staging-validation/artifacts/orchestrator.db"
+          fi
+
+      - name: Upload staging validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-validation-artifacts
+          path: ${{ runner.temp }}/staging-validation/artifacts
+          if-no-files-found: error
