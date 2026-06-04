@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - agent-integration
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Run pytest
+        id: pytest
+        shell: bash
+        run: |
+          mkdir -p actions-repair-artifacts
+          set +e
+          python -m pytest -ra 2>&1 | tee actions-repair-artifacts/pytest-output.txt
+          exit_code=${PIPESTATUS[0]}
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          exit "${exit_code}"
+
+      - name: Generate CI failure summary
+        if: failure()
+        run: |
+          python -m app.actions_repair \
+            --workflow ci \
+            --status failed \
+            --pytest-output actions-repair-artifacts/pytest-output.txt \
+            --output-dir actions-repair-artifacts
+
+      - name: Upload CI repair artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-repair-artifacts
+          path: actions-repair-artifacts/
+          if-no-files-found: error
