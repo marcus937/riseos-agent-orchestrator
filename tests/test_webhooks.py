@@ -47,6 +47,40 @@ def test_signed_issue_comment_payload_is_accepted() -> None:
     assert response.json()["event_type"] == "issue_comment"
 
 
+def test_signed_requeue_comment_returns_slack_task_packet() -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "riseos/example"},
+        "sender": {"login": "bb2"},
+        "issue": {
+            "number": 7,
+            "html_url": "https://github.com/riseos/example/issues/7",
+            "labels": [{"name": "agent-ready"}],
+        },
+        "comment": {"body": "NEEDS_CHANGES\n@circuit-forge retry issue 7"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "issue_comment", body))
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["task_state"] == "needs_changes"
+    assert data["slack_task_posted"] is False
+    assert data["requeue_context"] == {
+        "repo": "riseos/example",
+        "issue_number": 7,
+        "pull_request_number": None,
+        "labels": ["agent-ready"],
+        "url": "https://github.com/riseos/example/issues/7",
+        "comment_text": "NEEDS_CHANGES\n@circuit-forge retry issue 7",
+        "matched_keyword": "@circuit-forge",
+        "trigger": "issue_comment_requeue",
+    }
+
+
 def test_unsigned_payload_is_rejected() -> None:
     client = client_with_secret()
     response = client.post("/webhooks/github", json={"action": "created"}, headers={"X-GitHub-Event": "issue_comment"})
@@ -72,6 +106,7 @@ def test_issue_comment_parser_extracts_context() -> None:
             "sender": {"login": "marcus"},
             "issue": {
                 "number": 12,
+                "html_url": "https://github.com/riseos/example/pull/12",
                 "pull_request": {"url": "https://api.github.com/repos/riseos/example/pulls/12"},
                 "labels": [{"name": "agent:working"}],
             },
@@ -84,6 +119,7 @@ def test_issue_comment_parser_extracts_context() -> None:
     assert parsed.sender == "marcus"
     assert parsed.issue_number == 12
     assert parsed.pull_request_number == 12
+    assert parsed.html_url == "https://github.com/riseos/example/pull/12"
     assert parsed.labels == ["agent:working"]
 
 
@@ -118,6 +154,7 @@ def test_pull_request_parser_extracts_context() -> None:
             "sender": {"login": "marcus"},
             "pull_request": {
                 "number": 9,
+                "html_url": "https://github.com/riseos/example/pull/9",
                 "head": {"sha": "feedface"},
                 "labels": [{"name": "agent:review-needed"}],
             },
@@ -129,6 +166,7 @@ def test_pull_request_parser_extracts_context() -> None:
     assert parsed.repository == "riseos/example"
     assert parsed.sender == "marcus"
     assert parsed.pull_request_number == 9
+    assert parsed.html_url == "https://github.com/riseos/example/pull/9"
     assert parsed.head_sha == "feedface"
     assert parsed.labels == ["agent:review-needed"]
 
