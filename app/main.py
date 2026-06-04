@@ -23,9 +23,19 @@ from app.operational_logging import (
 from app.reviewer.decision import ReviewDecisionType
 from app.reviewer.openai_review import request_openai_review_decision
 from app.review_queue import (
+    RecentFailure,
+    ReviewLifecycleStage,
+    ReviewLifecycleVisibility,
     ReviewProcessResponse,
+    ReviewQueueStats,
     ReviewWorkItem,
+    WorkerStats,
+    build_lifecycle_visibility,
+    build_queue_stats,
+    build_recent_failures,
+    build_worker_stats,
     process_review_work_item,
+    record_lifecycle_stage,
     review_queue,
     review_work_item_from_parsed,
 )
@@ -62,6 +72,13 @@ def _require_debug_read_access(
     _require_admin_token(settings, x_orchestrator_admin_token)
 
 
+def _review_items() -> list[ReviewWorkItem]:
+    storage = _storage()
+    if storage is not None:
+        return storage.list_review_work_items()
+    return review_queue.list_items()
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -91,10 +108,39 @@ async def debug_health(
 async def debug_review_queue(
     _: None = Depends(_require_debug_read_access),
 ) -> list[ReviewWorkItem]:
+    return _review_items()
+
+
+@app.get("/debug/review-queue/stats", response_model=ReviewQueueStats)
+async def debug_review_queue_stats(
+    _: None = Depends(_require_debug_read_access),
+) -> ReviewQueueStats:
     storage = _storage()
     if storage is not None:
-        return storage.list_review_work_items()
-    return review_queue.list_items()
+        return build_queue_stats(storage.list_review_work_items(), counters=storage.review_queue_counters())
+    return build_queue_stats(review_queue.list_items(), counters=review_queue.counters())
+
+
+@app.get("/debug/workers/stats", response_model=WorkerStats)
+async def debug_worker_stats(
+    _: None = Depends(_require_debug_read_access),
+    settings: Settings = Depends(get_settings),
+) -> WorkerStats:
+    return build_worker_stats(_review_items(), auto_processing_enabled=settings.enable_auto_review_processing)
+
+
+@app.get("/debug/review-lifecycle", response_model=list[ReviewLifecycleVisibility])
+async def debug_review_lifecycle(
+    _: None = Depends(_require_debug_read_access),
+) -> list[ReviewLifecycleVisibility]:
+    return build_lifecycle_visibility(_review_items())
+
+
+@app.get("/debug/recent-failures", response_model=list[RecentFailure])
+async def debug_recent_failures(
+    _: None = Depends(_require_debug_read_access),
+) -> list[RecentFailure]:
+    return build_recent_failures(_review_items())
 
 
 @app.get("/debug/review-queue/{item_id}", response_model=ReviewWorkItem)
@@ -134,6 +180,7 @@ async def process_debug_review_queue_item(
 
 async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
     log_review_processing_started(item)
+    record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_STARTED)
     changed_files: list[str] = []
     diff_summary: str | None = None
     diff_patches: list[dict[str, object]] = []
@@ -151,6 +198,10 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
                 github_client,
                 base_branch=settings.base_branch,
             )
+        except Exception as exc:
+            github_context_error = str(exc)
+            record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_FAILED, error=github_context_error)
+            raise
         finally:
             await github_client.aclose()
 
@@ -163,6 +214,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
 
     if settings.enable_openai_review:
         log_openai_review_attempted(reviewer_model=settings.openai_review_model)
+        record_lifecycle_stage(item, ReviewLifecycleStage.OPENAI_REVIEW_ATTEMPTED)
     openai_review = await request_openai_review_decision(
         item,
         settings,
@@ -179,6 +231,12 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         error=openai_review.error,
         reviewer_model=openai_review.reviewer_model,
     )
+    if openai_review.attempted:
+        record_lifecycle_stage(
+            item,
+            ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED if openai_review.success else ReviewLifecycleStage.OPENAI_REVIEW_FAILED,
+            error=openai_review.error,
+        )
 
     response = process_review_work_item(
         item,
@@ -197,15 +255,23 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
 
     if not settings.enable_github_writeback:
         log_review_completed(response.work_item, decision=response.decision.decision.value)
+        record_lifecycle_stage(response.work_item, ReviewLifecycleStage.REVIEW_COMPLETED)
         return response
 
     log_github_writeback_attempted()
+    record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED)
     github_client = GitHubClient(token=settings.github_token)
     try:
         writeback = await writeback_review_decision(response, github_client)
         response.github_writeback_attempted = writeback.attempted
         response.github_writeback_success = writeback.success
         response.github_writeback_error = writeback.error
+        record_lifecycle_stage(
+            response.work_item,
+            ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED,
+            success=writeback.success,
+            error=writeback.error,
+        )
         if writeback.success and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
             task_dispatch = await dispatch_next_agent_task(
                 response.work_item.repo_full_name,
@@ -225,6 +291,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         error=response.github_writeback_error,
     )
     log_review_completed(response.work_item, decision=response.decision.decision.value)
+    record_lifecycle_stage(response.work_item, ReviewLifecycleStage.REVIEW_COMPLETED)
     return response
 
 
