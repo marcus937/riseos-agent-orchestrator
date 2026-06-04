@@ -18,9 +18,23 @@ class ReviewWorkItemStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class ReviewLifecycleStage(StrEnum):
+    REVIEW_QUEUED = "review_queued"
+    WORKER_CLAIMED = "worker_claimed"
+    REVIEW_STARTED = "review_started"
+    OPENAI_REVIEW_ATTEMPTED = "openai_review_attempted"
+    OPENAI_REVIEW_SUCCEEDED = "openai_review_succeeded"
+    OPENAI_REVIEW_FAILED = "openai_review_failed"
+    REVIEW_COMPLETED = "review_completed"
+    REVIEW_FAILED = "review_failed"
+    GITHUB_WRITEBACK_STARTED = "github_writeback_started"
+    GITHUB_WRITEBACK_COMPLETED = "github_writeback_completed"
+
+
 class ReviewWorkItem(BaseModel):
     id: str
     created_at: datetime
+    updated_at: datetime | None = None
     repo_full_name: str | None = None
     event_type: GitHubEventType
     branch: str | None = None
@@ -28,6 +42,18 @@ class ReviewWorkItem(BaseModel):
     issue_number: int | None = None
     pr_number: int | None = None
     status: ReviewWorkItemStatus = ReviewWorkItemStatus.PENDING_REVIEW
+    lifecycle_stage: ReviewLifecycleStage = ReviewLifecycleStage.REVIEW_QUEUED
+    worker_claimed_at: datetime | None = None
+    review_started_at: datetime | None = None
+    openai_review_attempted_at: datetime | None = None
+    openai_review_completed_at: datetime | None = None
+    review_completed_at: datetime | None = None
+    github_writeback_started_at: datetime | None = None
+    github_writeback_completed_at: datetime | None = None
+    github_writeback_success: bool | None = None
+    failure_count: int = 0
+    last_failure_at: datetime | None = None
+    last_error: str | None = None
 
 
 class ReviewProcessResponse(BaseModel):
@@ -64,6 +90,57 @@ class ReviewQueueCounters(BaseModel):
     blocked_count: int
 
 
+class ReviewQueueStats(BaseModel):
+    counters: ReviewQueueCounters
+    oldest_pending_age_seconds: float | None = None
+    newest_item_age_seconds: float | None = None
+    failure_count: int
+    recent_failure_count: int
+    last_failure_at: datetime | None = None
+
+
+class WorkerStats(BaseModel):
+    auto_processing_enabled: bool
+    claimed_count: int
+    active_reviewing_count: int
+    completed_count: int
+    failed_count: int
+    last_claimed_at: datetime | None = None
+    last_review_completed_at: datetime | None = None
+    last_failure_at: datetime | None = None
+
+
+class ReviewLifecycleVisibility(BaseModel):
+    item_id: str
+    repo_full_name: str | None = None
+    event_type: GitHubEventType
+    status: ReviewWorkItemStatus
+    lifecycle_stage: ReviewLifecycleStage
+    queued_at: datetime
+    worker_claimed_at: datetime | None = None
+    review_started_at: datetime | None = None
+    openai_review_attempted_at: datetime | None = None
+    openai_review_completed_at: datetime | None = None
+    review_completed_at: datetime | None = None
+    github_writeback_started_at: datetime | None = None
+    github_writeback_completed_at: datetime | None = None
+    github_writeback_success: bool | None = None
+    failure_count: int
+    last_failure_at: datetime | None = None
+    last_error: str | None = None
+
+
+class RecentFailure(BaseModel):
+    item_id: str
+    repo_full_name: str | None = None
+    event_type: GitHubEventType
+    status: ReviewWorkItemStatus
+    lifecycle_stage: ReviewLifecycleStage
+    failure_count: int
+    last_failure_at: datetime
+    last_error: str
+
+
 class InMemoryReviewQueue:
     def __init__(self) -> None:
         self._items: deque[ReviewWorkItem] = deque()
@@ -98,14 +175,17 @@ class InMemoryReviewQueue:
         if item is None or item.status != ReviewWorkItemStatus.PENDING_REVIEW:
             return None
         item.status = ReviewWorkItemStatus.REVIEWING
+        record_lifecycle_stage(item, ReviewLifecycleStage.WORKER_CLAIMED)
         return item
 
-    def reset_item_for_retry(self, item_id: str) -> ReviewWorkItem | None:
+    def reset_item_for_retry(self, item_id: str, *, error: str | None = None) -> ReviewWorkItem | None:
         item = self.get_item(item_id)
         if item is None:
             return None
         if item.status == ReviewWorkItemStatus.REVIEWING:
             item.status = ReviewWorkItemStatus.PENDING_REVIEW
+        if error:
+            record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_FAILED, error=error)
         return item
 
     def list_items(self) -> list[ReviewWorkItem]:
@@ -125,16 +205,7 @@ class InMemoryReviewQueue:
         return process_review_work_item(item)
 
     def counters(self) -> ReviewQueueCounters:
-        status_counts = Counter(item.status for item in self._items)
-        return ReviewQueueCounters(
-            review_queue_count=len(self._items),
-            pending_review_count=status_counts[ReviewWorkItemStatus.PENDING_REVIEW],
-            reviewing_count=status_counts[ReviewWorkItemStatus.REVIEWING],
-            needs_changes_count=status_counts[ReviewWorkItemStatus.NEEDS_CHANGES],
-            approved_count=status_counts[ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW],
-            approved_for_human_review_count=status_counts[ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW],
-            blocked_count=status_counts[ReviewWorkItemStatus.BLOCKED],
-        )
+        return review_queue_counters(self._items)
 
     def reset(self) -> None:
         self._items.clear()
@@ -153,9 +224,11 @@ class InMemoryReviewQueue:
 
 
 def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
+    now = datetime.now(UTC)
     return ReviewWorkItem(
         id=str(uuid4()),
-        created_at=datetime.now(UTC),
+        created_at=now,
+        updated_at=now,
         repo_full_name=parsed.repository,
         event_type=parsed.event_type,
         branch=_branch_from_parsed(parsed),
@@ -173,6 +246,125 @@ def review_work_item_identity(item: ReviewWorkItem) -> tuple[str | None, str, st
         item.pr_number,
         item.issue_number,
     )
+
+
+def record_lifecycle_stage(
+    item: ReviewWorkItem,
+    stage: ReviewLifecycleStage,
+    *,
+    success: bool | None = None,
+    error: str | None = None,
+) -> ReviewWorkItem:
+    now = datetime.now(UTC)
+    item.updated_at = now
+    item.lifecycle_stage = stage
+    if stage == ReviewLifecycleStage.WORKER_CLAIMED:
+        item.worker_claimed_at = now
+    elif stage == ReviewLifecycleStage.REVIEW_STARTED:
+        item.review_started_at = now
+    elif stage == ReviewLifecycleStage.OPENAI_REVIEW_ATTEMPTED:
+        item.openai_review_attempted_at = now
+    elif stage in {ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED, ReviewLifecycleStage.OPENAI_REVIEW_FAILED}:
+        item.openai_review_completed_at = now
+    elif stage == ReviewLifecycleStage.REVIEW_COMPLETED:
+        item.review_completed_at = now
+    elif stage == ReviewLifecycleStage.REVIEW_FAILED:
+        item.last_failure_at = now
+        item.failure_count += 1
+    elif stage == ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED:
+        item.github_writeback_started_at = now
+    elif stage == ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED:
+        item.github_writeback_completed_at = now
+        item.github_writeback_success = success
+    if error:
+        item.last_error = error
+        item.last_failure_at = now
+        if stage != ReviewLifecycleStage.REVIEW_FAILED:
+            item.failure_count += 1
+    return item
+
+
+def review_queue_counters(items: list[ReviewWorkItem] | deque[ReviewWorkItem]) -> ReviewQueueCounters:
+    status_counts = Counter(item.status for item in items)
+    return ReviewQueueCounters(
+        review_queue_count=len(items),
+        pending_review_count=status_counts[ReviewWorkItemStatus.PENDING_REVIEW],
+        reviewing_count=status_counts[ReviewWorkItemStatus.REVIEWING],
+        needs_changes_count=status_counts[ReviewWorkItemStatus.NEEDS_CHANGES],
+        approved_count=status_counts[ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW],
+        approved_for_human_review_count=status_counts[ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW],
+        blocked_count=status_counts[ReviewWorkItemStatus.BLOCKED],
+    )
+
+
+def build_queue_stats(items: list[ReviewWorkItem], counters: ReviewQueueCounters | None = None) -> ReviewQueueStats:
+    now = datetime.now(UTC)
+    pending_items = [item for item in items if item.status == ReviewWorkItemStatus.PENDING_REVIEW]
+    failed_items = [item for item in items if item.last_failure_at is not None]
+    return ReviewQueueStats(
+        counters=counters or review_queue_counters(items),
+        oldest_pending_age_seconds=_oldest_age_seconds(pending_items, now),
+        newest_item_age_seconds=_newest_age_seconds(items, now),
+        failure_count=sum(item.failure_count for item in items),
+        recent_failure_count=len(failed_items),
+        last_failure_at=max((item.last_failure_at for item in failed_items if item.last_failure_at), default=None),
+    )
+
+
+def build_worker_stats(items: list[ReviewWorkItem], *, auto_processing_enabled: bool) -> WorkerStats:
+    return WorkerStats(
+        auto_processing_enabled=auto_processing_enabled,
+        claimed_count=sum(1 for item in items if item.worker_claimed_at is not None),
+        active_reviewing_count=sum(1 for item in items if item.status == ReviewWorkItemStatus.REVIEWING),
+        completed_count=sum(1 for item in items if item.review_completed_at is not None),
+        failed_count=sum(item.failure_count for item in items),
+        last_claimed_at=max((item.worker_claimed_at for item in items if item.worker_claimed_at), default=None),
+        last_review_completed_at=max((item.review_completed_at for item in items if item.review_completed_at), default=None),
+        last_failure_at=max((item.last_failure_at for item in items if item.last_failure_at), default=None),
+    )
+
+
+def build_lifecycle_visibility(items: list[ReviewWorkItem]) -> list[ReviewLifecycleVisibility]:
+    return [
+        ReviewLifecycleVisibility(
+            item_id=item.id,
+            repo_full_name=item.repo_full_name,
+            event_type=item.event_type,
+            status=item.status,
+            lifecycle_stage=item.lifecycle_stage,
+            queued_at=item.created_at,
+            worker_claimed_at=item.worker_claimed_at,
+            review_started_at=item.review_started_at,
+            openai_review_attempted_at=item.openai_review_attempted_at,
+            openai_review_completed_at=item.openai_review_completed_at,
+            review_completed_at=item.review_completed_at,
+            github_writeback_started_at=item.github_writeback_started_at,
+            github_writeback_completed_at=item.github_writeback_completed_at,
+            github_writeback_success=item.github_writeback_success,
+            failure_count=item.failure_count,
+            last_failure_at=item.last_failure_at,
+            last_error=item.last_error,
+        )
+        for item in items
+    ]
+
+
+def build_recent_failures(items: list[ReviewWorkItem], *, limit: int = 20) -> list[RecentFailure]:
+    failures = [
+        RecentFailure(
+            item_id=item.id,
+            repo_full_name=item.repo_full_name,
+            event_type=item.event_type,
+            status=item.status,
+            lifecycle_stage=item.lifecycle_stage,
+            failure_count=item.failure_count,
+            last_failure_at=item.last_failure_at,
+            last_error=item.last_error or "Unknown review failure.",
+        )
+        for item in items
+        if item.last_failure_at is not None and item.last_error
+    ]
+    return sorted(failures, key=lambda failure: failure.last_failure_at, reverse=True)[:limit]
 
 
 def _branch_from_parsed(parsed: ParsedGitHubEvent) -> str | None:
@@ -227,9 +419,14 @@ def process_review_work_item(
 ) -> ReviewProcessResponse:
     if item.status == ReviewWorkItemStatus.PENDING_REVIEW:
         item.status = ReviewWorkItemStatus.REVIEWING
+        record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_STARTED)
 
     decision = decision or build_dry_run_review_decision(item)
     item.status = _status_from_decision(decision)
+    if github_context_error:
+        item.last_error = github_context_error
+    if github_writeback_error:
+        record_lifecycle_stage(item, ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED, success=False, error=github_writeback_error)
     return ReviewProcessResponse(
         work_item=item,
         decision=decision,
@@ -275,6 +472,18 @@ def _intended_next_actions(decision: ReviewDecision) -> list[str]:
     if decision.decision == ReviewDecisionType.NEEDS_CHANGES:
         return ["Prepare a follow-up task prompt for the coding agent.", "Wait for human approval before any merge."]
     return ["Send the dry-run decision to BB/Jarvis Architect for human review.", "Do not merge automatically."]
+
+
+def _oldest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
+    if not items:
+        return None
+    return round((now - min(item.created_at for item in items)).total_seconds(), 3)
+
+
+def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
+    if not items:
+        return None
+    return round((now - max(item.created_at for item in items)).total_seconds(), 3)
 
 
 _UNFINISHED_STATUSES = {ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}
