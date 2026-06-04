@@ -52,6 +52,41 @@ def log_review_processing_started(item: ReviewWorkItem) -> None:
     )
 
 
+def log_auto_review_processing_started(item: ReviewWorkItem) -> None:
+    log_event(
+        "auto_review_processing_started",
+        item_id=item.id,
+        repo_full_name=item.repo_full_name,
+        event_type=str(item.event_type),
+        commit_sha=item.commit_sha,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        status=str(item.status),
+    )
+
+
+def log_auto_review_processing_result(
+    item: ReviewWorkItem,
+    *,
+    success: bool,
+    error: str | None = None,
+    decision: str | None = None,
+) -> None:
+    log_event(
+        "auto_review_processing_succeeded" if success else "auto_review_processing_failed",
+        item_id=item.id,
+        repo_full_name=item.repo_full_name,
+        event_type=str(item.event_type),
+        commit_sha=item.commit_sha,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        status=str(item.status),
+        success=success,
+        decision=decision,
+        error=error,
+    )
+
+
 def log_openai_review_attempted(*, reviewer_model: str | None) -> None:
     log_event("openai_review_attempted", attempted=True, reviewer_model=reviewer_model)
 
