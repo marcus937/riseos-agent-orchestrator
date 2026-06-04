@@ -1,0 +1,112 @@
+name: End-to-End Review Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/end-to-end-review-validation.yml"
+      - "app/**"
+      - "tests/test_end_to_end_review_validation.py"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  end-to-end-review-validation:
+    name: End-to-end review queue execution validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      APP_ENV: end-to-end-review-validation
+      GITHUB_WEBHOOK_SECRET: end-to-end-review-validation-secret
+      ORCHESTRATOR_ADMIN_TOKEN: end-to-end-review-validation-admin-token
+      REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS: "true"
+      ENABLE_AUTO_REVIEW_PROCESSING: "true"
+      ENABLE_GITHUB_WRITEBACK: "true"
+      ENABLE_GITHUB_CONTEXT_HYDRATION: "false"
+      ENABLE_OPENAI_REVIEW: "false"
+      ENABLE_TASK_DISPATCH: "false"
+      GITHUB_TOKEN: end-to-end-review-validation-token
+      GITHUB_API_BASE_URL: http://127.0.0.1:9001
+      ORCHESTRATOR_DB_PATH: ${{ runner.temp }}/end-to-end-review-validation/orchestrator.db
+      E2E_REVIEW_VALIDATION_BASE_URL: http://127.0.0.1:8000
+      E2E_REVIEW_VALIDATION_ARTIFACT_DIR: ${{ runner.temp }}/end-to-end-review-validation/artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Prepare artifact directory
+        run: mkdir -p "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR"
+
+      - name: Python syntax validation
+        run: python -m compileall app tests
+
+      - name: Run end-to-end validation helper tests
+        run: |
+          pytest tests/test_end_to_end_review_validation.py \
+            --junitxml="$E2E_REVIEW_VALIDATION_ARTIFACT_DIR/end-to-end-helper-results.xml"
+
+      - name: Start local mock GitHub API
+        run: |
+          python -m app.end_to_end_review_validation mock-github \
+            --host 127.0.0.1 \
+            --port 9001 \
+            > "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR/mock-github.log" 2>&1 &
+          echo $! > "${{ runner.temp }}/end-to-end-review-validation/mock-github.pid"
+
+      - name: Start isolated orchestrator
+        run: |
+          python -m uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR/orchestrator.log" 2>&1 &
+          echo $! > "${{ runner.temp }}/end-to-end-review-validation/orchestrator.pid"
+
+      - name: Run end-to-end review validation
+        run: |
+          python -m app.end_to_end_review_validation validate \
+            --base-url "$E2E_REVIEW_VALIDATION_BASE_URL" \
+            --webhook-secret "$GITHUB_WEBHOOK_SECRET" \
+            --admin-token "$ORCHESTRATOR_ADMIN_TOKEN" \
+            --mock-github-base-url "$GITHUB_API_BASE_URL" \
+            --artifacts-dir "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR"
+
+      - name: Stop isolated services
+        if: always()
+        run: |
+          for pidfile in "${{ runner.temp }}/end-to-end-review-validation/orchestrator.pid" "${{ runner.temp }}/end-to-end-review-validation/mock-github.pid"; do
+            if [ -f "$pidfile" ]; then
+              kill "$(cat "$pidfile")" 2>/dev/null || true
+            fi
+          done
+
+      - name: Copy database artifact
+        if: always()
+        run: |
+          if [ -f "$ORCHESTRATOR_DB_PATH" ]; then
+            cp "$ORCHESTRATOR_DB_PATH" "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR/orchestrator.db"
+          fi
+
+      - name: Upload end-to-end review validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: end-to-end-review-validation-artifacts
+          path: ${{ runner.temp }}/end-to-end-review-validation/artifacts
+          if-no-files-found: error
