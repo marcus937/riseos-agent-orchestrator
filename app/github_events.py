@@ -17,6 +17,7 @@ class ParsedGitHubEvent(BaseModel):
     sender: str | None = None
     issue_number: int | None = None
     pull_request_number: int | None = None
+    html_url: str | None = None
     ref: str | None = None
     before: str | None = None
     after: str | None = None
@@ -65,6 +66,7 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
             **base,
             issue_number=issue.get("number"),
             pull_request_number=issue.get("number") if issue.get("pull_request") else None,
+            html_url=issue.get("html_url"),
             labels=[str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")],
             comment_body=(payload.get("comment") or {}).get("body"),
         )
@@ -83,6 +85,7 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     return ParsedGitHubEvent(
         **base,
         pull_request_number=pull_request.get("number") or payload.get("number"),
+        html_url=pull_request.get("html_url"),
         head_sha=(pull_request.get("head") or {}).get("sha"),
         head_ref=(pull_request.get("head") or {}).get("ref"),
         base_ref=(pull_request.get("base") or {}).get("ref"),
@@ -102,4 +105,6 @@ class WebhookAcceptedResponse(BaseModel):
     pull_request_number: int | None = None
     commit_sha: str | None = None
     review_context: dict[str, Any] | None = None
+    requeue_context: dict[str, Any] | None = None
+    slack_task_posted: bool = False
     next_intended_action: str | None = None
