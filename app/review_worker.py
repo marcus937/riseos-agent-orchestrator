@@ -22,7 +22,7 @@ async def process_queued_review_item(
     try:
         response = await process_work_item(item, settings)
     except Exception as exc:
-        retry_item = _reset_review_work_item_for_retry(item, storage)
+        retry_item = _reset_review_work_item_for_retry(item, storage, error=str(exc))
         log_review_failed(retry_item, error=str(exc))
         return None
 
@@ -37,7 +37,12 @@ def _claim_review_work_item(item_id: str, storage: SQLiteStateStore | None) -> R
     return review_queue.claim_item(item_id)
 
 
-def _reset_review_work_item_for_retry(item: ReviewWorkItem, storage: SQLiteStateStore | None) -> ReviewWorkItem:
+def _reset_review_work_item_for_retry(
+    item: ReviewWorkItem,
+    storage: SQLiteStateStore | None,
+    *,
+    error: str | None = None,
+) -> ReviewWorkItem:
     if storage is not None:
-        return storage.reset_review_work_item_for_retry(item.id) or item
-    return review_queue.reset_item_for_retry(item.id) or item
+        return storage.reset_review_work_item_for_retry(item.id, error=error) or item
+    return review_queue.reset_item_for_retry(item.id, error=error) or item
