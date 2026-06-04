@@ -73,7 +73,7 @@ def test_run_smoke_validation_writes_response_artifacts(tmp_path) -> None:
 
 def test_run_smoke_validation_reports_failed_endpoint(tmp_path) -> None:
     def fake_request(url: str, timeout_seconds: float) -> RuntimeHttpResponse:
-        if url.endswith("/health"):
+        if url == "http://service/health":
             return RuntimeHttpResponse(200, '{"status":"ok"}', 0.01, None)
         return RuntimeHttpResponse(404, "missing", 0.01, "HTTP 404")
 
@@ -89,6 +89,23 @@ def test_run_smoke_validation_reports_failed_endpoint(tmp_path) -> None:
     summary = (tmp_path / "failure-summary.md").read_text(encoding="utf-8")
     assert "diagnostics" in summary
     assert "got 404" in summary
+
+
+def test_run_smoke_validation_reports_readiness_failure(tmp_path) -> None:
+    def fake_request(url: str, timeout_seconds: float) -> RuntimeHttpResponse:
+        return RuntimeHttpResponse(503, "starting", 0.01, None)
+
+    exit_code = run_smoke_validation(
+        base_url="http://service",
+        artifact_dir=tmp_path,
+        readiness_timeout_seconds=0,
+        request_fn=fake_request,
+    )
+
+    assert exit_code == 1
+    summary = (tmp_path / "failure-summary.md").read_text(encoding="utf-8")
+    assert "startup_readiness" in summary
+    assert "All runtime smoke checks passed." not in summary
 
 
 def test_graceful_shutdown_terminates_process() -> None:
