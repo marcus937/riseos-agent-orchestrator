@@ -20,6 +20,7 @@ class Settings:
     orchestrator_admin_token: str | None = None
     orchestrator_max_review_items: int = 500
     require_admin_token_for_debug_reads: bool = False
+    enable_auto_review_processing: bool = False
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
@@ -47,6 +48,7 @@ def get_settings() -> Settings:
         orchestrator_admin_token=os.getenv("ORCHESTRATOR_ADMIN_TOKEN"),
         orchestrator_max_review_items=_int_env("ORCHESTRATOR_MAX_REVIEW_ITEMS", 500),
         require_admin_token_for_debug_reads=os.getenv("REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS", "").lower() == "true",
+        enable_auto_review_processing=os.getenv("ENABLE_AUTO_REVIEW_PROCESSING", "").lower() == "true",
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
         enable_github_writeback=os.getenv("ENABLE_GITHUB_WRITEBACK", "").lower() == "true",
         enable_task_dispatch=os.getenv("ENABLE_TASK_DISPATCH", "").lower() == "true",
