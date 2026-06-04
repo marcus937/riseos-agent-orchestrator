@@ -27,6 +27,8 @@ This MVP accepts GitHub webhooks, verifies GitHub signatures, parses supported e
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Later | Placeholder path for GitHub App private key. |
 | `OPENAI_API_KEY` | Later | Placeholder for reviewer integration. |
 | `ENABLE_OPENAI_REVIEW` | No | Must be `true` before future OpenAI reviewer calls are allowed. |
+| `SLACK_BOT_TOKEN` | Requeue dispatch | Bot token used to post Circuit requeue task messages. |
+| `SLACK_TASK_CHANNEL` | Requeue dispatch | Slack channel ID for Circuit task messages. |
 | `APP_ENV` | No | Runtime environment label. Defaults to `local`. |
 
 ## GitHub Token Permissions
@@ -88,7 +90,6 @@ PY
 
 Send the payload with `X-GitHub-Event: issue_comment` and the generated `X-Hub-Signature-256` header.
 
-
 ## Webhook Dry-Run Review Behavior
 
 The webhook endpoint accepts supported GitHub events and returns a dry-run review stub when review is needed. It does not call GitHub live, merge, write files, or change branches.
@@ -98,6 +99,23 @@ Review-needed triggers:
 - `push` to `refs/heads/agent-integration` returns `task_state: review_needed` with the pushed commit SHA.
 - `issue_comment` containing `Status: Done` returns `task_state: review_needed` with the issue number.
 - `pull_request` with action `opened` or `synchronize` from `agent-integration` returns `task_state: review_needed` with the PR number and head SHA.
+
+GitHub comment requeue triggers:
+
+- `issue_comment.created` and `issue_comment.edited` are inspected for Circuit requeue keywords.
+- Matching comments build a Slack task packet containing repo, issue/PR number, labels, URL, trigger, and comment text.
+- If `SLACK_BOT_TOKEN` and `SLACK_TASK_CHANNEL` are configured, the task packet is posted to Slack.
+- If Slack is not configured, the webhook still returns the `requeue_context` packet and `slack_task_posted: false`.
+
+Supported requeue keywords:
+
+- `@circuit-forge`
+- `NEEDS_CHANGES`
+- `APPROVED_FOR_HUMAN_REVIEW`
+- `ARCHITECTURE_BLOCKED`
+- `ARCHITECT_REVIEW_REQUIRED`
+- `MERGE_BLOCKED_NEEDS_BB`
+- `bb-review-needed`
 
 Example dry-run response shape:
 
