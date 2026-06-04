@@ -1,0 +1,71 @@
+name: Queue Lifecycle Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/queue-lifecycle-validation.yml"
+      - "app/queue_lifecycle_validation.py"
+      - "app/review_queue.py"
+      - "app/review_worker.py"
+      - "app/storage.py"
+      - "app/github_writeback.py"
+      - "pyproject.toml"
+      - "tests/test_queue_lifecycle_validation.py"
+      - "docs/queue-lifecycle-validation.md"
+
+permissions:
+  contents: read
+
+jobs:
+  queue-lifecycle-validation:
+    name: Deterministic queue lifecycle validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_ENV: ci
+      GITHUB_WEBHOOK_SECRET: ci-webhook-secret
+      ORCHESTRATOR_ADMIN_TOKEN: ci-admin-token
+      ENABLE_OPENAI_REVIEW: "false"
+      ENABLE_GITHUB_CONTEXT_HYDRATION: "false"
+      ENABLE_GITHUB_WRITEBACK: "false"
+      ENABLE_TASK_DISPATCH: "false"
+      QUEUE_LIFECYCLE_ARTIFACT_DIR: queue-lifecycle-validation-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Validate syntax and imports
+        run: |
+          python -m compileall app tests
+          python -c "import app.queue_lifecycle_validation; import app.review_queue; import app.review_worker; import app.storage"
+
+      - name: Run queue lifecycle tests
+        run: |
+          mkdir -p "$QUEUE_LIFECYCLE_ARTIFACT_DIR"
+          pytest tests/test_queue_lifecycle_validation.py --junitxml="$QUEUE_LIFECYCLE_ARTIFACT_DIR/queue-lifecycle-results.xml"
+
+      - name: Generate queue lifecycle artifact bundle
+        run: python -m app.queue_lifecycle_validation --artifact-dir "$QUEUE_LIFECYCLE_ARTIFACT_DIR"
+
+      - name: Upload queue lifecycle validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-lifecycle-validation-artifacts
+          path: queue-lifecycle-validation-artifacts/**
+          if-no-files-found: warn

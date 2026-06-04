@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - agent-integration
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Python syntax validation
+        run: python -m compileall app tests
+
+      - name: Import validation
+        run: python -c "import app.main; import app.review_queue; import app.review_worker"
+
+      - name: Optional lint if configured
+        run: |
+          python - <<'PY'
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+
+          pyproject = pathlib.Path("pyproject.toml")
+          has_ruff_config = pyproject.exists() and "[tool.ruff" in pyproject.read_text(encoding="utf-8")
+          if not has_ruff_config:
+              print("No lint configuration found; skipping optional lint.")
+              sys.exit(0)
+          if shutil.which("ruff") is None:
+              print("Ruff configuration found, but ruff is not installed; skipping optional lint.")
+              sys.exit(0)
+          subprocess.run(["ruff", "check", "."], check=True)
+          PY
+
+      - name: Run pytest
+        run: pytest --junitxml=pytest-results.xml
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-artifacts
+          path: |
+            pytest-results.xml
+            .pytest_cache/**
+          if-no-files-found: ignore
