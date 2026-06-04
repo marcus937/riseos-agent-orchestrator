@@ -10,6 +10,8 @@ from app.github_context import hydrate_github_context
 from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
 from app.operational_logging import (
+    log_auto_review_processing_result,
+    log_auto_review_processing_started,
     log_github_writeback_result,
     log_github_writeback_attempted,
     log_openai_review_attempted,
@@ -224,6 +226,31 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     return response
 
 
+async def _auto_process_work_item(
+    item: ReviewWorkItem | None,
+    settings: Settings,
+    storage: SQLiteStateStore | None,
+) -> ReviewProcessResponse | None:
+    if item is None or not settings.enable_auto_review_processing:
+        return None
+
+    log_auto_review_processing_started(item)
+    try:
+        response = await _process_work_item(item, settings)
+        if storage is not None:
+            storage.save_review_work_item(response.work_item)
+    except Exception as exc:
+        log_auto_review_processing_result(item, success=False, error=str(exc))
+        return None
+
+    log_auto_review_processing_result(
+        response.work_item,
+        success=True,
+        decision=response.decision.decision.value,
+    )
+    return response
+
+
 @app.post("/webhooks/github", response_model=WebhookAcceptedResponse)
 async def github_webhook(
     request: Request,
@@ -262,6 +289,8 @@ async def github_webhook(
     if storage is not None:
         storage.save_event_record(event_record)
         storage.prune_processed_review_items(settings.orchestrator_max_review_items)
+
+    await _auto_process_work_item(work_item, settings, storage)
 
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
