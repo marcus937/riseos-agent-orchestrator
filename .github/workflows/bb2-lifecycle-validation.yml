@@ -1,0 +1,68 @@
+name: BB2 Lifecycle Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/bb2-lifecycle-validation.yml"
+      - "app/main.py"
+      - "app/review_queue.py"
+      - "app/review_worker.py"
+      - "app/storage.py"
+      - "app/github_writeback.py"
+      - "app/github_context.py"
+      - "app/reviewer/**"
+      - "app/task_dispatch.py"
+      - "tests/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-lifecycle:
+    name: Mocked BB2 lifecycle validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_ENV: ci
+      GITHUB_WEBHOOK_SECRET: ci-webhook-secret
+      ORCHESTRATOR_ADMIN_TOKEN: ci-admin-token
+      ENABLE_OPENAI_REVIEW: "false"
+      ENABLE_GITHUB_CONTEXT_HYDRATION: "false"
+      ENABLE_GITHUB_WRITEBACK: "false"
+      ENABLE_TASK_DISPATCH: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Validate syntax and imports
+        run: |
+          python -m compileall app tests
+          python -c "import app.main; import app.review_queue; import app.review_worker; import app.github_writeback"
+
+      - name: Run mocked BB2 lifecycle tests
+        run: pytest tests/test_bb2_lifecycle_validation.py --junitxml=bb2-lifecycle-results.xml
+
+      - name: Upload lifecycle failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bb2-lifecycle-failure-artifacts
+          path: |
+            bb2-lifecycle-results.xml
+            .pytest_cache/**
+          if-no-files-found: ignore

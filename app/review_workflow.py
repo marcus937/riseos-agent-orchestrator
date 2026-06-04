@@ -52,12 +52,10 @@ def _review_trigger(parsed: ParsedGitHubEvent) -> str | None:
     if parsed.event_type == GitHubEventType.ISSUE_COMMENT and _contains_status_done(parsed.comment_body):
         return "issue_comment_status_done"
 
-    if (
-        parsed.event_type == GitHubEventType.PULL_REQUEST
-        and parsed.action in {"opened", "synchronize"}
-        and parsed.head_ref == AGENT_INTEGRATION_BRANCH
-    ):
-        return "pull_request_agent_integration"
+    if parsed.event_type == GitHubEventType.PULL_REQUEST and parsed.action in {"opened", "synchronize"}:
+        if parsed.head_ref == AGENT_INTEGRATION_BRANCH:
+            return "pull_request_agent_integration"
+        return "pull_request_review"
 
     return None
 
