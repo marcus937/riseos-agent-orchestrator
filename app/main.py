@@ -1,7 +1,7 @@
 import hmac
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
 from app.clients.github import GitHubClient
@@ -10,13 +10,12 @@ from app.github_context import hydrate_github_context
 from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
 from app.operational_logging import (
-    log_auto_review_processing_result,
-    log_auto_review_processing_started,
     log_github_writeback_result,
     log_github_writeback_attempted,
     log_openai_review_attempted,
     log_openai_review_result,
     log_queue_item_created,
+    log_review_completed,
     log_review_processing_started,
     log_slack_issue_dispatch_result,
     log_webhook_accepted,
@@ -30,6 +29,7 @@ from app.review_queue import (
     review_queue,
     review_work_item_from_parsed,
 )
+from app.review_worker import process_queued_review_item
 from app.review_workflow import build_review_workflow
 from app.security import verify_github_signature
 from app.slack_issue_dispatch import dispatch_ready_issue_to_slack
@@ -196,6 +196,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     )
 
     if not settings.enable_github_writeback:
+        log_review_completed(response.work_item, decision=response.decision.decision.value)
         return response
 
     log_github_writeback_attempted()
@@ -223,37 +224,27 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         success=response.github_writeback_success,
         error=response.github_writeback_error,
     )
+    log_review_completed(response.work_item, decision=response.decision.decision.value)
     return response
 
 
-async def _auto_process_work_item(
+def _schedule_auto_process_work_item(
     item: ReviewWorkItem | None,
     settings: Settings,
     storage: SQLiteStateStore | None,
-) -> ReviewProcessResponse | None:
+    background_tasks: BackgroundTasks,
+) -> bool:
     if item is None or not settings.enable_auto_review_processing:
-        return None
+        return False
 
-    log_auto_review_processing_started(item)
-    try:
-        response = await _process_work_item(item, settings)
-        if storage is not None:
-            storage.save_review_work_item(response.work_item)
-    except Exception as exc:
-        log_auto_review_processing_result(item, success=False, error=str(exc))
-        return None
-
-    log_auto_review_processing_result(
-        response.work_item,
-        success=True,
-        decision=response.decision.decision.value,
-    )
-    return response
+    background_tasks.add_task(process_queued_review_item, item.id, settings, storage, _process_work_item)
+    return True
 
 
 @app.post("/webhooks/github", response_model=WebhookAcceptedResponse)
 async def github_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_github_event: Annotated[str | None, Header(alias="X-GitHub-Event")] = None,
     x_hub_signature_256: Annotated[str | None, Header(alias="X-Hub-Signature-256")] = None,
     settings: Settings = Depends(get_settings),
@@ -290,7 +281,7 @@ async def github_webhook(
         storage.save_event_record(event_record)
         storage.prune_processed_review_items(settings.orchestrator_max_review_items)
 
-    await _auto_process_work_item(work_item, settings, storage)
+    _schedule_auto_process_work_item(work_item, settings, storage, background_tasks)
 
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
