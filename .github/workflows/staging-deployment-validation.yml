@@ -61,6 +61,12 @@ jobs:
             > "${{ runner.temp }}/staging-validation/artifacts/mock-github.log" 2>&1 &
           echo $! > "${{ runner.temp }}/staging-validation/mock-github.pid"
 
+      - name: Wait for mock GitHub API
+        run: |
+          python scripts/staging_deployment_validation.py wait-mock-github \
+            --mock-github-base-url "$GITHUB_API_BASE_URL" \
+            --artifacts-dir "${{ runner.temp }}/staging-validation/artifacts"
+
       - name: Start isolated orchestrator
         run: |
           uvicorn app.main:app \
