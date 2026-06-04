@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from app.event_store import EventRecord
-from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_work_item_identity
+from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
 
 
 class SQLiteStateStore:
@@ -24,6 +24,8 @@ class SQLiteStateStore:
                 CREATE TABLE IF NOT EXISTS event_records (
                     event_id TEXT PRIMARY KEY,
                     github_event TEXT NOT NULL,
+                    diagnostic_stage TEXT NOT NULL DEFAULT 'webhook_accepted',
+                    correlation_key TEXT,
                     repo_full_name TEXT,
                     branch TEXT,
                     commit_sha TEXT,
@@ -34,6 +36,8 @@ class SQLiteStateStore:
                 )
                 """
             )
+            _ensure_column(conn, "event_records", "diagnostic_stage", "TEXT NOT NULL DEFAULT 'webhook_accepted'")
+            _ensure_column(conn, "event_records", "correlation_key", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS review_work_items (
@@ -49,6 +53,8 @@ class SQLiteStateStore:
                 )
                 """
             )
+            for column_name, column_type in _REVIEW_WORK_ITEM_EXTRA_COLUMNS:
+                _ensure_column(conn, "review_work_items", column_name, column_type)
 
     def save_event_record(self, record: EventRecord) -> None:
         with self._connect() as conn:
@@ -57,6 +63,8 @@ class SQLiteStateStore:
                 INSERT OR REPLACE INTO event_records (
                     event_id,
                     github_event,
+                    diagnostic_stage,
+                    correlation_key,
                     repo_full_name,
                     branch,
                     commit_sha,
@@ -64,11 +72,13 @@ class SQLiteStateStore:
                     pr_number,
                     received_at,
                     raw_action
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.event_id,
                     str(record.github_event),
+                    record.diagnostic_stage,
+                    record.correlation_key,
                     record.repo_full_name,
                     record.branch,
                     record.commit_sha,
@@ -103,18 +113,32 @@ class SQLiteStateStore:
                 INSERT OR REPLACE INTO review_work_items (
                     id,
                     created_at,
+                    updated_at,
                     repo_full_name,
                     event_type,
                     branch,
                     commit_sha,
                     issue_number,
                     pr_number,
-                    status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status,
+                    lifecycle_stage,
+                    worker_claimed_at,
+                    review_started_at,
+                    openai_review_attempted_at,
+                    openai_review_completed_at,
+                    review_completed_at,
+                    github_writeback_started_at,
+                    github_writeback_completed_at,
+                    github_writeback_success,
+                    failure_count,
+                    last_failure_at,
+                    last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
                     item.created_at.isoformat(),
+                    _dt(item.updated_at),
                     item.repo_full_name,
                     str(item.event_type),
                     item.branch,
@@ -122,6 +146,18 @@ class SQLiteStateStore:
                     item.issue_number,
                     item.pr_number,
                     str(item.status),
+                    str(item.lifecycle_stage),
+                    _dt(item.worker_claimed_at),
+                    _dt(item.review_started_at),
+                    _dt(item.openai_review_attempted_at),
+                    _dt(item.openai_review_completed_at),
+                    _dt(item.review_completed_at),
+                    _dt(item.github_writeback_started_at),
+                    _dt(item.github_writeback_completed_at),
+                    _bool(item.github_writeback_success),
+                    item.failure_count,
+                    _dt(item.last_failure_at),
+                    item.last_error,
                 ),
             )
         self.prune_processed_review_items(self.max_review_items)
@@ -164,7 +200,10 @@ class SQLiteStateStore:
             cursor = conn.execute(
                 """
                 UPDATE review_work_items
-                SET status = ?
+                SET status = ?,
+                    lifecycle_stage = 'worker_claimed',
+                    worker_claimed_at = COALESCE(worker_claimed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE id = ? AND status = ?
                 """,
                 (ReviewWorkItemStatus.REVIEWING.value, item_id, ReviewWorkItemStatus.PENDING_REVIEW.value),
@@ -176,16 +215,32 @@ class SQLiteStateStore:
             return None
         return self._review_work_item_from_row(row)
 
-    def reset_review_work_item_for_retry(self, item_id: str) -> ReviewWorkItem | None:
+    def reset_review_work_item_for_retry(self, item_id: str, *, error: str | None = None) -> ReviewWorkItem | None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE review_work_items
-                SET status = ?
-                WHERE id = ? AND status = ?
-                """,
-                (ReviewWorkItemStatus.PENDING_REVIEW.value, item_id, ReviewWorkItemStatus.REVIEWING.value),
-            )
+            if error:
+                conn.execute(
+                    """
+                    UPDATE review_work_items
+                    SET status = ?,
+                        lifecycle_stage = 'review_failed',
+                        failure_count = failure_count + 1,
+                        last_failure_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        last_error = ?,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ? AND status = ?
+                    """,
+                    (ReviewWorkItemStatus.PENDING_REVIEW.value, error, item_id, ReviewWorkItemStatus.REVIEWING.value),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE review_work_items
+                    SET status = ?,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ? AND status = ?
+                    """,
+                    (ReviewWorkItemStatus.PENDING_REVIEW.value, item_id, ReviewWorkItemStatus.REVIEWING.value),
+                )
             row = conn.execute("SELECT * FROM review_work_items WHERE id = ?", (item_id,)).fetchone()
         if row is None:
             return None
@@ -209,25 +264,7 @@ class SQLiteStateStore:
         return self._review_work_item_from_row(row)
 
     def review_queue_counters(self) -> ReviewQueueCounters:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT status, COUNT(*) AS count
-                FROM review_work_items
-                GROUP BY status
-                """
-            ).fetchall()
-        status_counts = {str(row["status"]): int(row["count"]) for row in rows}
-        approved_count = status_counts.get(ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW.value, 0)
-        return ReviewQueueCounters(
-            review_queue_count=sum(status_counts.values()),
-            pending_review_count=status_counts.get(ReviewWorkItemStatus.PENDING_REVIEW.value, 0),
-            reviewing_count=status_counts.get(ReviewWorkItemStatus.REVIEWING.value, 0),
-            needs_changes_count=status_counts.get(ReviewWorkItemStatus.NEEDS_CHANGES.value, 0),
-            approved_count=approved_count,
-            approved_for_human_review_count=approved_count,
-            blocked_count=status_counts.get(ReviewWorkItemStatus.BLOCKED.value, 0),
-        )
+        return review_queue_counters(self.list_review_work_items())
 
     def prune_processed_review_items(self, max_items: int | None = None) -> int:
         limit = max_items or self.max_review_items
@@ -259,7 +296,10 @@ class SQLiteStateStore:
         return EventRecord.model_validate(dict(row))
 
     def _review_work_item_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
-        return ReviewWorkItem.model_validate(dict(row))
+        data = dict(row)
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        return ReviewWorkItem.model_validate(data)
 
 
 def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> SQLiteStateStore | None:
@@ -271,3 +311,41 @@ def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> S
         return None
     except sqlite3.Error:
         return None
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name in columns:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _dt(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _bool(value: bool | None) -> int | None:
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
+_REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
+    ("updated_at", "TEXT"),
+    ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'review_queued'"),
+    ("worker_claimed_at", "TEXT"),
+    ("review_started_at", "TEXT"),
+    ("openai_review_attempted_at", "TEXT"),
+    ("openai_review_completed_at", "TEXT"),
+    ("review_completed_at", "TEXT"),
+    ("github_writeback_started_at", "TEXT"),
+    ("github_writeback_completed_at", "TEXT"),
+    ("github_writeback_success", "INTEGER"),
+    ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_failure_at", "TEXT"),
+    ("last_error", "TEXT"),
+]
