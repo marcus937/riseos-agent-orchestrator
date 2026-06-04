@@ -192,7 +192,16 @@ def run_smoke_validation(
         encoding="utf-8",
     )
     if readiness.status_code != 200 or readiness.error is not None:
-        write_failure_summary([], artifact_dir)
+        write_failure_summary(
+            [
+                RuntimeCheckResult(
+                    endpoint=RuntimeEndpoint("startup_readiness", "/health"),
+                    url=readiness_url,
+                    response=readiness,
+                )
+            ],
+            artifact_dir,
+        )
         return 1
 
     results = [check_endpoint(base_url, endpoint, request_fn=request_fn) for endpoint in endpoints]
