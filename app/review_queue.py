@@ -89,9 +89,24 @@ class InMemoryReviewQueue:
     def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
         identity = review_work_item_identity(item)
         for existing in self._items:
-            if existing.status == ReviewWorkItemStatus.PENDING_REVIEW and review_work_item_identity(existing) == identity:
+            if existing.status in _UNFINISHED_STATUSES and review_work_item_identity(existing) == identity:
                 return existing
         return None
+
+    def claim_item(self, item_id: str) -> ReviewWorkItem | None:
+        item = self.get_item(item_id)
+        if item is None or item.status != ReviewWorkItemStatus.PENDING_REVIEW:
+            return None
+        item.status = ReviewWorkItemStatus.REVIEWING
+        return item
+
+    def reset_item_for_retry(self, item_id: str) -> ReviewWorkItem | None:
+        item = self.get_item(item_id)
+        if item is None:
+            return None
+        if item.status == ReviewWorkItemStatus.REVIEWING:
+            item.status = ReviewWorkItemStatus.PENDING_REVIEW
+        return item
 
     def list_items(self) -> list[ReviewWorkItem]:
         return list(reversed(self._items))
@@ -128,7 +143,7 @@ class InMemoryReviewQueue:
         removed = 0
         while len(self._items) > max_items:
             for item in list(self._items):
-                if item.status not in {ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}:
+                if item.status not in _UNFINISHED_STATUSES:
                     self._items.remove(item)
                     removed += 1
                     break
@@ -261,5 +276,7 @@ def _intended_next_actions(decision: ReviewDecision) -> list[str]:
         return ["Prepare a follow-up task prompt for the coding agent.", "Wait for human approval before any merge."]
     return ["Send the dry-run decision to BB/Jarvis Architect for human review.", "Do not merge automatically."]
 
+
+_UNFINISHED_STATUSES = {ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}
 
 review_queue = InMemoryReviewQueue()
