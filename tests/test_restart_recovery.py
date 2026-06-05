@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-from app.config import Settings, get_settings
+from app.config import get_settings
 from app.github_events import parse_github_event
 from app.main import app
 from app.review_queue import ReviewWorkItemStatus, review_work_item_from_parsed
@@ -55,7 +55,7 @@ def test_reclaim_stale_review_claim_keeps_recent_reviewing_item_claimed(tmp_path
     assert reloaded.failure_count == 0
 
 
-def test_startup_reclaims_stale_sqlite_claim_after_restart(tmp_path) -> None:
+def test_startup_reclaims_stale_sqlite_claim_after_restart(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "orchestrator.db"
     store = SQLiteStateStore(str(db_path))
     claimed = _claimed_item(store)
@@ -63,17 +63,14 @@ def test_startup_reclaims_stale_sqlite_claim_after_restart(tmp_path) -> None:
     claimed.updated_at = claimed.worker_claimed_at
     store.save_review_work_item(claimed)
 
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("ORCHESTRATOR_DB_PATH", str(db_path))
+    monkeypatch.setenv("ORCHESTRATOR_REVIEW_CLAIM_TIMEOUT_SECONDS", "900")
     get_settings.cache_clear()
-    app.dependency_overrides[get_settings] = lambda: Settings(
-        github_webhook_secret="test-secret",
-        orchestrator_db_path=str(db_path),
-        review_claim_timeout_seconds=900,
-    )
     try:
         with TestClient(app) as client:
             queue = client.get("/debug/review-queue").json()
     finally:
-        app.dependency_overrides.clear()
         get_settings.cache_clear()
 
     assert len(queue) == 1
