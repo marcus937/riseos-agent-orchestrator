@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.event_store import EventRecord
@@ -245,6 +246,53 @@ class SQLiteStateStore:
         if row is None:
             return None
         return self._review_work_item_from_row(row)
+
+    def reclaim_stale_review_claims(self, *, older_than_seconds: int) -> list[ReviewWorkItem]:
+        if older_than_seconds <= 0:
+            return []
+
+        cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM review_work_items
+                WHERE status = ?
+                  AND worker_claimed_at IS NOT NULL
+                  AND worker_claimed_at < ?
+                ORDER BY worker_claimed_at ASC
+                """,
+                (ReviewWorkItemStatus.REVIEWING.value, cutoff.isoformat()),
+            ).fetchall()
+            item_ids = [str(row["id"]) for row in rows]
+            if not item_ids:
+                return []
+
+            conn.executemany(
+                """
+                UPDATE review_work_items
+                SET status = ?,
+                    lifecycle_stage = 'review_failed',
+                    failure_count = failure_count + 1,
+                    last_failure_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_error = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ? AND status = ?
+                """,
+                [
+                    (
+                        ReviewWorkItemStatus.PENDING_REVIEW.value,
+                        "Recovered stale worker claim after restart.",
+                        item_id,
+                        ReviewWorkItemStatus.REVIEWING.value,
+                    )
+                    for item_id in item_ids
+                ],
+            )
+            reloaded = conn.execute(
+                f"SELECT * FROM review_work_items WHERE id IN ({','.join('?' for _ in item_ids)})",
+                item_ids,
+            ).fetchall()
+        return [self._review_work_item_from_row(row) for row in reloaded]
 
     def list_review_work_items(self) -> list[ReviewWorkItem]:
         with self._connect() as conn:
