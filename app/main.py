@@ -53,10 +53,13 @@ app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
 @app.on_event("startup")
 async def startup() -> None:
     settings = get_settings()
-    app.state.storage = build_sqlite_store(
+    storage = build_sqlite_store(
         settings.orchestrator_db_path,
         max_review_items=settings.orchestrator_max_review_items,
     )
+    if storage is not None:
+        storage.reclaim_stale_review_claims(older_than_seconds=settings.review_claim_timeout_seconds)
+    app.state.storage = storage
 
 
 def _storage() -> SQLiteStateStore | None:
