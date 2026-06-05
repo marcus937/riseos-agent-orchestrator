@@ -1,0 +1,75 @@
+name: Queue Contention Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/queue-contention-validation.yml"
+      - "app/queue_contention_validation.py"
+      - "app/review_queue.py"
+      - "app/review_worker.py"
+      - "app/storage.py"
+      - "tests/test_queue_contention_validation.py"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  queue-contention-validation:
+    name: Multi-worker queue contention validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_ENV: ci
+      GITHUB_WEBHOOK_SECRET: ci-webhook-secret
+      ORCHESTRATOR_ADMIN_TOKEN: ci-admin-token
+      ENABLE_OPENAI_REVIEW: "false"
+      ENABLE_GITHUB_CONTEXT_HYDRATION: "false"
+      ENABLE_GITHUB_WRITEBACK: "false"
+      ENABLE_TASK_DISPATCH: "false"
+      QUEUE_CONTENTION_ARTIFACT_DIR: queue-contention-validation-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Validate syntax and imports
+        run: |
+          python -m compileall app tests
+          python -c "import app.queue_contention_validation; import app.review_queue; import app.review_worker; import app.storage"
+
+      - name: Run queue contention tests
+        run: |
+          mkdir -p "$QUEUE_CONTENTION_ARTIFACT_DIR"
+          pytest tests/test_queue_contention_validation.py --junitxml="$QUEUE_CONTENTION_ARTIFACT_DIR/queue-contention-results.xml"
+
+      - name: Generate queue contention artifact bundle
+        run: python -m app.queue_contention_validation --artifact-dir "$QUEUE_CONTENTION_ARTIFACT_DIR"
+
+      - name: Upload queue contention validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-contention-validation-artifacts
+          path: |
+            queue-contention-validation-artifacts/queue-state.json
+            queue-contention-validation-artifacts/worker-claims.json
+            queue-contention-validation-artifacts/review-lifecycle.json
+            queue-contention-validation-artifacts/diagnostics.json
+            queue-contention-validation-artifacts/failure-summary.md
+            queue-contention-validation-artifacts/queue-contention-results.xml
+          if-no-files-found: error
