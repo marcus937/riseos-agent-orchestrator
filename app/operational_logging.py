@@ -27,6 +27,19 @@ def log_webhook_accepted(parsed: ParsedGitHubEvent) -> None:
     )
 
 
+def log_webhook_duplicate_suppressed(parsed: ParsedGitHubEvent, *, event_id: str) -> None:
+    log_event(
+        "webhook_duplicate_suppressed",
+        event_id=event_id,
+        github_event=str(parsed.event_type),
+        repo_full_name=parsed.repository,
+        action=parsed.action,
+        commit_sha=parsed.head_sha,
+        issue_number=parsed.issue_number,
+        pr_number=parsed.pull_request_number,
+    )
+
+
 def log_queue_item_created(item: ReviewWorkItem) -> None:
     log_event(
         "review_queued",
