@@ -19,6 +19,7 @@ from app.operational_logging import (
     log_review_processing_started,
     log_slack_issue_dispatch_result,
     log_webhook_accepted,
+    log_webhook_duplicate_suppressed,
 )
 from app.reviewer.decision import ReviewDecisionType
 from app.reviewer.openai_review import request_openai_review_decision
@@ -347,9 +348,11 @@ async def github_webhook(
     if storage is not None:
         event_record = event_record_from_parsed(parsed, event_id=event_id)
         if not storage.save_event_record(event_record):
+            log_webhook_duplicate_suppressed(parsed, event_id=event_id)
             event_store.record_duplicate()
             return _webhook_response(parsed, workflow)
     elif event_store.has_event_id(event_id):
+        log_webhook_duplicate_suppressed(parsed, event_id=event_id)
         event_store.record_duplicate()
         return _webhook_response(parsed, workflow)
     else:
