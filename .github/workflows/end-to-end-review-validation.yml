@@ -7,6 +7,7 @@ on:
       - ".github/workflows/end-to-end-review-validation.yml"
       - "app/**"
       - "tests/test_end_to_end_review_validation.py"
+      - "tests/test_multi_worker_queue_contention_validation.py"
       - "pyproject.toml"
 
 permissions:
@@ -63,6 +64,7 @@ jobs:
       - name: Run end-to-end validation helper tests
         run: |
           pytest tests/test_end_to_end_review_validation.py \
+            tests/test_multi_worker_queue_contention_validation.py \
             --junitxml="$E2E_REVIEW_VALIDATION_ARTIFACT_DIR/end-to-end-helper-results.xml"
 
       - name: Start local mock GitHub API
@@ -89,6 +91,11 @@ jobs:
             --admin-token "$ORCHESTRATOR_ADMIN_TOKEN" \
             --mock-github-base-url "$GITHUB_API_BASE_URL" \
             --artifacts-dir "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR"
+
+      - name: Run multi-worker queue contention validation
+        run: |
+          python -m app.multi_worker_queue_contention_validation \
+            --artifacts-dir "$E2E_REVIEW_VALIDATION_ARTIFACT_DIR/multi-worker-queue-contention"
 
       - name: Stop isolated services
         if: always()
