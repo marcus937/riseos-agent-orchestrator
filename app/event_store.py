@@ -24,6 +24,10 @@ class EventRecord(BaseModel):
     received_at: datetime
     raw_action: str | None = None
 
+    def model_post_init(self, __context: object) -> None:
+        if self.correlation_id is None and self.correlation_key:
+            self.correlation_id = correlation_id_from_key(self.correlation_key)
+
 
 class DebugHealth(BaseModel):
     webhook_count: int
