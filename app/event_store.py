@@ -45,6 +45,7 @@ class InMemoryEventStore:
         self.webhook_count = 0
         self.accepted_count = 0
         self.rejected_count = 0
+        self.duplicate_count = 0
 
     def has_event_id(self, event_id: str) -> bool:
         return event_id in self._event_ids
@@ -56,6 +57,10 @@ class InMemoryEventStore:
         self._records.append(record)
         self._event_ids.add(record.event_id)
         return record
+
+    def record_duplicate(self) -> None:
+        self.webhook_count += 1
+        self.duplicate_count += 1
 
     def record_rejected(self) -> None:
         self.webhook_count += 1
@@ -85,6 +90,7 @@ class InMemoryEventStore:
         self.webhook_count = 0
         self.accepted_count = 0
         self.rejected_count = 0
+        self.duplicate_count = 0
 
 
 def event_record_from_parsed(parsed: ParsedGitHubEvent, *, event_id: str | None = None) -> EventRecord:
