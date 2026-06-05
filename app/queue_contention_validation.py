@@ -37,6 +37,10 @@ WORKER_COUNT = 4
 DETERMINISTIC_REPO = "riseos/queue-contention-validation"
 
 
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 @dataclass
 class ClaimAttempt:
     worker_id: str
@@ -310,10 +314,6 @@ def _artifact_digest(artifact_dir: Path) -> str:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def main() -> int:
