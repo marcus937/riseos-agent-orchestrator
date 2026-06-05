@@ -32,6 +32,17 @@ class SlackIssueDispatchClient(Protocol):
         ...
 
 
+class IssueDispatchRegistry(Protocol):
+    def already_dispatched(self, issue_key: str) -> bool:
+        ...
+
+    def claim_issue_dispatch(self, issue_key: str) -> bool:
+        ...
+
+    def mark_dispatched(self, issue_key: str) -> None:
+        ...
+
+
 class SlackClient:
     def __init__(self, *, webhook_url: str | None, bot_token: str | None) -> None:
         self._webhook_url = webhook_url
@@ -72,6 +83,12 @@ class InMemoryDispatchedIssueRegistry:
     def already_dispatched(self, issue_key: str) -> bool:
         return issue_key in self._issue_keys
 
+    def claim_issue_dispatch(self, issue_key: str) -> bool:
+        if issue_key in self._issue_keys:
+            return False
+        self._issue_keys.add(issue_key)
+        return True
+
     def mark_dispatched(self, issue_key: str) -> None:
         self._issue_keys.add(issue_key)
 
@@ -87,7 +104,7 @@ async def dispatch_ready_issue_to_slack(
     settings: Settings,
     *,
     client: SlackIssueDispatchClient | None = None,
-    registry: InMemoryDispatchedIssueRegistry = issue_dispatch_registry,
+    registry: IssueDispatchRegistry = issue_dispatch_registry,
 ) -> SlackIssueDispatchResult:
     issue_key = _issue_key(parsed)
     skipped_reason = _skip_reason(parsed)
@@ -97,11 +114,11 @@ async def dispatch_ready_issue_to_slack(
     if issue_key is None:
         return SlackIssueDispatchResult(skipped_reason="Issue key could not be determined.")
 
-    if registry.already_dispatched(issue_key):
-        return SlackIssueDispatchResult(issue_key=issue_key, skipped_reason="Issue was already dispatched.")
-
     if not settings.slack_webhook_url and not settings.slack_bot_token:
         return SlackIssueDispatchResult(issue_key=issue_key, skipped_reason="Slack dispatch is not configured.")
+
+    if not registry.claim_issue_dispatch(issue_key):
+        return SlackIssueDispatchResult(issue_key=issue_key, skipped_reason="Issue was already dispatched.")
 
     owns_client = client is None
     client = client or SlackClient(webhook_url=settings.slack_webhook_url, bot_token=settings.slack_bot_token)
