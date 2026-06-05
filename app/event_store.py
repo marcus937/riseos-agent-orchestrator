@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from app.correlation import branch_from_parsed, correlation_id_from_key, correlation_key_from_parsed
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.review_queue import ReviewQueueCounters
 
@@ -13,6 +14,7 @@ class EventRecord(BaseModel):
     event_id: str
     github_event: GitHubEventType
     diagnostic_stage: str = "webhook_accepted"
+    correlation_id: str | None = None
     correlation_key: str | None = None
     repo_full_name: str | None = None
     branch: str | None = None
@@ -94,13 +96,15 @@ class InMemoryEventStore:
 
 
 def event_record_from_parsed(parsed: ParsedGitHubEvent, *, event_id: str | None = None) -> EventRecord:
+    correlation_key = correlation_key_from_parsed(parsed)
     return EventRecord(
         event_id=event_id or str(uuid4()),
         github_event=parsed.event_type,
         diagnostic_stage="webhook_accepted",
-        correlation_key=_correlation_key(parsed),
+        correlation_id=correlation_id_from_key(correlation_key),
+        correlation_key=correlation_key,
         repo_full_name=parsed.repository,
-        branch=_branch_from_parsed(parsed),
+        branch=branch_from_parsed(parsed),
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
@@ -117,31 +121,12 @@ def webhook_delivery_key(parsed: ParsedGitHubEvent, delivery_id: str | None = No
         parsed.repository or "",
         parsed.action or "",
         parsed.action_label or "",
-        _branch_from_parsed(parsed) or "",
+        branch_from_parsed(parsed) or "",
         parsed.head_sha or "",
         str(parsed.issue_number or ""),
         str(parsed.pull_request_number or ""),
     ]
     return "github-derived:" + ":".join(parts)
-
-
-def _branch_from_parsed(parsed: ParsedGitHubEvent) -> str | None:
-    if parsed.head_ref:
-        return parsed.head_ref
-    if parsed.ref and parsed.ref.startswith("refs/heads/"):
-        return parsed.ref.removeprefix("refs/heads/")
-    return parsed.ref
-
-
-def _correlation_key(parsed: ParsedGitHubEvent) -> str:
-    repo = parsed.repository or "unknown-repo"
-    if parsed.pull_request_number:
-        return f"{repo}:pr:{parsed.pull_request_number}"
-    if parsed.issue_number:
-        return f"{repo}:issue:{parsed.issue_number}"
-    if parsed.head_sha:
-        return f"{repo}:commit:{parsed.head_sha}"
-    return f"{repo}:event:{parsed.event_type}"
 
 
 event_store = InMemoryEventStore()
