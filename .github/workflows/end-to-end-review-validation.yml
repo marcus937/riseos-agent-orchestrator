@@ -30,9 +30,7 @@ jobs:
       ENABLE_TASK_DISPATCH: "false"
       GITHUB_TOKEN: end-to-end-review-validation-token
       GITHUB_API_BASE_URL: http://127.0.0.1:9001
-      ORCHESTRATOR_DB_PATH: ${{ runner.temp }}/end-to-end-review-validation/orchestrator.db
       E2E_REVIEW_VALIDATION_BASE_URL: http://127.0.0.1:8000
-      E2E_REVIEW_VALIDATION_ARTIFACT_DIR: ${{ runner.temp }}/end-to-end-review-validation/artifacts
 
     steps:
       - name: Checkout
@@ -45,6 +43,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: Configure runner paths
+        run: |
+          echo "ORCHESTRATOR_DB_PATH=$RUNNER_TEMP/end-to-end-review-validation/orchestrator.db" >> "$GITHUB_ENV"
+          echo "E2E_REVIEW_VALIDATION_ARTIFACT_DIR=$RUNNER_TEMP/end-to-end-review-validation/artifacts" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
