@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any
 
+from app.correlation import correlation_id_from_item, correlation_id_from_parsed
 from app.github_events import ParsedGitHubEvent
 from app.review_queue import ReviewWorkItem
 from app.slack_issue_dispatch import SlackIssueDispatchResult
@@ -18,6 +19,7 @@ def log_event(event: str, **fields: Any) -> None:
 def log_webhook_accepted(parsed: ParsedGitHubEvent) -> None:
     log_event(
         "webhook_accepted",
+        correlation_id=correlation_id_from_parsed(parsed),
         github_event=str(parsed.event_type),
         repo_full_name=parsed.repository,
         action=parsed.action,
@@ -31,6 +33,8 @@ def log_webhook_duplicate_suppressed(parsed: ParsedGitHubEvent, *, event_id: str
     log_event(
         "webhook_duplicate_suppressed",
         event_id=event_id,
+        duplicate_source=_duplicate_source(event_id),
+        correlation_id=correlation_id_from_parsed(parsed),
         github_event=str(parsed.event_type),
         repo_full_name=parsed.repository,
         action=parsed.action,
@@ -43,6 +47,7 @@ def log_webhook_duplicate_suppressed(parsed: ParsedGitHubEvent, *, event_id: str
 def log_queue_item_created(item: ReviewWorkItem) -> None:
     log_event(
         "review_queued",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -56,6 +61,7 @@ def log_queue_item_created(item: ReviewWorkItem) -> None:
 def log_worker_claimed(item: ReviewWorkItem) -> None:
     log_event(
         "worker_claimed",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -69,6 +75,7 @@ def log_worker_claimed(item: ReviewWorkItem) -> None:
 def log_review_processing_started(item: ReviewWorkItem) -> None:
     log_event(
         "review_started",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -81,6 +88,7 @@ def log_review_processing_started(item: ReviewWorkItem) -> None:
 def log_review_completed(item: ReviewWorkItem, *, decision: str | None = None) -> None:
     log_event(
         "review_completed",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -95,6 +103,7 @@ def log_review_completed(item: ReviewWorkItem, *, decision: str | None = None) -
 def log_review_failed(item: ReviewWorkItem, *, error: str | None = None) -> None:
     log_event(
         "review_failed",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -109,6 +118,7 @@ def log_review_failed(item: ReviewWorkItem, *, error: str | None = None) -> None
 def log_auto_review_processing_started(item: ReviewWorkItem) -> None:
     log_event(
         "auto_review_processing_started",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -128,6 +138,7 @@ def log_auto_review_processing_result(
 ) -> None:
     log_event(
         "auto_review_processing_succeeded" if success else "auto_review_processing_failed",
+        correlation_id=correlation_id_from_item(item),
         item_id=item.id,
         repo_full_name=item.repo_full_name,
         event_type=str(item.event_type),
@@ -179,6 +190,7 @@ def log_slack_issue_dispatch_result(parsed: ParsedGitHubEvent, result: SlackIssu
         attempted=result.attempted,
         success=result.success,
         issue_key=result.issue_key,
+        correlation_id=result.correlation_id or correlation_id_from_parsed(parsed),
         repo_full_name=parsed.repository,
         issue_number=parsed.issue_number,
         action=parsed.action,
@@ -199,3 +211,11 @@ def _slack_dispatch_event_name(result: SlackIssueDispatchResult) -> str:
     if result.skipped_reason == "Repository is not approved for Circuit Slack dispatch.":
         return "slack_issue_dispatch_invalid_repo"
     return "slack_issue_dispatch_skipped"
+
+
+def _duplicate_source(event_id: str) -> str:
+    if event_id.startswith("github-delivery:"):
+        return "github_delivery_header"
+    if event_id.startswith("github-derived:"):
+        return "derived_webhook_identity"
+    return "unknown"
