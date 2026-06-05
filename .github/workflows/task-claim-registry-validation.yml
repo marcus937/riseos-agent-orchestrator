@@ -1,0 +1,64 @@
+name: Task Claim Registry Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/task-claim-registry-validation.yml"
+      - "app/task_claim_registry.py"
+      - "app/task_claim_registry_validation.py"
+      - "tests/test_task_claim_registry_validation.py"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  task-claim-registry-validation:
+    name: Task claim registry validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Configure artifact directory
+        run: echo "TASK_CLAIM_ARTIFACT_DIR=$RUNNER_TEMP/task-claim-registry/artifacts" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Prepare artifact directory
+        run: mkdir -p "$TASK_CLAIM_ARTIFACT_DIR"
+
+      - name: Python syntax validation
+        run: python -m compileall app tests
+
+      - name: Run task claim registry tests
+        run: |
+          pytest tests/test_task_claim_registry_validation.py \
+            --junitxml="$TASK_CLAIM_ARTIFACT_DIR/task-claim-registry-results.xml"
+
+      - name: Run task claim registry artifact validation
+        run: |
+          python -m app.task_claim_registry_validation \
+            --artifacts-dir "$TASK_CLAIM_ARTIFACT_DIR"
+
+      - name: Upload task claim registry artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-claim-registry-validation-artifacts
+          path: ${{ runner.temp }}/task-claim-registry/artifacts
+          if-no-files-found: error
