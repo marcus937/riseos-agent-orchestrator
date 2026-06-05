@@ -41,6 +41,14 @@ class SQLiteStateStore:
             _ensure_column(conn, "event_records", "correlation_key", "TEXT")
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS issue_dispatch_claims (
+                    issue_key TEXT PRIMARY KEY,
+                    claimed_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS review_work_items (
                     id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -57,11 +65,16 @@ class SQLiteStateStore:
             for column_name, column_type in _REVIEW_WORK_ITEM_EXTRA_COLUMNS:
                 _ensure_column(conn, "review_work_items", column_name, column_type)
 
-    def save_event_record(self, record: EventRecord) -> None:
+    def has_event_record(self, event_id: str) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            row = conn.execute("SELECT 1 FROM event_records WHERE event_id = ?", (event_id,)).fetchone()
+        return row is not None
+
+    def save_event_record(self, record: EventRecord) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
                 """
-                INSERT OR REPLACE INTO event_records (
+                INSERT OR IGNORE INTO event_records (
                     event_id,
                     github_event,
                     diagnostic_stage,
@@ -89,6 +102,26 @@ class SQLiteStateStore:
                     record.raw_action,
                 ),
             )
+        return cursor.rowcount == 1
+
+    def already_dispatched(self, issue_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM issue_dispatch_claims WHERE issue_key = ?", (issue_key,)).fetchone()
+        return row is not None
+
+    def claim_issue_dispatch(self, issue_key: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO issue_dispatch_claims (issue_key, claimed_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (issue_key,),
+            )
+        return cursor.rowcount == 1
+
+    def mark_dispatched(self, issue_key: str) -> None:
+        self.claim_issue_dispatch(issue_key)
 
     def recent_events(self, limit: int = 50) -> list[EventRecord]:
         with self._connect() as conn:
