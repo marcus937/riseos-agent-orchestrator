@@ -40,16 +40,21 @@ class DebugHealth(BaseModel):
 class InMemoryEventStore:
     def __init__(self, max_records: int = 50) -> None:
         self._records: deque[EventRecord] = deque(maxlen=max_records)
+        self._event_ids: set[str] = set()
         self._started_at = monotonic()
         self.webhook_count = 0
         self.accepted_count = 0
         self.rejected_count = 0
 
-    def record_accepted(self, parsed: ParsedGitHubEvent) -> EventRecord:
+    def has_event_id(self, event_id: str) -> bool:
+        return event_id in self._event_ids
+
+    def record_accepted(self, parsed: ParsedGitHubEvent, *, event_id: str | None = None) -> EventRecord:
         self.webhook_count += 1
         self.accepted_count += 1
-        record = event_record_from_parsed(parsed)
+        record = event_record_from_parsed(parsed, event_id=event_id)
         self._records.append(record)
+        self._event_ids.add(record.event_id)
         return record
 
     def record_rejected(self) -> None:
@@ -75,15 +80,16 @@ class InMemoryEventStore:
 
     def reset(self) -> None:
         self._records.clear()
+        self._event_ids.clear()
         self._started_at = monotonic()
         self.webhook_count = 0
         self.accepted_count = 0
         self.rejected_count = 0
 
 
-def event_record_from_parsed(parsed: ParsedGitHubEvent) -> EventRecord:
+def event_record_from_parsed(parsed: ParsedGitHubEvent, *, event_id: str | None = None) -> EventRecord:
     return EventRecord(
-        event_id=str(uuid4()),
+        event_id=event_id or str(uuid4()),
         github_event=parsed.event_type,
         diagnostic_stage="webhook_accepted",
         correlation_key=_correlation_key(parsed),
@@ -95,6 +101,22 @@ def event_record_from_parsed(parsed: ParsedGitHubEvent) -> EventRecord:
         received_at=datetime.now(UTC),
         raw_action=parsed.action,
     )
+
+
+def webhook_delivery_key(parsed: ParsedGitHubEvent, delivery_id: str | None = None) -> str:
+    if delivery_id and delivery_id.strip():
+        return f"github-delivery:{delivery_id.strip()}"
+    parts = [
+        str(parsed.event_type),
+        parsed.repository or "",
+        parsed.action or "",
+        parsed.action_label or "",
+        _branch_from_parsed(parsed) or "",
+        parsed.head_sha or "",
+        str(parsed.issue_number or ""),
+        str(parsed.pull_request_number or ""),
+    ]
+    return "github-derived:" + ":".join(parts)
 
 
 def _branch_from_parsed(parsed: ParsedGitHubEvent) -> str | None:
