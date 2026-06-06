@@ -6,11 +6,13 @@ import httpx
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.correlation import correlation_id_from_parsed
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 
 AGENT_READY_LABEL = "agent-ready"
 APPROVED_REPO_FULL_NAMES = {
     "marcus937/Project-Jarvis",
+    "marcus937/hermes-runtime-agent",
     "marcus937/jarvis-mission-control",
     "marcus937/riseos-agent-orchestrator",
     "marcus937/Rylinn-Field-App-Codex",
@@ -22,6 +24,7 @@ class SlackIssueDispatchResult(BaseModel):
     attempted: bool = False
     success: bool = False
     issue_key: str | None = None
+    correlation_id: str | None = None
     skipped_reason: str | None = None
     error: str | None = None
     message: str | None = None
@@ -29,6 +32,17 @@ class SlackIssueDispatchResult(BaseModel):
 
 class SlackIssueDispatchClient(Protocol):
     async def post_message(self, *, channel: str, text: str) -> None:
+        ...
+
+
+class IssueDispatchRegistry(Protocol):
+    def already_dispatched(self, issue_key: str) -> bool:
+        ...
+
+    def claim_issue_dispatch(self, issue_key: str) -> bool:
+        ...
+
+    def mark_dispatched(self, issue_key: str) -> None:
         ...
 
 
@@ -72,6 +86,12 @@ class InMemoryDispatchedIssueRegistry:
     def already_dispatched(self, issue_key: str) -> bool:
         return issue_key in self._issue_keys
 
+    def claim_issue_dispatch(self, issue_key: str) -> bool:
+        if issue_key in self._issue_keys:
+            return False
+        self._issue_keys.add(issue_key)
+        return True
+
     def mark_dispatched(self, issue_key: str) -> None:
         self._issue_keys.add(issue_key)
 
@@ -87,21 +107,30 @@ async def dispatch_ready_issue_to_slack(
     settings: Settings,
     *,
     client: SlackIssueDispatchClient | None = None,
-    registry: InMemoryDispatchedIssueRegistry = issue_dispatch_registry,
+    registry: IssueDispatchRegistry = issue_dispatch_registry,
 ) -> SlackIssueDispatchResult:
     issue_key = _issue_key(parsed)
+    correlation_id = correlation_id_from_parsed(parsed)
     skipped_reason = _skip_reason(parsed)
     if skipped_reason:
-        return SlackIssueDispatchResult(issue_key=issue_key, skipped_reason=skipped_reason)
+        return SlackIssueDispatchResult(issue_key=issue_key, correlation_id=correlation_id, skipped_reason=skipped_reason)
 
     if issue_key is None:
-        return SlackIssueDispatchResult(skipped_reason="Issue key could not be determined.")
-
-    if registry.already_dispatched(issue_key):
-        return SlackIssueDispatchResult(issue_key=issue_key, skipped_reason="Issue was already dispatched.")
+        return SlackIssueDispatchResult(correlation_id=correlation_id, skipped_reason="Issue key could not be determined.")
 
     if not settings.slack_webhook_url and not settings.slack_bot_token:
-        return SlackIssueDispatchResult(issue_key=issue_key, skipped_reason="Slack dispatch is not configured.")
+        return SlackIssueDispatchResult(
+            issue_key=issue_key,
+            correlation_id=correlation_id,
+            skipped_reason="Slack dispatch is not configured.",
+        )
+
+    if not registry.claim_issue_dispatch(issue_key):
+        return SlackIssueDispatchResult(
+            issue_key=issue_key,
+            correlation_id=correlation_id,
+            skipped_reason="Issue was already dispatched.",
+        )
 
     owns_client = client is None
     client = client or SlackClient(webhook_url=settings.slack_webhook_url, bot_token=settings.slack_bot_token)
@@ -109,13 +138,26 @@ async def dispatch_ready_issue_to_slack(
     try:
         await client.post_message(channel=settings.slack_channel, text=message)
     except Exception as exc:
-        return SlackIssueDispatchResult(attempted=True, success=False, issue_key=issue_key, error=str(exc), message=message)
+        return SlackIssueDispatchResult(
+            attempted=True,
+            success=False,
+            issue_key=issue_key,
+            correlation_id=correlation_id,
+            error=str(exc),
+            message=message,
+        )
     finally:
         if owns_client and hasattr(client, "aclose"):
             await client.aclose()
 
     registry.mark_dispatched(issue_key)
-    return SlackIssueDispatchResult(attempted=True, success=True, issue_key=issue_key, message=message)
+    return SlackIssueDispatchResult(
+        attempted=True,
+        success=True,
+        issue_key=issue_key,
+        correlation_id=correlation_id,
+        message=message,
+    )
 
 
 def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> str:
@@ -123,9 +165,11 @@ def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> s
     title = _sanitize_slack_text(parsed.issue_title or f"Issue #{parsed.issue_number}")
     issue_url = _sanitize_slack_text(parsed.issue_url or "No issue URL provided.")
     repo = _sanitize_slack_text(parsed.repository or "unknown repo")
+    correlation_id = _sanitize_slack_text(correlation_id_from_parsed(parsed))
     return (
         "@circuit-forge Circuit task ready\n"
         f"Channel: {_sanitize_slack_text(channel)}\n"
+        f"Correlation ID: {correlation_id}\n"
         f"Repo: {repo}\n"
         f"Issue: #{parsed.issue_number} - {title}\n"
         f"Labels: {labels}\n"

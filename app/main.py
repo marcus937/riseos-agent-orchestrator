@@ -5,7 +5,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 
 from app.config import Settings, get_settings
 from app.clients.github import GitHubClient
-from app.event_store import DebugHealth, EventRecord, event_store
+from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, event_store, webhook_delivery_key
 from app.github_context import hydrate_github_context
 from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
@@ -19,6 +19,7 @@ from app.operational_logging import (
     log_review_processing_started,
     log_slack_issue_dispatch_result,
     log_webhook_accepted,
+    log_webhook_duplicate_suppressed,
 )
 from app.reviewer.decision import ReviewDecisionType
 from app.reviewer.openai_review import request_openai_review_decision
@@ -53,10 +54,13 @@ app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
 @app.on_event("startup")
 async def startup() -> None:
     settings = get_settings()
-    app.state.storage = build_sqlite_store(
+    storage = build_sqlite_store(
         settings.orchestrator_db_path,
         max_review_items=settings.orchestrator_max_review_items,
     )
+    if storage is not None:
+        storage.reclaim_stale_review_claims(older_than_seconds=settings.review_claim_timeout_seconds)
+    app.state.storage = storage
 
 
 def _storage() -> SQLiteStateStore | None:
@@ -313,6 +317,7 @@ async def github_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_github_event: Annotated[str | None, Header(alias="X-GitHub-Event")] = None,
+    x_github_delivery: Annotated[str | None, Header(alias="X-GitHub-Delivery")] = None,
     x_hub_signature_256: Annotated[str | None, Header(alias="X-Hub-Signature-256")] = None,
     settings: Settings = Depends(get_settings),
 ) -> WebhookAcceptedResponse:
@@ -338,18 +343,36 @@ async def github_webhook(
         raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail=str(exc)) from exc
 
     workflow = build_review_workflow(parsed)
-    event_record = event_store.record_accepted(parsed)
+    storage = _storage()
+    event_id = webhook_delivery_key(parsed, x_github_delivery)
+    if storage is not None:
+        event_record = event_record_from_parsed(parsed, event_id=event_id)
+        if not storage.save_event_record(event_record):
+            log_webhook_duplicate_suppressed(parsed, event_id=event_id)
+            event_store.record_duplicate()
+            return _webhook_response(parsed, workflow)
+    elif event_store.has_event_id(event_id):
+        log_webhook_duplicate_suppressed(parsed, event_id=event_id)
+        event_store.record_duplicate()
+        return _webhook_response(parsed, workflow)
+    else:
+        event_store.record_accepted(parsed, event_id=event_id)
+
     log_webhook_accepted(parsed)
     work_item = _create_review_work_item(parsed, workflow.review_context is not None, settings)
-    slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings)
-    log_slack_issue_dispatch_result(parsed, slack_dispatch)
-    storage = _storage()
     if storage is not None:
-        storage.save_event_record(event_record)
+        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings, registry=storage)
         storage.prune_processed_review_items(settings.orchestrator_max_review_items)
+    else:
+        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings)
+    log_slack_issue_dispatch_result(parsed, slack_dispatch)
 
     _schedule_auto_process_work_item(work_item, settings, storage, background_tasks)
 
+    return _webhook_response(parsed, workflow)
+
+
+def _webhook_response(parsed: ParsedGitHubEvent, workflow: Any) -> WebhookAcceptedResponse:
     return WebhookAcceptedResponse(
         event_type=parsed.event_type,
         repository=parsed.repository,

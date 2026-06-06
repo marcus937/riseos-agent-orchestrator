@@ -19,6 +19,7 @@ class Settings:
     orchestrator_db_path: str | None = None
     orchestrator_admin_token: str | None = None
     orchestrator_max_review_items: int = 500
+    review_claim_timeout_seconds: int = 900
     require_admin_token_for_debug_reads: bool = False
     enable_auto_review_processing: bool = False
     enable_github_context_hydration: bool = False
@@ -26,7 +27,7 @@ class Settings:
     enable_task_dispatch: bool = False
     slack_webhook_url: str | None = None
     slack_bot_token: str | None = None
-    slack_channel: str = "#project_riseos"
+    slack_channel: str = "#jarvis-agent-orchestrator"
     work_branch: str = "agent-integration"
     base_branch: str = "main"
 
@@ -47,6 +48,7 @@ def get_settings() -> Settings:
         orchestrator_db_path=os.getenv("ORCHESTRATOR_DB_PATH"),
         orchestrator_admin_token=os.getenv("ORCHESTRATOR_ADMIN_TOKEN"),
         orchestrator_max_review_items=_int_env("ORCHESTRATOR_MAX_REVIEW_ITEMS", 500),
+        review_claim_timeout_seconds=_int_env("ORCHESTRATOR_REVIEW_CLAIM_TIMEOUT_SECONDS", 900),
         require_admin_token_for_debug_reads=os.getenv("REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS", "").lower() == "true",
         enable_auto_review_processing=os.getenv("ENABLE_AUTO_REVIEW_PROCESSING", "").lower() == "true",
         enable_github_context_hydration=os.getenv("ENABLE_GITHUB_CONTEXT_HYDRATION", "").lower() == "true",
@@ -54,7 +56,7 @@ def get_settings() -> Settings:
         enable_task_dispatch=os.getenv("ENABLE_TASK_DISPATCH", "").lower() == "true",
         slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
-        slack_channel=os.getenv("SLACK_CHANNEL", "#project_riseos"),
+        slack_channel=os.getenv("SLACK_CHANNEL", "#jarvis-agent-orchestrator"),
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
     )

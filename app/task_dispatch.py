@@ -88,7 +88,7 @@ async def list_agent_ready_issues(repo_full_name: str, client: TaskDispatchClien
         labels = _label_names(raw_issue.get("labels"))
         if LABEL_AGENT_TASK not in labels or LABEL_AGENT_READY not in labels:
             continue
-        if LABEL_BB2_BLOCKED in labels:
+        if _has_existing_owner(labels):
             continue
         ready.append(
             AgentTaskIssue(
@@ -113,8 +113,8 @@ async def post_circuit_assignment(
     assignment_body: str,
     client: TaskDispatchClient,
 ) -> None:
-    await client.post_issue_comment(repo_full_name, issue_number, assignment_body)
     await client.apply_label(repo_full_name, issue_number, LABEL_AGENT_NEXT)
+    await client.post_issue_comment(repo_full_name, issue_number, assignment_body)
 
 
 async def dispatch_next_agent_task(
@@ -134,7 +134,7 @@ async def dispatch_next_agent_task(
             return TaskDispatchResult(
                 attempted=True,
                 success=False,
-                error="No queued agent-ready issue found",
+                error="No queued unclaimed agent-ready issue found",
             )
         assignment_body = build_circuit_assignment_body(issue)
         await post_circuit_assignment(repo_full_name, issue.number, assignment_body, client)
@@ -164,6 +164,10 @@ def build_circuit_assignment_body(issue: AgentTaskIssue) -> str:
         "Task summary:\n"
         f"{task_summary}"
     )
+
+
+def _has_existing_owner(labels: set[str]) -> bool:
+    return bool({LABEL_AGENT_NEXT, LABEL_AGENT_WORKING, LABEL_BB2_BLOCKED} & labels)
 
 
 def _label_names(raw_labels: Any) -> set[str]:

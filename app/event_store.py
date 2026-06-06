@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from app.correlation import branch_from_parsed, correlation_id_from_key, correlation_key_from_parsed
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.review_queue import ReviewQueueCounters
 
@@ -13,6 +14,7 @@ class EventRecord(BaseModel):
     event_id: str
     github_event: GitHubEventType
     diagnostic_stage: str = "webhook_accepted"
+    correlation_id: str | None = None
     correlation_key: str | None = None
     repo_full_name: str | None = None
     branch: str | None = None
@@ -21,6 +23,10 @@ class EventRecord(BaseModel):
     pr_number: int | None = None
     received_at: datetime
     raw_action: str | None = None
+
+    def model_post_init(self, __context: object) -> None:
+        if self.correlation_id is None and self.correlation_key:
+            self.correlation_id = correlation_id_from_key(self.correlation_key)
 
 
 class DebugHealth(BaseModel):
@@ -40,17 +46,27 @@ class DebugHealth(BaseModel):
 class InMemoryEventStore:
     def __init__(self, max_records: int = 50) -> None:
         self._records: deque[EventRecord] = deque(maxlen=max_records)
+        self._event_ids: set[str] = set()
         self._started_at = monotonic()
         self.webhook_count = 0
         self.accepted_count = 0
         self.rejected_count = 0
+        self.duplicate_count = 0
 
-    def record_accepted(self, parsed: ParsedGitHubEvent) -> EventRecord:
+    def has_event_id(self, event_id: str) -> bool:
+        return event_id in self._event_ids
+
+    def record_accepted(self, parsed: ParsedGitHubEvent, *, event_id: str | None = None) -> EventRecord:
         self.webhook_count += 1
         self.accepted_count += 1
-        record = event_record_from_parsed(parsed)
+        record = event_record_from_parsed(parsed, event_id=event_id)
         self._records.append(record)
+        self._event_ids.add(record.event_id)
         return record
+
+    def record_duplicate(self) -> None:
+        self.webhook_count += 1
+        self.duplicate_count += 1
 
     def record_rejected(self) -> None:
         self.webhook_count += 1
@@ -75,20 +91,24 @@ class InMemoryEventStore:
 
     def reset(self) -> None:
         self._records.clear()
+        self._event_ids.clear()
         self._started_at = monotonic()
         self.webhook_count = 0
         self.accepted_count = 0
         self.rejected_count = 0
+        self.duplicate_count = 0
 
 
-def event_record_from_parsed(parsed: ParsedGitHubEvent) -> EventRecord:
+def event_record_from_parsed(parsed: ParsedGitHubEvent, *, event_id: str | None = None) -> EventRecord:
+    correlation_key = correlation_key_from_parsed(parsed)
     return EventRecord(
-        event_id=str(uuid4()),
+        event_id=event_id or str(uuid4()),
         github_event=parsed.event_type,
         diagnostic_stage="webhook_accepted",
-        correlation_key=_correlation_key(parsed),
+        correlation_id=correlation_id_from_key(correlation_key),
+        correlation_key=correlation_key,
         repo_full_name=parsed.repository,
-        branch=_branch_from_parsed(parsed),
+        branch=branch_from_parsed(parsed),
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
@@ -97,23 +117,20 @@ def event_record_from_parsed(parsed: ParsedGitHubEvent) -> EventRecord:
     )
 
 
-def _branch_from_parsed(parsed: ParsedGitHubEvent) -> str | None:
-    if parsed.head_ref:
-        return parsed.head_ref
-    if parsed.ref and parsed.ref.startswith("refs/heads/"):
-        return parsed.ref.removeprefix("refs/heads/")
-    return parsed.ref
-
-
-def _correlation_key(parsed: ParsedGitHubEvent) -> str:
-    repo = parsed.repository or "unknown-repo"
-    if parsed.pull_request_number:
-        return f"{repo}:pr:{parsed.pull_request_number}"
-    if parsed.issue_number:
-        return f"{repo}:issue:{parsed.issue_number}"
-    if parsed.head_sha:
-        return f"{repo}:commit:{parsed.head_sha}"
-    return f"{repo}:event:{parsed.event_type}"
+def webhook_delivery_key(parsed: ParsedGitHubEvent, delivery_id: str | None = None) -> str:
+    if delivery_id and delivery_id.strip():
+        return f"github-delivery:{delivery_id.strip()}"
+    parts = [
+        str(parsed.event_type),
+        parsed.repository or "",
+        parsed.action or "",
+        parsed.action_label or "",
+        branch_from_parsed(parsed) or "",
+        parsed.head_sha or "",
+        str(parsed.issue_number or ""),
+        str(parsed.pull_request_number or ""),
+    ]
+    return "github-derived:" + ":".join(parts)
 
 
 event_store = InMemoryEventStore()

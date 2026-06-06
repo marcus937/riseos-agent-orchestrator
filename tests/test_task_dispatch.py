@@ -24,6 +24,7 @@ class FakeTaskDispatchClient:
         self.list_calls: list[tuple[str, list[str] | None, str, str]] = []
         self.comments: list[tuple[str, int, str]] = []
         self.labels: list[tuple[str, int, str]] = []
+        self.actions: list[tuple[str, int, str]] = []
 
     async def list_open_issues(
         self,
@@ -38,10 +39,12 @@ class FakeTaskDispatchClient:
 
     async def post_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> dict[str, Any]:
         self.comments.append((repo_full_name, issue_number, body))
+        self.actions.append(("comment", issue_number, body))
         return {"id": 1}
 
     async def apply_label(self, repo_full_name: str, issue_number: int, label: str) -> dict[str, Any]:
         self.labels.append((repo_full_name, issue_number, label))
+        self.actions.append(("label", issue_number, label))
         return {"labels": [label]}
 
 
@@ -93,7 +96,7 @@ def test_needs_changes_does_not_dispatch_next_task() -> None:
     assert should_dispatch_next_task(ReviewDecisionType.NEEDS_CHANGES) is False
 
 
-def test_no_ready_issue_is_handled_cleanly() -> None:
+def test_no_unclaimed_ready_issue_is_handled_cleanly() -> None:
     client = FakeTaskDispatchClient([])
 
     result = run(dispatch_next_agent_task("riseos/example", client, enabled=True))
@@ -101,7 +104,7 @@ def test_no_ready_issue_is_handled_cleanly() -> None:
     assert result.attempted is True
     assert result.success is False
     assert result.issue_number is None
-    assert result.error == "No queued agent-ready issue found"
+    assert result.error == "No queued unclaimed agent-ready issue found"
     assert client.comments == []
     assert client.labels == []
 
@@ -118,6 +121,8 @@ def test_dispatch_posts_assignment_comment_and_agent_next_label() -> None:
     assert result.issue_number == 8
     assert client.comments[0][0:2] == ("riseos/example", 8)
     assert client.labels == [("riseos/example", 8, LABEL_AGENT_NEXT)]
+    assert client.actions[0] == ("label", 8, LABEL_AGENT_NEXT)
+    assert client.actions[1][0:2] == ("comment", 8)
     body = client.comments[0][2]
     assert "Circuit Assignment" in body
     assert "Wire dispatch" in body
@@ -161,6 +166,20 @@ def test_list_agent_ready_issues_filters_missing_labels_and_blocked() -> None:
     ready = run(list_agent_ready_issues("riseos/example", client))
 
     assert [item.number for item in ready] == [1]
+
+
+def test_list_agent_ready_issues_filters_existing_owner_labels() -> None:
+    client = FakeTaskDispatchClient(
+        [
+            issue(1, created_at="2026-06-01T00:00:00Z", labels=["agent-task", "agent-ready", "agent-next"]),
+            issue(2, created_at="2026-06-02T00:00:00Z", labels=["agent-task", "agent-ready", "agent-working"]),
+            issue(3, created_at="2026-06-03T00:00:00Z", labels=["agent-task", "agent-ready"]),
+        ]
+    )
+
+    ready = run(list_agent_ready_issues("riseos/example", client))
+
+    assert [item.number for item in ready] == [3]
 
 
 def test_github_client_has_no_forbidden_mutation_methods() -> None:
