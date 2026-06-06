@@ -12,6 +12,7 @@ from app.github_events import GitHubEventType, ParsedGitHubEvent
 AGENT_READY_LABEL = "agent-ready"
 APPROVED_REPO_FULL_NAMES = {
     "marcus937/Project-Jarvis",
+    "marcus937/hermes-runtime-agent",
     "marcus937/jarvis-mission-control",
     "marcus937/riseos-agent-orchestrator",
     "marcus937/Rylinn-Field-App-Codex",
