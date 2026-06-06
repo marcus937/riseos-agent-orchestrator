@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class GitHubEventType(StrEnum):
     ISSUE_COMMENT = "issue_comment"
     ISSUES = "issues"
+    PING = "ping"
     PUSH = "push"
     PULL_REQUEST = "pull_request"
 
@@ -79,6 +80,9 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
         "sender": _sender_login(payload),
         "raw": payload,
     }
+
+    if event_type == GitHubEventType.PING:
+        return ParsedGitHubEvent(**base)
 
     if event_type == GitHubEventType.ISSUE_COMMENT:
         issue = payload.get("issue") or {}
