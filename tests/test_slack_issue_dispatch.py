@@ -49,7 +49,7 @@ def client_with_secret(secret: str = "test-secret") -> TestClient:
     app.dependency_overrides[get_settings] = lambda: Settings(
         github_webhook_secret=secret,
         slack_webhook_url="https://hooks.slack.test/services/test",
-        slack_channel="#project_riseos",
+        slack_channel="#jarvis-agent-orchestrator",
     )
     return TestClient(app)
 
@@ -84,6 +84,20 @@ def issue_payload(
     return payload
 
 
+def test_ping_parser_accepts_hermes_repository_context() -> None:
+    parsed = parse_github_event(
+        "ping",
+        {
+            "repository": {"full_name": "marcus937/hermes-runtime-agent"},
+            "sender": {"login": "marcus"},
+        },
+    )
+
+    assert parsed.event_type == GitHubEventType.PING
+    assert parsed.repository == "marcus937/hermes-runtime-agent"
+    assert parsed.sender == "marcus"
+
+
 def test_issues_parser_extracts_issue_context() -> None:
     parsed = parse_github_event("issues", issue_payload(action="labeled", action_label=AGENT_READY_LABEL))
 
@@ -106,7 +120,7 @@ def test_opened_agent_ready_issue_dispatches_to_slack() -> None:
     result = run(
         dispatch_ready_issue_to_slack(
             parsed,
-            Settings(slack_webhook_url="https://hooks.slack.test/services/test", slack_channel="#project_riseos"),
+            Settings(slack_webhook_url="https://hooks.slack.test/services/test", slack_channel="#jarvis-agent-orchestrator"),
             client=client,
             registry=registry,
         )
@@ -115,7 +129,7 @@ def test_opened_agent_ready_issue_dispatches_to_slack() -> None:
     assert result.attempted is True
     assert result.success is True
     assert result.issue_key == "marcus937/Project-Jarvis#11"
-    assert client.messages[0][0] == "#project_riseos"
+    assert client.messages[0][0] == "#jarvis-agent-orchestrator"
     assert "@circuit-forge" in client.messages[0][1]
     assert "Repo: marcus937/Project-Jarvis" in client.messages[0][1]
     assert "Issue: #11 - Architecture plan: shared memory layer" in client.messages[0][1]
@@ -156,6 +170,24 @@ def test_dispatch_allows_exact_approved_full_repo_name() -> None:
 
     assert result.success is True
     assert result.issue_key == "marcus937/Rylinn-Field-App-Codex#11"
+
+
+def test_dispatch_allows_hermes_runtime_agent_repo() -> None:
+    parsed = parse_github_event("issues", issue_payload(repo="marcus937/hermes-runtime-agent"))
+    client = FakeSlackClient()
+
+    result = run(
+        dispatch_ready_issue_to_slack(
+            parsed,
+            Settings(slack_webhook_url="https://hooks.slack.test/services/test"),
+            client=client,
+            registry=InMemoryDispatchedIssueRegistry(),
+        )
+    )
+
+    assert result.success is True
+    assert result.issue_key == "marcus937/hermes-runtime-agent#11"
+    assert "Repo: marcus937/hermes-runtime-agent" in client.messages[0][1]
 
 
 def test_dispatch_ignores_closed_issues() -> None:
@@ -228,10 +260,10 @@ def test_dispatch_deduplicates_issue_key() -> None:
 def test_message_includes_required_fields() -> None:
     parsed = parse_github_event("issues", issue_payload(labels=[AGENT_READY_LABEL, "ARCHITECT_REVIEW_REQUIRED"]))
 
-    message = build_circuit_slack_message(parsed, channel="#project_riseos")
+    message = build_circuit_slack_message(parsed, channel="#jarvis-agent-orchestrator")
 
     assert "@circuit-forge" in message
-    assert "Channel: #project_riseos" in message
+    assert "Channel: #jarvis-agent-orchestrator" in message
     assert "Repo: marcus937/Project-Jarvis" in message
     assert "Issue: #11 - Architecture plan: shared memory layer" in message
     assert "Labels: agent-ready, ARCHITECT_REVIEW_REQUIRED" in message
@@ -250,7 +282,7 @@ def test_message_sanitizes_slack_control_sequences() -> None:
         ),
     )
 
-    message = build_circuit_slack_message(parsed, channel="#project_riseos")
+    message = build_circuit_slack_message(parsed, channel="#jarvis-agent-orchestrator")
 
     assert "<!channel>" not in message
     assert "<!here>" not in message
@@ -281,6 +313,27 @@ def test_slack_dispatch_logging_uses_structured_event_names(caplog: Any) -> None
         assert f'"event": "{expected_event}"' in caplog.text
 
 
+def test_signed_ping_webhook_is_accepted_without_slack_dispatch(monkeypatch: Any) -> None:
+    secret = "test-secret"
+    client = client_with_secret(secret)
+    dispatched: list[tuple[str | None, int | None]] = []
+
+    async def fake_dispatch(parsed: Any, settings: Settings) -> SlackIssueDispatchResult:
+        dispatched.append((parsed.repository, parsed.issue_number))
+        return SlackIssueDispatchResult(skipped_reason="Not a GitHub issues event.")
+
+    monkeypatch.setattr(main_module, "dispatch_ready_issue_to_slack", fake_dispatch)
+    body = json.dumps({"repository": {"full_name": "marcus937/hermes-runtime-agent"}}).encode("utf-8")
+
+    response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "ping", body))
+
+    assert response.status_code == 200
+    assert response.json()["event_type"] == "ping"
+    assert response.json()["repository"] == "marcus937/hermes-runtime-agent"
+    assert response.json()["task_state"] == "working"
+    assert dispatched == [("marcus937/hermes-runtime-agent", None)]
+
+
 def test_signed_issues_webhook_invokes_slack_dispatch(monkeypatch: Any) -> None:
     secret = "test-secret"
     client = client_with_secret(secret)
@@ -291,14 +344,14 @@ def test_signed_issues_webhook_invokes_slack_dispatch(monkeypatch: Any) -> None:
         return SlackIssueDispatchResult(attempted=True, success=True, issue_key=f"{parsed.repository}#{parsed.issue_number}")
 
     monkeypatch.setattr(main_module, "dispatch_ready_issue_to_slack", fake_dispatch)
-    body = json.dumps(issue_payload()).encode("utf-8")
+    body = json.dumps(issue_payload(repo="marcus937/hermes-runtime-agent")).encode("utf-8")
 
     response = client.post("/webhooks/github", content=body, headers=signed_headers(secret, "issues", body))
 
     assert response.status_code == 200
     assert response.json()["event_type"] == "issues"
     assert response.json()["issue_number"] == 11
-    assert dispatched == [("marcus937/Project-Jarvis", 11)]
+    assert dispatched == [("marcus937/hermes-runtime-agent", 11)]
 
 
 def test_unsigned_issues_webhook_is_rejected_before_slack_dispatch(monkeypatch: Any) -> None:
