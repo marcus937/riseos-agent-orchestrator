@@ -27,7 +27,7 @@ class Settings:
     enable_task_dispatch: bool = False
     slack_webhook_url: str | None = None
     slack_bot_token: str | None = None
-    slack_channel: str = "#project_riseos"
+    slack_channel: str = "#jarvis-agent-orchestrator"
     work_branch: str = "agent-integration"
     base_branch: str = "main"
 
@@ -56,7 +56,7 @@ def get_settings() -> Settings:
         enable_task_dispatch=os.getenv("ENABLE_TASK_DISPATCH", "").lower() == "true",
         slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
-        slack_channel=os.getenv("SLACK_CHANNEL", "#project_riseos"),
+        slack_channel=os.getenv("SLACK_CHANNEL", "#jarvis-agent-orchestrator"),
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
     )
