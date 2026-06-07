@@ -18,25 +18,27 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 {
   "schema_version": "orchestrator.snapshot.v1",
   "generated_at": "2026-06-07T19:45:00.000000Z",
-  "overview": {
-    "status": "ok",
-    "app_env": "local",
-    "work_branch": "agent-integration",
-    "base_branch": "main",
-    "webhook_count": 1,
-    "accepted_count": 1,
-    "rejected_count": 0,
-    "review_queue_count": 1,
-    "pending_review_count": 1,
-    "active_reviewing_count": 0,
-    "approved_for_human_review_count": 0,
-    "blocked_count": 0,
-    "recent_failure_count": 0
+  "workforce": {
+    "overview": {
+      "status": "ok",
+      "app_env": "local",
+      "work_branch": "agent-integration",
+      "base_branch": "main",
+      "webhook_count": 1,
+      "accepted_count": 1,
+      "rejected_count": 0,
+      "review_queue_count": 1,
+      "pending_review_count": 1,
+      "active_reviewing_count": 0,
+      "approved_for_human_review_count": 0,
+      "blocked_count": 0,
+      "recent_failure_count": 0
+    },
+    "agents": [],
+    "issues": [],
+    "prs": [],
+    "events": []
   },
-  "agents": [],
-  "issues": [],
-  "prs": [],
-  "events": [],
   "queue": {},
   "health": {},
   "runtime": {
@@ -63,15 +65,21 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 | --- | --- | --- |
 | `schema_version` | string | Stable contract identifier. Current value is `orchestrator.snapshot.v1`. |
 | `generated_at` | datetime | UTC timestamp when the snapshot was assembled. |
-| `overview` | object | Compact summary for top-level JMC status cards. |
-| `agents` | array | Review lifecycle projection built from existing `ReviewLifecycleVisibility` records. |
-| `issues` | array | Review work items attached to GitHub issues and not PRs. |
-| `prs` | array | Review work items attached to GitHub pull requests. |
-| `events` | array | Recent accepted webhook events from the existing `EventRecord` source. |
-| `queue` | object | Existing `ReviewQueueStats` payload. |
-| `health` | object | Existing `DebugHealth` payload. |
-| `runtime` | object | Current Orchestrator runtime and dispatch configuration status. |
+| `workforce` | object | JMC Workforce section payload. Contains `overview`, `agents`, `issues`, `prs`, and `events`. |
+| `queue` | object | Existing `ReviewQueueStats` payload for operational queue counters and ages. |
+| `health` | object | Existing `DebugHealth` payload for service and webhook counters. |
+| `runtime` | object | Current Orchestrator runtime and dispatch configuration status. Secret values are never included. |
 | `recent_failures` | array | Existing bounded `RecentFailure` projection. Additive helper field for JMC failure panels. |
+
+## Workforce Fields
+
+| Field | Type | Definition |
+| --- | --- | --- |
+| `workforce.overview` | object | Compact summary for top-level JMC Workforce status cards. |
+| `workforce.agents` | array | Review lifecycle projection built from existing `ReviewLifecycleVisibility` records. |
+| `workforce.issues` | array | Review work items attached to GitHub issues and not PRs. |
+| `workforce.prs` | array | Review work items attached to GitHub pull requests. |
+| `workforce.events` | array | Recent accepted webhook events from the existing `EventRecord` source. |
 
 ## Overview Fields
 
@@ -95,13 +103,21 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 
 The snapshot intentionally reuses existing Orchestrator telemetry sources rather than duplicating business logic:
 
-- `WorkerStats` contributes worker activity fields to `overview` and `runtime` interpretation.
+- `WorkerStats` contributes worker activity fields to `workforce.overview` and runtime interpretation.
 - `ReviewQueueStats` is embedded at `queue`.
-- `ReviewWorkItem` is embedded in `issues` and `prs`.
-- `EventRecord` is embedded in `events`.
+- `ReviewWorkItem` is embedded in `workforce.issues` and `workforce.prs`.
+- `EventRecord` is embedded in `workforce.events`.
 - `RecentFailure` is embedded in `recent_failures`.
-- `ReviewLifecycleVisibility` is embedded in `agents`.
+- `ReviewLifecycleVisibility` is embedded in `workforce.agents`.
 - Hermes dispatch configuration is normalized into `runtime.hermes_dispatch` as `HermesDispatchStatus`.
+
+## Access And Security
+
+The snapshot exposes operational queue, event, health, and runtime configuration status. It must follow the debug-read access policy:
+
+- Local/default mode: readable without an admin token when `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=false`.
+- Protected mode: requires `X-Orchestrator-Admin-Token` when `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`.
+- Runtime configuration fields expose configured/enabled booleans only. They must not expose webhook URLs, bot tokens, Hermes tokens, GitHub tokens, admin tokens, or default target strings.
 
 ## Update Cadence
 
@@ -137,5 +153,6 @@ Jarvis Brain may enrich JMC with product or reasoning context, but Brain is not 
 The contract is covered by endpoint tests that verify:
 
 - `GET /api/v1/orchestrator/snapshot` returns `schema_version: orchestrator.snapshot.v1`.
-- Existing webhook, event, queue, lifecycle, health, and runtime data are aggregated into one payload.
+- Existing webhook, event, queue, lifecycle, health, and runtime data are aggregated into one payload with JMC Workforce data under `workforce`.
 - The endpoint follows the debug-read access policy when token protection is enabled.
+- Runtime status does not expose configured secret values.
