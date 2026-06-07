@@ -7,8 +7,9 @@ import httpx
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.correlation import branch_from_parsed
+from app.correlation import branch_from_parsed, correlation_id_from_parsed
 from app.github_events import GitHubEventType, ParsedGitHubEvent
+from app.operational_logging import log_event
 from app.slack_issue_dispatch import SlackClient, SlackIssueDispatchClient, _sanitize_slack_text
 
 HERMES_RUNTIME_LABELS = {"runtime-agent", "playwright", "evidence", "testing"}
@@ -112,13 +113,50 @@ async def dispatch_hermes_runtime_validation(
     hermes_client: HermesDispatchHTTPClient | None = None,
     registry: HermesDispatchRegistry = hermes_dispatch_registry,
 ) -> HermesDispatchResult:
+    explicit = _explicit_hermes_command(parsed.comment_body)
+    labels_request_hermes = _labels_request_hermes(parsed.labels, explicit=explicit)
     route = _route_reason(parsed)
-    if route is None:
-        return HermesDispatchResult(skipped_reason="Event does not require Hermes runtime validation.")
-
     node = _hermes_node(parsed.labels)
+    _log_hermes_decision(
+        parsed,
+        "hermes_route_evaluated",
+        node=node,
+        route=route,
+        explicit_command=explicit,
+        labels_request_hermes=labels_request_hermes,
+        runtime_label_match=bool(set(parsed.labels) & HERMES_RUNTIME_LABELS),
+        lifecycle_label_match=bool(set(parsed.labels) & HERMES_LIFECYCLE_LABELS),
+        terminal_label_match=bool(set(parsed.labels) & TERMINAL_LABELS),
+        bb2_blocked=BB2_BLOCK_LABEL in set(parsed.labels),
+    )
+    if route is None:
+        return HermesDispatchResult(hermes_node=node, skipped_reason="Event does not require Hermes runtime validation.")
+
     correlation_id = _hermes_correlation_id(parsed, node=node)
     dispatch_key = _dispatch_key(parsed, settings, node=node)
+    disabled = _dispatch_disabled(settings, node=node)
+    missing_config = _missing_config(settings, node=node)
+    target_error = _target_url_error(settings.hermes_default_target)
+    eligibility_blocker = _eligibility_blocker(
+        dispatch_key=dispatch_key,
+        disabled=disabled,
+        missing_config=missing_config,
+        target_error=target_error,
+    )
+    _log_hermes_decision(
+        parsed,
+        "hermes_dispatch_eligibility_evaluated",
+        node=node,
+        route=route,
+        dispatch_key=dispatch_key,
+        dispatch_key_available=dispatch_key is not None,
+        dispatch_enabled=eligibility_blocker is None,
+        disabled_reason=disabled,
+        missing_config=missing_config,
+        target_error=target_error,
+        eligibility_blocker=eligibility_blocker,
+        hermes_target=settings.hermes_default_target,
+    )
     if dispatch_key is None:
         return HermesDispatchResult(
             hermes_node=node,
@@ -126,7 +164,6 @@ async def dispatch_hermes_runtime_validation(
             skipped_reason="PR dispatch key could not be determined.",
         )
 
-    disabled = _dispatch_disabled(settings, node=node)
     if disabled:
         return HermesDispatchResult(
             hermes_node=node,
@@ -148,7 +185,6 @@ async def dispatch_hermes_runtime_validation(
         )
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
 
-    missing_config = _missing_config(settings, node=node)
     if missing_config:
         result = HermesDispatchResult(
             attempted=True,
@@ -162,7 +198,6 @@ async def dispatch_hermes_runtime_validation(
         )
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
 
-    target_error = _target_url_error(settings.hermes_default_target)
     if target_error:
         result = HermesDispatchResult(
             attempted=True,
@@ -187,13 +222,43 @@ async def dispatch_hermes_runtime_validation(
     owns_client = hermes_client is None
     hermes_client = hermes_client or HermesHTTPClient()
     payload = build_hermes_job_payload(parsed, settings, node=node, correlation_id=correlation_id, route=route)
+    base_url = _node_base_url(settings, node)
+    _log_hermes_decision(
+        parsed,
+        "hermes_post_attempted",
+        node=node,
+        route=route,
+        dispatch_key=dispatch_key,
+        hermes_base_url=base_url,
+        hermes_target=settings.hermes_default_target,
+        payload_correlation_id=payload["correlationId"],
+        payload_type=payload["type"],
+    )
     try:
-        response = await hermes_client.post_job(_node_base_url(settings, node), _node_token(settings, node), payload)
+        response = await hermes_client.post_job(base_url, _node_token(settings, node), payload)
         result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
+        _log_hermes_decision(
+            parsed,
+            "hermes_post_completed",
+            node=node,
+            route=route,
+            dispatch_key=dispatch_key,
+            status=result.status,
+            success=result.success,
+            job_id=result.job_id,
+        )
         if parsed.event_type == GitHubEventType.ISSUES and result.status == "FAILED":
             result.label = "agent-blocked"
         registry.mark_hermes_dispatch(dispatch_key)
     except Exception as exc:
+        _log_hermes_decision(
+            parsed,
+            "hermes_post_failed",
+            node=node,
+            route=route,
+            dispatch_key=dispatch_key,
+            error=str(exc),
+        )
         result = HermesDispatchResult(
             attempted=True,
             success=False,
@@ -392,6 +457,44 @@ def _hermes_correlation_id(parsed: ParsedGitHubEvent, *, node: Literal["M2", "DG
     pr_number = parsed.pull_request_number or parsed.issue_number or "unknown"
     short_sha = (parsed.head_sha or "unknown")[:7]
     return f"hermes-{node.lower()}-{repo}-pr-{pr_number}-{short_sha}"
+
+
+def _eligibility_blocker(
+    *,
+    dispatch_key: str | None,
+    disabled: str | None,
+    missing_config: str | None,
+    target_error: str | None,
+) -> str | None:
+    if dispatch_key is None:
+        return "dispatch_key_missing"
+    return disabled or missing_config or target_error
+
+
+def _log_hermes_decision(
+    parsed: ParsedGitHubEvent,
+    event: str,
+    *,
+    node: Literal["M2", "DGX"],
+    route: str | None = None,
+    **fields: Any,
+) -> None:
+    log_event(
+        event,
+        correlation_id=_hermes_correlation_id(parsed, node=node),
+        orchestrator_correlation_id=correlation_id_from_parsed(parsed),
+        github_event=str(parsed.event_type),
+        repo_full_name=parsed.repository,
+        action=parsed.action,
+        action_label=parsed.action_label,
+        commit_sha=parsed.head_sha,
+        issue_number=parsed.issue_number,
+        pr_number=parsed.pull_request_number,
+        labels=sorted(set(parsed.labels)),
+        hermes_node=node,
+        route=route,
+        **fields,
+    )
 
 
 def _result_from_hermes_response(
