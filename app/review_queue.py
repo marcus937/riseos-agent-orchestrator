@@ -41,6 +41,7 @@ class ReviewWorkItem(BaseModel):
     commit_sha: str | None = None
     issue_number: int | None = None
     pr_number: int | None = None
+    labels: list[str] = Field(default_factory=list)
     status: ReviewWorkItemStatus = ReviewWorkItemStatus.PENDING_REVIEW
     lifecycle_stage: ReviewLifecycleStage = ReviewLifecycleStage.REVIEW_QUEUED
     worker_claimed_at: datetime | None = None
@@ -235,6 +236,7 @@ def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
+        labels=sorted(set(parsed.labels)),
     )
 
 
