@@ -22,7 +22,7 @@ These labels mean the PR should enter the Hermes runtime validation path. They a
 2. Circuit works only inside the allowed branch rule, currently `agent-integration` for this orchestrator lane.
 3. Circuit opens or updates a draft PR into `main` from `agent-integration`.
 4. The orchestrator accepts the `pull_request` webhook.
-5. If the PR head branch is `agent-integration` and the base branch is `main`, the orchestrator treats the PR as Hermes-eligible even when the trigger labels are not already present.
+5. If the PR head branch is `agent-integration`, the base branch is `main`, and the PR head/base repositories both match the webhook repository, the orchestrator treats the PR as Hermes-eligible even when the trigger labels are not already present.
 6. The orchestrator checks Hermes dispatch safety gates first: dispatch enabled, supported node, required config, valid target, and duplicate-dispatch suppression.
 7. When those gates pass and GitHub writeback is enabled, the orchestrator applies `runtime-agent`, `playwright`, and `bb-review-needed` to the PR.
 8. The orchestrator sends Hermes a validation job payload containing repo, PR number, branch, commit SHA, target URL, trigger route, and canonical labels.
@@ -59,14 +59,17 @@ Hermes must remain read-only by default:
 
 GitHub writeback is limited to comments and labels when `ENABLE_GITHUB_WRITEBACK=true`. Disabled or duplicate Hermes dispatch must not apply trigger labels, post comments, or enqueue jobs.
 
+Automatic Circuit PR routing must require a trusted same-repository PR. A forked PR that uses the branch name `agent-integration` must not auto-dispatch Hermes or apply labels.
+
 Blocked Hermes runs should produce a `BLOCKED` packet explaining what input or environment is needed before BB2 continues.
 
 ## VERIFIED
 
-- Circuit PRs from `agent-integration` into `main` now enter Hermes routing on `opened`, `synchronize`, and `ready_for_review` events.
+- Circuit PRs from `agent-integration` into `main` now enter Hermes routing on `opened`, `synchronize`, and `ready_for_review` events only when the PR head/base repositories match the webhook repository.
 - The canonical Hermes trigger labels are `runtime-agent`, `playwright`, and `bb-review-needed`.
 - When dispatch safety gates pass and GitHub writeback is enabled, those trigger labels are applied automatically before the Hermes job is dispatched.
-- Hermes job payloads include the canonical labels for Circuit PRs even if the webhook payload did not already contain them.
+- Hermes job payloads include the canonical labels for trusted Circuit PRs even if the webhook payload did not already contain them.
+- Duplicate label webhook events for the same PR commit and target are suppressed by the Hermes dispatch registry.
 
 ## ASSUMED
 
