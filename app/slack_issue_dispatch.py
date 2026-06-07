@@ -219,11 +219,16 @@ def _sanitize_slack_text(value: str) -> str:
 
 
 def _orchestrator_slack_webhook_url(settings: Settings) -> str | None:
-    return settings.orchestrator_slack_webhook_url or os.getenv("ORCHESTRATOR_SLACK_WEBHOOK_URL") or os.getenv("SLACK_WEBHOOK_URL") or settings.slack_webhook_url
+    configured = settings.orchestrator_slack_webhook_url or os.getenv("ORCHESTRATOR_SLACK_WEBHOOK_URL") or os.getenv("SLACK_WEBHOOK_URL")
+    if configured:
+        return configured
+    if settings.hermes_slack_webhook_url and settings.slack_webhook_url == settings.hermes_slack_webhook_url:
+        return None
+    return settings.slack_webhook_url
 
 
 def _orchestrator_slack_channel(settings: Settings) -> str:
-    return settings.orchestrator_slack_channel or os.getenv("ORCHESTRATOR_SLACK_CHANNEL") or os.getenv("SLACK_CHANNEL") or settings.slack_channel or ORCHESTRATOR_SLACK_CHANNEL
+    return os.getenv("ORCHESTRATOR_SLACK_CHANNEL") or os.getenv("SLACK_CHANNEL") or settings.orchestrator_slack_channel or settings.slack_channel or ORCHESTRATOR_SLACK_CHANNEL
 
 
 def _slack_route_for_text(text: str) -> SlackRoute:
