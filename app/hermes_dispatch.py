@@ -24,6 +24,7 @@ TERMINAL_LABELS = {"wontfix", "duplicate", "invalid", "agent-blocked", "agent-me
 BB2_BLOCK_LABEL = "bb2-blocked"
 DGX_LABELS = {"dgx", "runtime-agent", "evidence", "mission-control", "frontend", "playwright"}
 EVIDENCE_FILES = ["summary.json", "logs.json", "console.json", "network.json", "page.json", "screenshot.png"]
+PLACEHOLDER_TARGETS = {"https://example.com", "http://example.com"}
 
 
 class HermesWritebackClient(Protocol):
@@ -85,8 +86,8 @@ class HermesHTTPClient:
 
     async def post_job(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = await self._http_client.post(
-            f"{base_url.rstrip('/')}/jobs",
-            headers={"Authorization": f"Bearer {token}"},
+            f"{base_url.rstrip('/')}/api/v1/jobs",
+            headers={"X-Hermes-Token": token},
             json=payload,
         )
         response.raise_for_status()
@@ -125,7 +126,16 @@ async def dispatch_hermes_runtime_validation(
             skipped_reason="PR dispatch key could not be determined.",
         )
 
-    if node == "DGX" and not settings.hermes_dgx_enable_dispatch:
+    disabled = _dispatch_disabled(settings, node=node)
+    if disabled:
+        return HermesDispatchResult(
+            hermes_node=node,
+            dispatch_key=dispatch_key,
+            correlation_id=correlation_id,
+            skipped_reason=disabled,
+        )
+
+    if node == "DGX":
         result = HermesDispatchResult(
             attempted=True,
             success=False,
@@ -133,18 +143,10 @@ async def dispatch_hermes_runtime_validation(
             hermes_node=node,
             dispatch_key=dispatch_key,
             correlation_id=correlation_id,
-            error="Hermes DGX dispatch is not enabled.",
+            error="Hermes DGX dispatch is not supported yet.",
             label="agent-blocked",
         )
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
-
-    if not registry.claim_hermes_dispatch(dispatch_key):
-        return HermesDispatchResult(
-            hermes_node=node,
-            dispatch_key=dispatch_key,
-            correlation_id=correlation_id,
-            skipped_reason="Hermes validation was already dispatched for this PR commit and target.",
-        )
 
     missing_config = _missing_config(settings, node=node)
     if missing_config:
@@ -160,9 +162,8 @@ async def dispatch_hermes_runtime_validation(
         )
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
 
-    target_url = settings.hermes_default_target
-    invalid_target = _target_url_error(target_url)
-    if invalid_target:
+    target_error = _target_url_error(settings.hermes_default_target)
+    if target_error:
         result = HermesDispatchResult(
             attempted=True,
             success=False,
@@ -170,17 +171,25 @@ async def dispatch_hermes_runtime_validation(
             hermes_node=node,
             dispatch_key=dispatch_key,
             correlation_id=correlation_id,
-            error=invalid_target,
+            error=target_error,
             label="agent-blocked",
         )
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
+
+    if not registry.claim_hermes_dispatch(dispatch_key):
+        return HermesDispatchResult(
+            hermes_node=node,
+            dispatch_key=dispatch_key,
+            correlation_id=correlation_id,
+            skipped_reason="Hermes validation was already dispatched for this PR commit and target.",
+        )
 
     owns_client = hermes_client is None
     hermes_client = hermes_client or HermesHTTPClient()
     payload = build_hermes_job_payload(parsed, settings, node=node, correlation_id=correlation_id, route=route)
     try:
         response = await hermes_client.post_job(_node_base_url(settings, node), _node_token(settings, node), payload)
-        result = _result_from_hermes_response(response, parsed, settings, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
+        result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
         registry.mark_hermes_dispatch(dispatch_key)
     except Exception as exc:
         result = HermesDispatchResult(
@@ -281,7 +290,8 @@ def build_hermes_pr_comment(parsed: ParsedGitHubEvent, result: HermesDispatchRes
         "### Evidence\n"
         f"{evidence}\n\n"
         "### VERIFIED\n"
-        f"- {verified}\n\n"
+        f"- {verified}\n"
+        "- This label is runtime evidence only and is not merge approval.\n\n"
         "### ASSUMED\n"
         "- Runtime target is the configured Hermes default target.\n"
         "- Hermes artifacts are stored outside this repository or referenced by the returned job.\n\n"
@@ -296,19 +306,15 @@ def _route_reason(parsed: ParsedGitHubEvent) -> str | None:
         if parsed.action == "created" and parsed.pull_request_number and explicit:
             return "pr_comment_hermes_validate"
         return None
-
     if parsed.event_type == GitHubEventType.PULL_REQUEST:
         if parsed.action not in {"labeled", "unlabeled", "opened", "synchronize", "ready_for_review"}:
             return None
         if _labels_request_hermes(parsed.labels, explicit=explicit):
             return f"pull_request_{parsed.action}"
         return None
-
     if parsed.event_type == GitHubEventType.PULL_REQUEST_REVIEW:
         if parsed.action == "submitted" and _labels_request_hermes(parsed.labels, explicit=explicit):
             return "pull_request_review_submitted"
-        return None
-
     return None
 
 
@@ -333,16 +339,18 @@ def _hermes_node(labels: list[str]) -> Literal["M2", "DGX"]:
     return "M2"
 
 
-def _missing_config(settings: Settings, *, node: Literal["M2", "DGX"]) -> str | None:
-    if node == "DGX":
-        if not settings.hermes_dgx_enable_dispatch:
-            return "HERMES_DGX_ENABLE_DISPATCH=false."
-        if not settings.hermes_dgx_base_url or not settings.hermes_dgx_token:
-            return "Missing HERMES_DGX_BASE_URL or HERMES_DGX_TOKEN."
-        return None
-    if not settings.hermes_m2_enable_dispatch:
+def _dispatch_disabled(settings: Settings, *, node: Literal["M2", "DGX"]) -> str | None:
+    if node == "DGX" and not settings.hermes_dgx_enable_dispatch:
+        return "HERMES_DGX_ENABLE_DISPATCH=false."
+    if node == "M2" and not settings.hermes_m2_enable_dispatch:
         return "HERMES_M2_ENABLE_DISPATCH=false."
-    if not settings.hermes_m2_base_url or not settings.hermes_m2_token:
+    return None
+
+
+def _missing_config(settings: Settings, *, node: Literal["M2", "DGX"]) -> str | None:
+    if node == "DGX" and (not settings.hermes_dgx_base_url or not settings.hermes_dgx_token):
+        return "Missing HERMES_DGX_BASE_URL or HERMES_DGX_TOKEN."
+    if node == "M2" and (not settings.hermes_m2_base_url or not settings.hermes_m2_token):
         return "Missing HERMES_M2_BASE_URL or HERMES_M2_TOKEN."
     return None
 
@@ -351,6 +359,8 @@ def _target_url_error(target_url: str) -> str | None:
     parsed = urlparse(target_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return "HERMES_DEFAULT_TARGET must be an absolute http or https URL."
+    if target_url.rstrip("/") in PLACEHOLDER_TARGETS:
+        return "HERMES_DEFAULT_TARGET is a placeholder and cannot produce runtime validation writeback."
     return None
 
 
@@ -380,8 +390,6 @@ def _hermes_correlation_id(parsed: ParsedGitHubEvent, *, node: Literal["M2", "DG
 
 def _result_from_hermes_response(
     response: dict[str, Any],
-    parsed: ParsedGitHubEvent,
-    settings: Settings,
     *,
     node: Literal["M2", "DGX"],
     dispatch_key: str,
@@ -443,7 +451,10 @@ async def _notify_and_writeback(
         if parsed.repository and pr_number:
             comment = build_hermes_pr_comment(parsed, result, settings)
             result.comment = comment
-            await github_client.post_issue_comment(parsed.repository, pr_number, comment)
-            await github_client.apply_label(parsed.repository, pr_number, result.label)
+            try:
+                await github_client.post_issue_comment(parsed.repository, pr_number, comment)
+                await github_client.apply_label(parsed.repository, pr_number, result.label)
+            except Exception as exc:
+                result.error = result.error or str(exc)
 
     return result
