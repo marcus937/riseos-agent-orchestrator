@@ -11,6 +11,7 @@ class GitHubEventType(StrEnum):
     PING = "ping"
     PUSH = "push"
     PULL_REQUEST = "pull_request"
+    PULL_REQUEST_REVIEW = "pull_request_review"
 
 
 class ParsedGitHubEvent(BaseModel):
@@ -124,6 +125,7 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     return ParsedGitHubEvent(
         **base,
         pull_request_number=pull_request.get("number") or payload.get("number"),
+        action_label=_action_label(payload),
         head_sha=(pull_request.get("head") or {}).get("sha"),
         head_ref=(pull_request.get("head") or {}).get("ref"),
         base_ref=(pull_request.get("base") or {}).get("ref"),
