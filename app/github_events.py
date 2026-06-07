@@ -30,7 +30,9 @@ class ParsedGitHubEvent(BaseModel):
     after: str | None = None
     head_sha: str | None = None
     head_ref: str | None = None
+    head_repo_full_name: str | None = None
     base_ref: str | None = None
+    base_repo_full_name: str | None = None
     comment_body: str | None = None
     labels: list[str] = Field(default_factory=list)
     raw: dict[str, Any] = Field(default_factory=dict)
@@ -66,6 +68,13 @@ def _action_label(payload: dict[str, Any]) -> str | None:
     label = payload.get("label") or {}
     name = label.get("name")
     return str(name) if name else None
+
+
+def _full_name(raw_repo: Any) -> str | None:
+    if not isinstance(raw_repo, dict):
+        return None
+    full_name = raw_repo.get("full_name")
+    return str(full_name) if full_name else None
 
 
 def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHubEvent:
@@ -122,13 +131,17 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
         )
 
     pull_request = payload.get("pull_request") or {}
+    head = pull_request.get("head") or {}
+    base_ref = pull_request.get("base") or {}
     return ParsedGitHubEvent(
         **base,
         pull_request_number=pull_request.get("number") or payload.get("number"),
         action_label=_action_label(payload),
-        head_sha=(pull_request.get("head") or {}).get("sha"),
-        head_ref=(pull_request.get("head") or {}).get("ref"),
-        base_ref=(pull_request.get("base") or {}).get("ref"),
+        head_sha=head.get("sha"),
+        head_ref=head.get("ref"),
+        head_repo_full_name=_full_name(head.get("repo")),
+        base_ref=base_ref.get("ref"),
+        base_repo_full_name=_full_name(base_ref.get("repo")),
         labels=_label_names(pull_request.get("labels")),
     )
 
