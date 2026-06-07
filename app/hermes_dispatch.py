@@ -707,6 +707,11 @@ def _github_subject_label(parsed: ParsedGitHubEvent) -> str:
 
 
 def _dispatch_key(parsed: ParsedGitHubEvent, target_url: str, *, node: Literal["M2", "DGX"]) -> str | None:
+def _duplicate_subject_label(parsed: ParsedGitHubEvent) -> str:
+    return "item" if _subject_kind(parsed) == "issue" else "PR"
+
+
+def _dispatch_key(parsed: ParsedGitHubEvent, settings: Settings, *, node: Literal["M2", "DGX"]) -> str | None:
     repo = parsed.repository
     subject_number = _subject_number(parsed)
     commit_sha = parsed.head_sha or "unknown"
@@ -863,12 +868,14 @@ async def _notify_and_writeback(
     result.message = final_message
 
     owns_slack = slack_client is None
-    if settings.hermes_slack_webhook_url or settings.slack_bot_token:
-        slack_client = slack_client or SlackClient(webhook_url=settings.hermes_slack_webhook_url, bot_token=settings.slack_bot_token)
+    webhook_url = settings.hermes_slack_webhook_url or settings.slack_webhook_url
+    channel = settings.hermes_slack_channel or settings.slack_channel
+    if webhook_url or settings.slack_bot_token:
+        slack_client = slack_client or SlackClient(webhook_url=webhook_url, bot_token=settings.slack_bot_token)
         try:
-            await slack_client.post_message(channel=settings.hermes_slack_channel, text=request_message)
+            await slack_client.post_message(channel=channel, text=request_message)
             if final_message != request_message:
-                await slack_client.post_message(channel=settings.hermes_slack_channel, text=final_message)
+                await slack_client.post_message(channel=channel, text=final_message)
         except Exception as exc:
             result.error = result.error or _redact_sensitive_text(str(exc), settings)
         finally:
