@@ -1,7 +1,8 @@
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from app.pr_workflow_state import bb2_decision_transition_labels
 from app.review_queue import ReviewProcessResponse
 from app.task_dispatch import BB2_DECISION_LABELS
 
@@ -20,6 +21,7 @@ class GitHubWritebackResult(BaseModel):
     error: str | None = None
     comment_body: str | None = None
     label: str | None = None
+    labels: list[str] = Field(default_factory=list)
 
 
 DECISION_LABELS = BB2_DECISION_LABELS
@@ -37,11 +39,13 @@ async def writeback_review_decision(
     if target_number is None:
         return GitHubWritebackResult(error="issue_number or pr_number is required for GitHub writeback.")
 
-    label = DECISION_LABELS[response.decision.decision]
-    comment_body = build_writeback_comment(response)
+    labels = bb2_decision_transition_labels(response.decision.decision, item.labels)
+    label = labels[0] if labels else DECISION_LABELS[response.decision.decision]
+    comment_body = build_writeback_comment(response, labels=labels)
     try:
         await client.post_issue_comment(item.repo_full_name, target_number, comment_body)
-        await client.apply_label(item.repo_full_name, target_number, label)
+        for next_label in labels:
+            await client.apply_label(item.repo_full_name, target_number, next_label)
     except Exception as exc:
         return GitHubWritebackResult(
             attempted=True,
@@ -49,6 +53,7 @@ async def writeback_review_decision(
             error=str(exc),
             comment_body=comment_body,
             label=label,
+            labels=labels,
         )
 
     return GitHubWritebackResult(
@@ -56,14 +61,16 @@ async def writeback_review_decision(
         success=True,
         comment_body=comment_body,
         label=label,
+        labels=labels,
     )
 
 
-def build_writeback_comment(response: ReviewProcessResponse) -> str:
+def build_writeback_comment(response: ReviewProcessResponse, *, labels: list[str] | None = None) -> str:
     decision = response.decision
     required_changes = "\n".join(f"- {item}" for item in decision.required_changes) or "- None"
     changed_files = "\n".join(f"- {path}" for path in response.changed_files) or "- None"
     diff_summary = response.diff_summary or "Not available"
+    label_lines = "\n".join(f"- {label}" for label in labels or []) or "- None"
     return (
         "## Review Decision\n"
         f"{decision.decision.value}\n\n"
@@ -77,6 +84,8 @@ def build_writeback_comment(response: ReviewProcessResponse) -> str:
         f"{changed_files}\n\n"
         "## Diff Summary\n"
         f"{diff_summary}\n\n"
+        "## Workflow Labels\n"
+        f"{label_lines}\n\n"
         "## Dry-run Status\n"
         f"{response.work_item.status.value}\n\n"
         "## Human Review Required\n"
