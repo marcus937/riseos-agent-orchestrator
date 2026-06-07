@@ -16,6 +16,7 @@ HERMES_LIFECYCLE_LABELS = {"bb-review-needed", "agent-review", "agent-ready", "a
 CANONICAL_HERMES_TRIGGER_LABELS = ("runtime-agent", "playwright", "bb-review-needed")
 CIRCUIT_HERMES_PR_ACTIONS = {"opened", "synchronize", "ready_for_review"}
 CIRCUIT_WORK_BRANCH = "agent-integration"
+CIRCUIT_BASE_BRANCH = "main"
 HERMES_COMMANDS = {
     "/hermes validate",
     "run hermes validation",
@@ -129,13 +130,6 @@ async def dispatch_hermes_runtime_validation(
             skipped_reason="PR dispatch key could not be determined.",
         )
 
-    trigger_label_error = await _apply_canonical_hermes_trigger_labels(
-        parsed,
-        settings,
-        route=route,
-        github_client=github_client,
-    )
-
     disabled = _dispatch_disabled(settings, node=node)
     if disabled:
         return HermesDispatchResult(
@@ -143,7 +137,6 @@ async def dispatch_hermes_runtime_validation(
             dispatch_key=dispatch_key,
             correlation_id=correlation_id,
             skipped_reason=disabled,
-            error=trigger_label_error,
         )
 
     if node == "DGX":
@@ -193,8 +186,14 @@ async def dispatch_hermes_runtime_validation(
             dispatch_key=dispatch_key,
             correlation_id=correlation_id,
             skipped_reason="Hermes validation was already dispatched for this PR commit and target.",
-            error=trigger_label_error,
         )
+
+    trigger_label_error = await _apply_canonical_hermes_trigger_labels(
+        parsed,
+        settings,
+        route=route,
+        github_client=github_client,
+    )
 
     owns_client = hermes_client is None
     hermes_client = hermes_client or HermesHTTPClient()
@@ -204,8 +203,6 @@ async def dispatch_hermes_runtime_validation(
         result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
         if trigger_label_error and not result.error:
             result.error = trigger_label_error
-        if parsed.event_type == GitHubEventType.ISSUES and result.status == "FAILED":
-            result.label = "agent-blocked"
         registry.mark_hermes_dispatch(dispatch_key)
     except Exception as exc:
         result = HermesDispatchResult(
@@ -324,10 +321,6 @@ def _route_reason(parsed: ParsedGitHubEvent) -> str | None:
         if parsed.action == "created" and parsed.pull_request_number and explicit:
             return "pr_comment_hermes_validate"
         return None
-    if parsed.event_type == GitHubEventType.ISSUES:
-        if parsed.action == "labeled" and _labels_request_hermes(parsed.labels, explicit=explicit):
-            return "issue_labeled_hermes_validate"
-        return None
     if parsed.event_type == GitHubEventType.PULL_REQUEST:
         if parsed.action not in {"labeled", "unlabeled", *CIRCUIT_HERMES_PR_ACTIONS}:
             return None
@@ -357,7 +350,11 @@ def _explicit_hermes_command(body: str | None) -> bool:
 
 
 def _is_circuit_pr(parsed: ParsedGitHubEvent) -> bool:
-    return parsed.event_type == GitHubEventType.PULL_REQUEST and parsed.head_ref == CIRCUIT_WORK_BRANCH
+    return (
+        parsed.event_type == GitHubEventType.PULL_REQUEST
+        and parsed.head_ref == CIRCUIT_WORK_BRANCH
+        and parsed.base_ref == CIRCUIT_BASE_BRANCH
+    )
 
 
 def _missing_canonical_hermes_trigger_labels(labels: list[str]) -> list[str]:
