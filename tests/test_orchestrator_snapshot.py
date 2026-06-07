@@ -21,6 +21,8 @@ def client_with_secret(
         github_webhook_secret=secret,
         orchestrator_admin_token=admin_token,
         require_admin_token_for_debug_reads=require_debug_read_token,
+        hermes_m2_token="hermes-m2-secret",
+        hermes_dgx_token="hermes-dgx-secret",
     )
     return TestClient(app)
 
@@ -52,19 +54,23 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
     data = snapshot.json()
     assert data["schema_version"] == "orchestrator.snapshot.v1"
     assert data["generated_at"]
-    assert set(data) >= {"overview", "agents", "issues", "prs", "events", "queue", "health", "runtime"}
-    assert data["overview"]["status"] == "ok"
-    assert data["overview"]["work_branch"] == "agent-integration"
-    assert data["overview"]["base_branch"] == "main"
-    assert data["overview"]["review_queue_count"] == 1
+    assert set(data) >= {"workforce", "queue", "health", "runtime", "recent_failures"}
+    assert "overview" not in data
+    assert "agents" not in data
+    workforce = data["workforce"]
+    assert set(workforce) == {"overview", "agents", "issues", "prs", "events"}
+    assert workforce["overview"]["status"] == "ok"
+    assert workforce["overview"]["work_branch"] == "agent-integration"
+    assert workforce["overview"]["base_branch"] == "main"
+    assert workforce["overview"]["review_queue_count"] == 1
     assert data["queue"]["counters"]["pending_review_count"] == 1
     assert data["health"]["accepted_count"] == 1
-    assert data["agents"][0]["item_id"]
-    assert data["agents"][0]["repo_full_name"] == "riseos/example"
-    assert data["events"][0]["repo_full_name"] == "riseos/example"
-    assert data["events"][0]["commit_sha"] == "abc123"
-    assert data["issues"] == []
-    assert data["prs"] == []
+    assert workforce["agents"][0]["item_id"]
+    assert workforce["agents"][0]["repo_full_name"] == "riseos/example"
+    assert workforce["events"][0]["repo_full_name"] == "riseos/example"
+    assert workforce["events"][0]["commit_sha"] == "abc123"
+    assert workforce["issues"] == []
+    assert workforce["prs"] == []
     assert data["runtime"]["auto_processing_enabled"] is False
     assert data["runtime"]["hermes_dispatch"]["m2_dispatch_enabled"] is False
 
@@ -80,3 +86,22 @@ def test_orchestrator_snapshot_uses_debug_read_access_policy() -> None:
 
     assert response.status_code == 200
     assert response.json()["schema_version"] == "orchestrator.snapshot.v1"
+
+
+def test_orchestrator_snapshot_runtime_status_does_not_expose_secret_values() -> None:
+    client = client_with_secret()
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "hermes-m2-secret" not in body
+    assert "hermes-dgx-secret" not in body
+    data = response.json()
+    assert set(data["runtime"]["hermes_dispatch"]) == {
+        "default_target_configured",
+        "m2_dispatch_enabled",
+        "m2_configured",
+        "dgx_dispatch_enabled",
+        "dgx_configured",
+    }
