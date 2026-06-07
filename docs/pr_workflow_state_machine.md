@@ -18,6 +18,19 @@ This document defines the canonical Coding Crew PR label workflow for RiseOS Age
 - `bb2-needs-changes` routes work back to Circuit for rework.
 - `ready-to-merge` is the final human-readable merge-readiness label.
 
+## State Precedence
+
+The orchestrator is label-add-only, so historical labels can remain on a PR after newer labels are added. When labels are mixed, `workflow_state_from_labels()` uses this canonical precedence:
+
+1. BB2 rework or block labels: `bb2-needs-changes`, `bb2-blocked`.
+2. Hermes rework or block labels: `agent-revisions`, `agent-blocked`.
+3. Final readiness: `ready-to-merge`.
+4. BB2 approval or review request: `bb2-approved`, `bb-review-needed`.
+5. Hermes verification or request labels: `agent-verified`, `runtime-agent`, `playwright`.
+6. Circuit work labels: `agent-working`, `agent-ready`, `agent-next`.
+
+Stale `ready-to-merge` labels must never override newer blocker or rework labels. This keeps a rejected or blocked PR out of the ready-to-merge state until a later approved transition can add fresh readiness evidence.
+
 ## States
 
 | State | Canonical labels | Meaning | Next expected handoff |
@@ -30,6 +43,7 @@ This document defines the canonical Coding Crew PR label workflow for RiseOS Age
 | Hermes revisions | `agent-revisions` | Hermes found runtime failure. | Circuit updates PR and Hermes can run again on the new commit. |
 | BB2 review requested | `bb-review-needed` | BB2 review is requested. | BB2 approves, blocks, or requests changes. |
 | BB2 needs changes | `bb2-needs-changes`, `agent-next` | BB2 rejected the packet and sends work back to Circuit. | Circuit reworks on `agent-integration`, then requests validation again. |
+| BB2 blocked | `bb2-blocked` | BB2 blocked the packet or escalated it to Marcus. | Human direction is required before work continues. |
 | BB2 approved | `bb2-approved` | BB2 approved for human review only. | Orchestrator may add `ready-to-merge` only if all criteria pass. |
 | Ready to merge | `ready-to-merge` | Coding Crew loop is complete and human merge review can proceed. | Marcus or another authorized human reviews and merges. |
 
