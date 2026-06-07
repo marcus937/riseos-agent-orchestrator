@@ -4,6 +4,7 @@ from typing import Any
 from app.config import Settings
 from app.github_events import GitHubEventType, parse_github_event
 from app.hermes_dispatch import (
+    CANONICAL_HERMES_TRIGGER_LABELS,
     InMemoryHermesDispatchRegistry,
     build_hermes_job_payload,
     build_hermes_pr_comment,
@@ -104,6 +105,30 @@ def test_pr_label_runtime_request_dispatches_hermes_m2() -> None:
     assert "secret-token" not in github.comments[0][2]
     assert "Hermes validation requested" in slack.messages[0][1]
     assert "Hermes validation complete" in slack.messages[1][1]
+
+
+def test_agent_integration_pr_opened_applies_hermes_labels_and_dispatches() -> None:
+    parsed = parse_github_event("pull_request", pr_payload(action="opened", labels=[]))
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    expected_trigger_labels = [
+        ("marcus937/riseos-agent-orchestrator", 51, label) for label in CANONICAL_HERMES_TRIGGER_LABELS
+    ]
+    assert result.success is True
+    assert hermes.jobs[0][2]["payload"]["trigger"] == "pull_request_opened_circuit_hermes"
+    assert hermes.jobs[0][2]["payload"]["labels"] == sorted(CANONICAL_HERMES_TRIGGER_LABELS)
+    assert github.labels == [*expected_trigger_labels, ("marcus937/riseos-agent-orchestrator", 51, "agent-verified")]
 
 
 def test_dispatch_disabled_skips_without_side_effects() -> None:
