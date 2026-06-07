@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import re
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
@@ -10,10 +12,9 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.correlation import branch_from_parsed, correlation_id_from_parsed
 from app.github_events import GitHubEventType, ParsedGitHubEvent
-from app.operational_logging import log_event
 from app.slack_issue_dispatch import SlackClient, SlackIssueDispatchClient, _sanitize_slack_text
 
-HERMES_RUNTIME_LABELS = {"runtime-agent", "playwright", "evidence", "testing"}
+HERMES_RUNTIME_LABELS = {"runtime-agent", "playwright", "evidence"}
 HERMES_LIFECYCLE_LABELS = {"bb-review-needed", "agent-review", "agent-ready", "agent-next"}
 CANONICAL_HERMES_TRIGGER_LABELS = ("runtime-agent", "playwright", "bb-review-needed")
 CIRCUIT_HERMES_PR_ACTIONS = {"opened", "synchronize", "ready_for_review"}
@@ -36,6 +37,7 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)((?:x-hermes-token|authorization|api[_-]?key|access[_-]?token|token)\s*[:=]\s*['\"]?)([^'\"\s,;}]+)"),
     re.compile(r"(?i)(bearer\s+)([^'\"\s,;}]+)"),
 )
+LOGGER = logging.getLogger("riseos_agent_orchestrator")
 
 
 class HermesWritebackClient(Protocol):
@@ -573,22 +575,23 @@ def _log_hermes_decision(
     route: str | None = None,
     **fields: Any,
 ) -> None:
-    log_event(
-        event,
-        correlation_id=_hermes_correlation_id(parsed, node=node),
-        orchestrator_correlation_id=correlation_id_from_parsed(parsed),
-        github_event=str(parsed.event_type),
-        repo_full_name=parsed.repository,
-        action=parsed.action,
-        action_label=parsed.action_label,
-        commit_sha=parsed.head_sha,
-        issue_number=parsed.issue_number,
-        pr_number=parsed.pull_request_number,
-        labels=sorted(set(parsed.labels)),
-        hermes_node=node,
-        route=route,
+    payload = {
+        "event": event,
+        "correlation_id": _hermes_correlation_id(parsed, node=node),
+        "orchestrator_correlation_id": correlation_id_from_parsed(parsed),
+        "github_event": str(parsed.event_type),
+        "repo_full_name": parsed.repository,
+        "action": parsed.action,
+        "action_label": parsed.action_label,
+        "commit_sha": parsed.head_sha,
+        "issue_number": parsed.issue_number,
+        "pr_number": parsed.pull_request_number,
+        "labels": sorted(set(parsed.labels)),
+        "hermes_node": node,
+        "route": route,
         **fields,
-    )
+    }
+    LOGGER.info(json.dumps({key: value for key, value in payload.items() if value is not None or key == "route"}, sort_keys=True, default=str))
 
 
 def _result_from_hermes_response(
