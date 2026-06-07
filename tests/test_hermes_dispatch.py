@@ -4,6 +4,7 @@ from typing import Any
 from app.config import Settings
 from app.github_events import GitHubEventType, parse_github_event
 from app.hermes_dispatch import (
+    CANONICAL_HERMES_TRIGGER_LABELS,
     InMemoryHermesDispatchRegistry,
     build_hermes_job_payload,
     build_hermes_pr_comment,
@@ -61,17 +62,35 @@ def settings(**overrides: Any) -> Settings:
     return Settings(**base)
 
 
-def pr_payload(*, labels: list[str] | None = None, action: str = "labeled", label: str = "playwright") -> dict[str, Any]:
+def pr_payload(
+    *,
+    labels: list[str] | None = None,
+    action: str = "labeled",
+    label: str = "playwright",
+    head_ref: str = "agent-integration",
+    base_ref: str = "main",
+    repository_full_name: str = "marcus937/riseos-agent-orchestrator",
+    head_repo_full_name: str = "marcus937/riseos-agent-orchestrator",
+    base_repo_full_name: str = "marcus937/riseos-agent-orchestrator",
+) -> dict[str, Any]:
+    label_names = labels if labels is not None else ["runtime-agent", "playwright", "bb-review-needed"]
     return {
         "action": action,
-        "repository": {"full_name": "marcus937/riseos-agent-orchestrator"},
+        "repository": {"full_name": repository_full_name},
         "sender": {"login": "marcus"},
         "label": {"name": label},
         "pull_request": {
             "number": 51,
-            "head": {"ref": "agent-integration", "sha": "abcdef1234567890"},
-            "base": {"ref": "main"},
-            "labels": [{"name": item} for item in (labels or ["runtime-agent", "playwright", "bb-review-needed"])],
+            "head": {
+                "ref": head_ref,
+                "sha": "abcdef1234567890",
+                "repo": {"full_name": head_repo_full_name},
+            },
+            "base": {
+                "ref": base_ref,
+                "repo": {"full_name": base_repo_full_name},
+            },
+            "labels": [{"name": item} for item in label_names],
         },
     }
 
@@ -104,6 +123,158 @@ def test_pr_label_runtime_request_dispatches_hermes_m2() -> None:
     assert "secret-token" not in github.comments[0][2]
     assert "Hermes validation requested" in slack.messages[0][1]
     assert "Hermes validation complete" in slack.messages[1][1]
+
+
+def test_agent_integration_pr_opened_applies_hermes_labels_and_dispatches() -> None:
+    parsed = parse_github_event("pull_request", pr_payload(action="opened", labels=[]))
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    expected_trigger_labels = [
+        ("marcus937/riseos-agent-orchestrator", 51, label) for label in CANONICAL_HERMES_TRIGGER_LABELS
+    ]
+    assert result.success is True
+    assert hermes.jobs[0][2]["payload"]["trigger"] == "pull_request_opened_circuit_hermes"
+    assert hermes.jobs[0][2]["payload"]["labels"] == sorted(CANONICAL_HERMES_TRIGGER_LABELS)
+    assert github.labels == [*expected_trigger_labels, ("marcus937/riseos-agent-orchestrator", 51, "agent-verified")]
+
+
+def test_agent_integration_pr_opened_dispatch_disabled_has_no_side_effects() -> None:
+    parsed = parse_github_event("pull_request", pr_payload(action="opened", labels=[]))
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(hermes_m2_enable_dispatch=False),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "HERMES_M2_ENABLE_DISPATCH=false."
+    assert github.comments == []
+    assert github.labels == []
+    assert hermes.jobs == []
+
+
+def test_non_circuit_pr_opened_does_not_auto_dispatch() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        pr_payload(action="opened", labels=[], head_ref="feature/demo", base_ref="main"),
+    )
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "Event does not require Hermes runtime validation."
+    assert github.comments == []
+    assert github.labels == []
+    assert hermes.jobs == []
+
+
+def test_agent_integration_pr_to_non_main_does_not_auto_dispatch() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        pr_payload(action="opened", labels=[], head_ref="agent-integration", base_ref="agent-integration"),
+    )
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "Event does not require Hermes runtime validation."
+    assert hermes.jobs == []
+
+
+def test_fork_agent_integration_pr_does_not_auto_dispatch() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        pr_payload(
+            action="opened",
+            labels=[],
+            head_ref="agent-integration",
+            base_ref="main",
+            head_repo_full_name="external-user/riseos-agent-orchestrator",
+        ),
+    )
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "Event does not require Hermes runtime validation."
+    assert github.comments == []
+    assert github.labels == []
+    assert hermes.jobs == []
+
+
+def test_auto_applied_label_webhooks_do_not_duplicate_dispatch() -> None:
+    registry = InMemoryHermesDispatchRegistry()
+    hermes = FakeHermesClient()
+    opened = parse_github_event("pull_request", pr_payload(action="opened", labels=[]))
+    labeled = parse_github_event("pull_request", pr_payload(action="labeled"))
+
+    first = run(
+        dispatch_hermes_runtime_validation(
+            opened,
+            settings(),
+            hermes_client=hermes,
+            registry=registry,
+        )
+    )
+    second = run(
+        dispatch_hermes_runtime_validation(
+            labeled,
+            settings(),
+            hermes_client=hermes,
+            registry=registry,
+        )
+    )
+
+    assert first.attempted is True
+    assert second.attempted is False
+    assert second.skipped_reason == "Hermes validation was already dispatched for this PR commit and target."
+    assert len(hermes.jobs) == 1
 
 
 def test_dispatch_disabled_skips_without_side_effects() -> None:

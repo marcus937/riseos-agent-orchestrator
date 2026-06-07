@@ -13,6 +13,10 @@ from app.slack_issue_dispatch import SlackClient, SlackIssueDispatchClient, _san
 
 HERMES_RUNTIME_LABELS = {"runtime-agent", "playwright", "evidence", "testing"}
 HERMES_LIFECYCLE_LABELS = {"bb-review-needed", "agent-review", "agent-ready", "agent-next"}
+CANONICAL_HERMES_TRIGGER_LABELS = ("runtime-agent", "playwright", "bb-review-needed")
+CIRCUIT_HERMES_PR_ACTIONS = {"opened", "synchronize", "ready_for_review"}
+CIRCUIT_WORK_BRANCH = "agent-integration"
+CIRCUIT_BASE_BRANCH = "main"
 HERMES_COMMANDS = {
     "/hermes validate",
     "run hermes validation",
@@ -184,12 +188,21 @@ async def dispatch_hermes_runtime_validation(
             skipped_reason="Hermes validation was already dispatched for this PR commit and target.",
         )
 
+    trigger_label_error = await _apply_canonical_hermes_trigger_labels(
+        parsed,
+        settings,
+        route=route,
+        github_client=github_client,
+    )
+
     owns_client = hermes_client is None
     hermes_client = hermes_client or HermesHTTPClient()
     payload = build_hermes_job_payload(parsed, settings, node=node, correlation_id=correlation_id, route=route)
     try:
         response = await hermes_client.post_job(_node_base_url(settings, node), _node_token(settings, node), payload)
         result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
+        if trigger_label_error and not result.error:
+            result.error = trigger_label_error
         registry.mark_hermes_dispatch(dispatch_key)
     except Exception as exc:
         result = HermesDispatchResult(
@@ -220,7 +233,9 @@ def build_hermes_job_payload(
     commit_sha = parsed.head_sha or "unknown"
     pr_number = parsed.pull_request_number or parsed.issue_number
     branch = branch_from_parsed(parsed) or settings.work_branch
-    labels = sorted(set(parsed.labels))
+    labels = set(parsed.labels)
+    if _is_circuit_pr(parsed):
+        labels.update(CANONICAL_HERMES_TRIGGER_LABELS)
     return {
         "type": "playwright",
         "dryRun": False,
@@ -233,7 +248,7 @@ def build_hermes_job_payload(
             "commitSha": commit_sha,
             "branch": branch,
             "screenshotName": f"pr-{pr_number}-validation.png",
-            "labels": labels,
+            "labels": sorted(labels),
             "hermesNode": node,
             "trigger": route,
         },
@@ -307,10 +322,12 @@ def _route_reason(parsed: ParsedGitHubEvent) -> str | None:
             return "pr_comment_hermes_validate"
         return None
     if parsed.event_type == GitHubEventType.PULL_REQUEST:
-        if parsed.action not in {"labeled", "unlabeled", "opened", "synchronize", "ready_for_review"}:
+        if parsed.action not in {"labeled", "unlabeled", *CIRCUIT_HERMES_PR_ACTIONS}:
             return None
         if _labels_request_hermes(parsed.labels, explicit=explicit):
             return f"pull_request_{parsed.action}"
+        if parsed.action in CIRCUIT_HERMES_PR_ACTIONS and _is_circuit_pr(parsed):
+            return f"pull_request_{parsed.action}_circuit_hermes"
         return None
     if parsed.event_type == GitHubEventType.PULL_REQUEST_REVIEW:
         if parsed.action == "submitted" and _labels_request_hermes(parsed.labels, explicit=explicit):
@@ -330,6 +347,44 @@ def _labels_request_hermes(labels: list[str], *, explicit: bool = False) -> bool
 def _explicit_hermes_command(body: str | None) -> bool:
     normalized = (body or "").lower()
     return any(command in normalized for command in HERMES_COMMANDS)
+
+
+def _is_circuit_pr(parsed: ParsedGitHubEvent) -> bool:
+    return (
+        parsed.event_type == GitHubEventType.PULL_REQUEST
+        and parsed.repository is not None
+        and parsed.head_repo_full_name == parsed.repository
+        and parsed.base_repo_full_name == parsed.repository
+        and parsed.head_ref == CIRCUIT_WORK_BRANCH
+        and parsed.base_ref == CIRCUIT_BASE_BRANCH
+    )
+
+
+def _missing_canonical_hermes_trigger_labels(labels: list[str]) -> list[str]:
+    existing = set(labels)
+    return [label for label in CANONICAL_HERMES_TRIGGER_LABELS if label not in existing]
+
+
+async def _apply_canonical_hermes_trigger_labels(
+    parsed: ParsedGitHubEvent,
+    settings: Settings,
+    *,
+    route: str,
+    github_client: HermesWritebackClient | None,
+) -> str | None:
+    if not settings.enable_github_writeback or github_client is None:
+        return None
+    if not route.endswith("_circuit_hermes"):
+        return None
+    if not parsed.repository or not parsed.pull_request_number:
+        return "Cannot apply Hermes trigger labels without repository and PR number."
+
+    try:
+        for label in _missing_canonical_hermes_trigger_labels(parsed.labels):
+            await github_client.apply_label(parsed.repository, parsed.pull_request_number, label)
+    except Exception as exc:
+        return f"Hermes trigger label writeback failed: {exc}"
+    return None
 
 
 def _hermes_node(labels: list[str]) -> Literal["M2", "DGX"]:
