@@ -190,6 +190,8 @@ async def dispatch_hermes_runtime_validation(
     try:
         response = await hermes_client.post_job(_node_base_url(settings, node), _node_token(settings, node), payload)
         result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
+        if parsed.event_type == GitHubEventType.ISSUES and result.status == "FAILED":
+            result.label = "agent-blocked"
         registry.mark_hermes_dispatch(dispatch_key)
     except Exception as exc:
         result = HermesDispatchResult(
@@ -305,6 +307,10 @@ def _route_reason(parsed: ParsedGitHubEvent) -> str | None:
     if parsed.event_type == GitHubEventType.ISSUE_COMMENT:
         if parsed.action == "created" and parsed.pull_request_number and explicit:
             return "pr_comment_hermes_validate"
+        return None
+    if parsed.event_type == GitHubEventType.ISSUES:
+        if parsed.action == "labeled" and _labels_request_hermes(parsed.labels, explicit=explicit):
+            return "issue_labeled_hermes_validate"
         return None
     if parsed.event_type == GitHubEventType.PULL_REQUEST:
         if parsed.action not in {"labeled", "unlabeled", "opened", "synchronize", "ready_for_review"}:
