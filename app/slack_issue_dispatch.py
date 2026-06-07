@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 import httpx
 from pydantic import BaseModel
@@ -21,7 +20,6 @@ APPROVED_REPO_FULL_NAMES = {
 DEFAULT_BRANCH_RULE = "agent-integration only"
 ORCHESTRATOR_SLACK_CHANNEL = "#jarvis-agent-orchestrator"
 HERMES_SLACK_CHANNEL = "#jarvis-hermes-runtime"
-SlackRoute = Literal["orchestrator", "hermes"]
 
 
 class SlackIssueDispatchResult(BaseModel):
@@ -51,19 +49,17 @@ class IssueDispatchRegistry(Protocol):
 
 
 class SlackClient:
-    def __init__(self, *, webhook_url: str | None, bot_token: str | None) -> None:
+    def __init__(self, *, webhook_url: str | None, bot_token: str | None, http_client: Any | None = None) -> None:
         self._webhook_url = webhook_url
         self._bot_token = bot_token
-        self._http_client = httpx.AsyncClient(timeout=20.0)
+        self._http_client = http_client or httpx.AsyncClient(timeout=20.0)
+        self._owns_http_client = http_client is None
 
     async def post_message(self, *, channel: str, text: str) -> None:
-        route = _slack_route_for_text(text)
-        webhook_url = _route_webhook_url(route, fallback=self._webhook_url)
-        routed_channel = _route_channel(route, fallback=channel)
-        if webhook_url:
+        if self._webhook_url:
             response = await self._http_client.post(
-                webhook_url,
-                json={"channel": routed_channel, "text": text},
+                self._webhook_url,
+                json={"channel": channel, "text": text},
             )
             response.raise_for_status()
             return
@@ -72,7 +68,7 @@ class SlackClient:
             response = await self._http_client.post(
                 "https://slack.com/api/chat.postMessage",
                 headers={"Authorization": f"Bearer {self._bot_token}"},
-                json={"channel": routed_channel, "text": text},
+                json={"channel": channel, "text": text},
             )
             response.raise_for_status()
             payload = response.json()
@@ -83,7 +79,8 @@ class SlackClient:
         raise RuntimeError("Slack webhook URL or bot token is required for Slack dispatch.")
 
     async def aclose(self) -> None:
-        await self._http_client.aclose()
+        if self._owns_http_client and hasattr(self._http_client, "aclose"):
+            await self._http_client.aclose()
 
 
 class InMemoryDispatchedIssueRegistry:
@@ -219,33 +216,12 @@ def _sanitize_slack_text(value: str) -> str:
 
 
 def _orchestrator_slack_webhook_url(settings: Settings) -> str | None:
-    configured = settings.orchestrator_slack_webhook_url or os.getenv("ORCHESTRATOR_SLACK_WEBHOOK_URL") or os.getenv("SLACK_WEBHOOK_URL")
-    if configured:
-        return configured
+    if settings.orchestrator_slack_webhook_url:
+        return settings.orchestrator_slack_webhook_url
     if settings.hermes_slack_webhook_url and settings.slack_webhook_url == settings.hermes_slack_webhook_url:
         return None
     return settings.slack_webhook_url
 
 
 def _orchestrator_slack_channel(settings: Settings) -> str:
-    return os.getenv("ORCHESTRATOR_SLACK_CHANNEL") or os.getenv("SLACK_CHANNEL") or settings.orchestrator_slack_channel or settings.slack_channel or ORCHESTRATOR_SLACK_CHANNEL
-
-
-def _slack_route_for_text(text: str) -> SlackRoute:
-    return "hermes" if text.startswith("Hermes ") else "orchestrator"
-
-
-def _route_webhook_url(route: SlackRoute, *, fallback: str | None) -> str | None:
-    legacy = os.getenv("SLACK_WEBHOOK_URL")
-    orchestrator = os.getenv("ORCHESTRATOR_SLACK_WEBHOOK_URL") or legacy
-    if route == "orchestrator":
-        return orchestrator or fallback
-    return os.getenv("HERMES_SLACK_WEBHOOK_URL") or orchestrator or fallback
-
-
-def _route_channel(route: SlackRoute, *, fallback: str) -> str:
-    legacy = os.getenv("SLACK_CHANNEL")
-    orchestrator = os.getenv("ORCHESTRATOR_SLACK_CHANNEL") or legacy
-    if route == "orchestrator":
-        return orchestrator or fallback or ORCHESTRATOR_SLACK_CHANNEL
-    return os.getenv("HERMES_SLACK_CHANNEL") or orchestrator or legacy or HERMES_SLACK_CHANNEL
+    return settings.orchestrator_slack_channel or settings.slack_channel or ORCHESTRATOR_SLACK_CHANNEL
