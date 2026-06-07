@@ -30,6 +30,10 @@ class Settings:
     slack_channel: str = "#jarvis-agent-orchestrator"
     work_branch: str = "agent-integration"
     base_branch: str = "main"
+    hermes_base_url: str | None = None
+    hermes_token: str | None = None
+    hermes_default_target: str = "https://example.com"
+    hermes_enable_dispatch: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -59,6 +63,10 @@ def get_settings() -> Settings:
         slack_channel=os.getenv("SLACK_CHANNEL", "#jarvis-agent-orchestrator"),
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
+        hermes_base_url=os.getenv("HERMES_BASE_URL"),
+        hermes_token=os.getenv("HERMES_TOKEN"),
+        hermes_default_target=os.getenv("HERMES_DEFAULT_TARGET", "https://example.com"),
+        hermes_enable_dispatch=os.getenv("HERMES_ENABLE_DISPATCH", "").lower() == "true",
     )
 
 
