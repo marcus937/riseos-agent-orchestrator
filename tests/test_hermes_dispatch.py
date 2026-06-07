@@ -63,6 +63,7 @@ def settings(**overrides: Any) -> Settings:
 
 
 def pr_payload(*, labels: list[str] | None = None, action: str = "labeled", label: str = "playwright") -> dict[str, Any]:
+    label_names = labels if labels is not None else ["runtime-agent", "playwright", "bb-review-needed"]
     return {
         "action": action,
         "repository": {"full_name": "marcus937/riseos-agent-orchestrator"},
@@ -72,7 +73,7 @@ def pr_payload(*, labels: list[str] | None = None, action: str = "labeled", labe
             "number": 51,
             "head": {"ref": "agent-integration", "sha": "abcdef1234567890"},
             "base": {"ref": "main"},
-            "labels": [{"name": item} for item in (labels or ["runtime-agent", "playwright", "bb-review-needed"])],
+            "labels": [{"name": item} for item in label_names],
         },
     }
 
