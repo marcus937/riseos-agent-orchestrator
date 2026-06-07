@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Any
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.github_events import parse_github_event
 from app.hermes_dispatch import InMemoryHermesDispatchRegistry, dispatch_hermes_runtime_validation
 
@@ -30,6 +30,15 @@ class FakeHermesClient:
     async def post_job(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.jobs.append((base_url, token, payload))
         return self.response
+
+
+class FakeSlackClient:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    async def post_message(self, channel: str, text: str) -> dict[str, Any]:
+        self.messages.append((channel, text))
+        return {"ok": True}
 
 
 def run(coro: Any) -> Any:
@@ -140,6 +149,155 @@ def test_issue_labeled_testing_runtime_label_remains_backward_compatible(caplog:
     assert route_log["labels_request_hermes"] is True
     assert route_log["runtime_label_match"] is True
     assert_secret_absent(events)
+
+
+def test_issue_labeled_dispatch_disabled_by_m2_flag_does_not_post_or_writeback() -> None:
+    parsed = parse_github_event("issues", issue_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(hermes_m2_enable_dispatch=False),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "HERMES_M2_ENABLE_DISPATCH=false."
+    assert hermes.jobs == []
+    assert github.comments == []
+    assert github.labels == []
+    assert_secret_absent(result.model_dump())
+
+
+def test_issue_labeled_missing_m2_config_blocks_without_post_and_writes_back_when_enabled() -> None:
+    parsed = parse_github_event("issues", issue_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(hermes_m2_token=None),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is True
+    assert result.status == "BLOCKED"
+    assert result.label == "agent-blocked"
+    assert result.error == "Missing HERMES_M2_BASE_URL or HERMES_M2_TOKEN."
+    assert hermes.jobs == []
+    assert github.labels == [("marcus937/riseos-agent-orchestrator", 53, "agent-blocked")]
+    assert "Status: BLOCKED" in github.comments[0][2]
+    assert_secret_absent(result.model_dump())
+    assert_secret_absent(github.comments)
+
+
+def test_issue_labeled_duplicate_dispatch_skips_second_post_and_writeback() -> None:
+    parsed = parse_github_event("issues", issue_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+    registry = InMemoryHermesDispatchRegistry()
+
+    first = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            github_client=github,
+            hermes_client=hermes,
+            registry=registry,
+        )
+    )
+    second = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(),
+            github_client=github,
+            hermes_client=hermes,
+            registry=registry,
+        )
+    )
+
+    assert first.success is True
+    assert second.attempted is False
+    assert second.skipped_reason == "Hermes validation was already dispatched for this item commit and target."
+    assert len(hermes.jobs) == 1
+    assert len(github.comments) == 1
+    assert github.labels == [("marcus937/riseos-agent-orchestrator", 53, "agent-verified")]
+    assert_secret_absent(second.model_dump())
+
+
+def test_issue_labeled_writeback_disabled_does_not_comment_or_label() -> None:
+    parsed = parse_github_event("issues", issue_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(enable_github_writeback=False),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.success is True
+    assert len(hermes.jobs) == 1
+    assert github.comments == []
+    assert github.labels == []
+    assert result.comment is None
+    assert_secret_absent(result.model_dump())
+
+
+def test_hermes_slack_messages_use_hermes_destination_not_orchestrator_destination() -> None:
+    parsed = parse_github_event("issues", issue_payload())
+    slack = FakeSlackClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(
+                enable_github_writeback=False,
+                orchestrator_slack_webhook_url="https://hooks.slack.example/orchestrator",
+                orchestrator_slack_channel="#jarvis-agent-orchestrator",
+                hermes_slack_webhook_url="https://hooks.slack.example/hermes",
+                hermes_slack_channel="#jarvis-hermes-runtime",
+            ),
+            slack_client=slack,
+            hermes_client=FakeHermesClient(),
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.success is True
+    assert len(slack.messages) == 2
+    assert [channel for channel, _ in slack.messages] == ["#jarvis-hermes-runtime", "#jarvis-hermes-runtime"]
+    assert "#jarvis-agent-orchestrator" not in json.dumps(slack.messages)
+    assert_secret_absent(result.model_dump())
+
+
+def test_hermes_and_orchestrator_slack_env_are_owned_separately(monkeypatch: Any) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("ORCHESTRATOR_SLACK_WEBHOOK_URL", "https://hooks.slack.example/orchestrator")
+    monkeypatch.setenv("ORCHESTRATOR_SLACK_CHANNEL", "#jarvis-agent-orchestrator")
+    monkeypatch.setenv("HERMES_SLACK_WEBHOOK_URL", "https://hooks.slack.example/hermes")
+    monkeypatch.setenv("HERMES_SLACK_CHANNEL", "#jarvis-hermes-runtime")
+
+    loaded = get_settings()
+
+    assert loaded.orchestrator_slack_webhook_url == "https://hooks.slack.example/orchestrator"
+    assert loaded.orchestrator_slack_channel == "#jarvis-agent-orchestrator"
+    assert loaded.hermes_slack_webhook_url == "https://hooks.slack.example/hermes"
+    assert loaded.hermes_slack_channel == "#jarvis-hermes-runtime"
+    get_settings.cache_clear()
 
 
 def test_issue_labeled_runtime_failure_applies_agent_blocked() -> None:
