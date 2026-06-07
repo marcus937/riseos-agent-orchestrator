@@ -352,6 +352,9 @@ def _explicit_hermes_command(body: str | None) -> bool:
 def _is_circuit_pr(parsed: ParsedGitHubEvent) -> bool:
     return (
         parsed.event_type == GitHubEventType.PULL_REQUEST
+        and parsed.repository is not None
+        and parsed.head_repo_full_name == parsed.repository
+        and parsed.base_repo_full_name == parsed.repository
         and parsed.head_ref == CIRCUIT_WORK_BRANCH
         and parsed.base_ref == CIRCUIT_BASE_BRANCH
     )
