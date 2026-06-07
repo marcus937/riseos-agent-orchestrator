@@ -60,6 +60,7 @@ def log_events(records: list[logging.LogRecord]) -> list[dict[str, Any]]:
 def assert_secret_absent(value: Any) -> None:
     serialized = json.dumps(value, default=str)
     assert "secret-token" not in serialized
+    assert "url-secret" not in serialized
     assert "Bearer secret-token" not in serialized
     assert "X-Hermes-Token: secret-token" not in serialized
 
@@ -107,11 +108,15 @@ def test_pull_request_labeled_opened_and_synchronize_attempt_hermes_with_operati
         post_log = next(event for event in events if event["event"] == "hermes_post_attempted")
         assert post_log["payload_correlation_id"] == route_log["correlation_id"]
         assert post_log["hermes_base_url"] == "http://100.70.83.13:8787"
+        assert hermes.jobs[0][2]["payload"]["subjectType"] == "pr"
+        assert hermes.jobs[0][2]["payload"]["prNumber"] == 59
+        assert "issueNumber" not in hermes.jobs[0][2]["payload"]
+        assert hermes.jobs[0][2]["payload"]["screenshotName"] == "pr-59-validation.png"
         assert_secret_absent(events)
         assert_secret_absent(result.model_dump())
 
 
-def test_failed_hermes_post_redacts_exception_secrets_from_operational_outputs(caplog: Any) -> None:
+def test_failed_hermes_post_redacts_exception_and_target_secrets_from_operational_outputs(caplog: Any) -> None:
     parsed = parse_github_event("pull_request", pr_payload(action="labeled"))
     hermes = FakeHermesClient(fail=True)
 
@@ -119,7 +124,7 @@ def test_failed_hermes_post_redacts_exception_secrets_from_operational_outputs(c
         result = run(
             dispatch_hermes_runtime_validation(
                 parsed,
-                settings(),
+                settings(hermes_default_target="https://preview.vercel.app/?access_token=url-secret"),
                 hermes_client=hermes,
                 registry=InMemoryHermesDispatchRegistry(),
             )
@@ -127,10 +132,12 @@ def test_failed_hermes_post_redacts_exception_secrets_from_operational_outputs(c
 
     events = log_events(caplog.records)
     failed_log = next(event for event in events if event["event"] == "hermes_post_failed")
+    attempted_log = next(event for event in events if event["event"] == "hermes_post_attempted")
 
     assert result.status == "BLOCKED"
     assert result.label == "agent-blocked"
     assert "[REDACTED]" in failed_log["error"]
+    assert "[REDACTED]" in attempted_log["hermes_target"]
     assert "[REDACTED]" in (result.error or "")
     assert_secret_absent(events)
     assert_secret_absent(result.model_dump())
