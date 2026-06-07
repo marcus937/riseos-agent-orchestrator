@@ -680,12 +680,12 @@ async def _notify_and_writeback(
     result.message = final_message
 
     owns_slack = slack_client is None
-    if settings.slack_webhook_url or settings.slack_bot_token:
-        slack_client = slack_client or SlackClient(webhook_url=settings.slack_webhook_url, bot_token=settings.slack_bot_token)
+    if settings.hermes_slack_webhook_url or settings.slack_bot_token:
+        slack_client = slack_client or SlackClient(webhook_url=settings.hermes_slack_webhook_url, bot_token=settings.slack_bot_token)
         try:
-            await slack_client.post_message(channel=settings.slack_channel, text=request_message)
+            await slack_client.post_message(channel=settings.hermes_slack_channel, text=request_message)
             if final_message != request_message:
-                await slack_client.post_message(channel=settings.slack_channel, text=final_message)
+                await slack_client.post_message(channel=settings.hermes_slack_channel, text=final_message)
         except Exception as exc:
             result.error = result.error or _redact_sensitive_text(str(exc), settings)
         finally:
