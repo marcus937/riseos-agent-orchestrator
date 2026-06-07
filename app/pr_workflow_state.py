@@ -34,6 +34,7 @@ class PRWorkflowState(StrEnum):
     HERMES_REVISIONS = "hermes_revisions"
     BB2_REVIEW_REQUESTED = "bb2_review_requested"
     BB2_NEEDS_CHANGES = "bb2_needs_changes"
+    BB2_BLOCKED = "bb2_blocked"
     BB2_APPROVED = "bb2_approved"
     READY_TO_MERGE = "ready_to_merge"
 
@@ -44,18 +45,20 @@ def normalize_labels(labels: list[str] | set[str] | tuple[str, ...] | None) -> s
 
 def workflow_state_from_labels(labels: list[str] | set[str] | tuple[str, ...] | None) -> PRWorkflowState | None:
     current = normalize_labels(labels)
-    if LABEL_READY_TO_MERGE in current:
-        return PRWorkflowState.READY_TO_MERGE
     if LABEL_BB2_NEEDS_CHANGES in current:
         return PRWorkflowState.BB2_NEEDS_CHANGES
-    if LABEL_BB2_APPROVED in current:
-        return PRWorkflowState.BB2_APPROVED
-    if LABEL_BB_REVIEW_NEEDED in current:
-        return PRWorkflowState.BB2_REVIEW_REQUESTED
+    if LABEL_BB2_BLOCKED in current:
+        return PRWorkflowState.BB2_BLOCKED
     if LABEL_AGENT_REVISIONS in current:
         return PRWorkflowState.HERMES_REVISIONS
     if LABEL_AGENT_BLOCKED in current:
         return PRWorkflowState.HERMES_BLOCKED
+    if LABEL_READY_TO_MERGE in current:
+        return PRWorkflowState.READY_TO_MERGE
+    if LABEL_BB2_APPROVED in current:
+        return PRWorkflowState.BB2_APPROVED
+    if LABEL_BB_REVIEW_NEEDED in current:
+        return PRWorkflowState.BB2_REVIEW_REQUESTED
     if LABEL_AGENT_VERIFIED in current:
         return PRWorkflowState.HERMES_VERIFIED
     if current & HERMES_TRIGGER_LABELS:
