@@ -61,6 +61,33 @@ class GitHubClient:
         self._require_value(head, "head")
         return await self._request("GET", f"/repos/{repo_full_name}/compare/{base}...{head}")
 
+    async def list_commit_statuses(self, repo_full_name: str, ref: str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(ref, "ref")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/commits/{ref}/statuses",
+            params={"per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/commits/{ref}/statuses", 200, "Expected list response.")
+        return payload
+
+    async def list_check_runs_for_ref(self, repo_full_name: str, ref: str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(ref, "ref")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/commits/{ref}/check-runs",
+            params={"per_page": 100},
+        )
+        if not isinstance(payload, dict):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/commits/{ref}/check-runs", 200, "Expected object response.")
+        check_runs = payload.get("check_runs") or []
+        if not isinstance(check_runs, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/commits/{ref}/check-runs", 200, "Expected check_runs list.")
+        return [item for item in check_runs if isinstance(item, dict)]
+
     async def list_open_issues(
         self,
         repo_full_name: str,

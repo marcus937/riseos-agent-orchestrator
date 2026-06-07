@@ -12,6 +12,13 @@ from app.review_queue import (
     ReviewWorkItem,
     WorkerStats,
 )
+from app.workflow_lifecycle import (
+    WorkflowEvent,
+    WorkflowOwner,
+    WorkflowState,
+    build_event_workflow_projection,
+    build_work_item_workflow_projection,
+)
 
 ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v1"
 
@@ -32,12 +39,32 @@ class OrchestratorSnapshotOverview(BaseModel):
     recent_failure_count: int
 
 
+class WorkflowFields(BaseModel):
+    workflow_events: list[WorkflowEvent] = Field(default_factory=list)
+    workflow_state: WorkflowState | None = None
+    workflow_state_history: list[WorkflowEvent] = Field(default_factory=list)
+    workflow_duration_seconds: float | None = None
+    current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
+
+
+class WorkflowWorkItemSnapshot(ReviewWorkItem, WorkflowFields):
+    pass
+
+
+class WorkflowLifecycleVisibilitySnapshot(ReviewLifecycleVisibility, WorkflowFields):
+    pass
+
+
+class WorkflowEventRecordSnapshot(EventRecord, WorkflowFields):
+    pass
+
+
 class OrchestratorWorkforceSnapshot(BaseModel):
     overview: OrchestratorSnapshotOverview
-    agents: list[ReviewLifecycleVisibility]
-    issues: list[ReviewWorkItem]
-    prs: list[ReviewWorkItem]
-    events: list[EventRecord]
+    agents: list[WorkflowLifecycleVisibilitySnapshot]
+    issues: list[WorkflowWorkItemSnapshot]
+    prs: list[WorkflowWorkItemSnapshot]
+    events: list[WorkflowEventRecordSnapshot]
 
 
 class HermesDispatchStatus(BaseModel):
@@ -78,6 +105,7 @@ def build_orchestrator_snapshot(
     events: list[EventRecord],
     recent_failures: list[RecentFailure],
 ) -> OrchestratorSnapshot:
+    workflow_items = [_workflow_work_item_snapshot(item) for item in review_items]
     return OrchestratorSnapshot(
         workforce=OrchestratorWorkforceSnapshot(
             overview=OrchestratorSnapshotOverview(
@@ -95,10 +123,10 @@ def build_orchestrator_snapshot(
                 blocked_count=health.blocked_count,
                 recent_failure_count=queue.recent_failure_count,
             ),
-            agents=lifecycle,
-            issues=[item for item in review_items if item.issue_number is not None and item.pr_number is None],
-            prs=[item for item in review_items if item.pr_number is not None],
-            events=events,
+            agents=[_workflow_lifecycle_snapshot(item, workflow_items) for item in lifecycle],
+            issues=[item for item in workflow_items if item.issue_number is not None and item.pr_number is None],
+            prs=[item for item in workflow_items if item.pr_number is not None],
+            events=[_workflow_event_snapshot(event) for event in events],
         ),
         queue=queue,
         health=health,
@@ -126,6 +154,40 @@ def build_hermes_dispatch_status(settings: Settings) -> HermesDispatchStatus:
 
 def snapshot_schema() -> dict[str, Any]:
     return OrchestratorSnapshot.model_json_schema()
+
+
+def _workflow_work_item_snapshot(item: ReviewWorkItem) -> WorkflowWorkItemSnapshot:
+    projection = build_work_item_workflow_projection(item)
+    return WorkflowWorkItemSnapshot.model_validate(
+        {
+            **item.model_dump(),
+            **projection.model_dump(),
+        }
+    )
+
+
+def _workflow_lifecycle_snapshot(
+    item: ReviewLifecycleVisibility,
+    workflow_items: list[WorkflowWorkItemSnapshot],
+) -> WorkflowLifecycleVisibilitySnapshot:
+    matching_item = next((workflow_item for workflow_item in workflow_items if workflow_item.id == item.item_id), None)
+    workflow_fields = matching_item.model_dump(include=set(WorkflowFields.model_fields)) if matching_item else {}
+    return WorkflowLifecycleVisibilitySnapshot.model_validate(
+        {
+            **item.model_dump(),
+            **workflow_fields,
+        }
+    )
+
+
+def _workflow_event_snapshot(event: EventRecord) -> WorkflowEventRecordSnapshot:
+    projection = build_event_workflow_projection(event)
+    return WorkflowEventRecordSnapshot.model_validate(
+        {
+            **event.model_dump(),
+            **projection.model_dump(),
+        }
+    )
 
 
 def _configured_url(value: str | None) -> bool:
