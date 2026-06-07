@@ -55,7 +55,7 @@ def settings(**overrides: Any) -> Settings:
         "hermes_m2_base_url": "http://100.70.83.13:8787",
         "hermes_m2_token": "secret-token",
         "hermes_m2_enable_dispatch": True,
-        "hermes_default_target": "https://example.com",
+        "hermes_default_target": "https://preview.vercel.app",
     }
     base.update(overrides)
     return Settings(**base)
@@ -96,12 +96,36 @@ def test_pr_label_runtime_request_dispatches_hermes_m2() -> None:
     assert result.success is True
     assert result.status == "PASSED"
     assert hermes.jobs[0][0] == "http://100.70.83.13:8787"
+    assert hermes.jobs[0][1] == "secret-token"
     assert hermes.jobs[0][2]["payload"]["repo"] == "marcus937/riseos-agent-orchestrator"
     assert hermes.jobs[0][2]["payload"]["prNumber"] == 51
     assert hermes.jobs[0][2]["payload"]["branch"] == "agent-integration"
     assert github.labels == [("marcus937/riseos-agent-orchestrator", 51, "agent-verified")]
+    assert "secret-token" not in github.comments[0][2]
     assert "Hermes validation requested" in slack.messages[0][1]
     assert "Hermes validation complete" in slack.messages[1][1]
+
+
+def test_dispatch_disabled_skips_without_side_effects() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(hermes_m2_enable_dispatch=False),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "HERMES_M2_ENABLE_DISPATCH=false."
+    assert github.comments == []
+    assert github.labels == []
+    assert hermes.jobs == []
 
 
 def test_pr_comment_hermes_validate_dispatches() -> None:
@@ -182,6 +206,27 @@ def test_missing_hermes_config_blocks_and_comments() -> None:
     assert github.labels == [("marcus937/riseos-agent-orchestrator", 51, "agent-blocked")]
 
 
+def test_placeholder_default_target_blocks_validation_writeback() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(hermes_default_target="https://example.com"),
+            github_client=github,
+            hermes_client=hermes,
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.status == "BLOCKED"
+    assert "placeholder" in result.error
+    assert hermes.jobs == []
+    assert github.labels == [("marcus937/riseos-agent-orchestrator", 51, "agent-blocked")]
+
+
 def test_failed_hermes_response_requests_revisions() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     github = FakeGitHubClient()
@@ -202,6 +247,25 @@ def test_failed_hermes_response_requests_revisions() -> None:
     assert github.labels == [("marcus937/riseos-agent-orchestrator", 51, "agent-revisions")]
 
 
+def test_writeback_disabled_posts_no_github_comment_or_label() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+
+    result = run(
+        dispatch_hermes_runtime_validation(
+            parsed,
+            settings(enable_github_writeback=False),
+            github_client=github,
+            hermes_client=FakeHermesClient(),
+            registry=InMemoryHermesDispatchRegistry(),
+        )
+    )
+
+    assert result.success is True
+    assert github.comments == []
+    assert github.labels == []
+
+
 def test_slack_and_pr_comment_payloads_include_required_sections() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     result = run(
@@ -218,6 +282,7 @@ def test_slack_and_pr_comment_payloads_include_required_sections() -> None:
 
     assert "Hermes validation complete" in slack_message
     assert "Evidence: summary.json, logs.json, console.json, network.json, page.json, screenshot.png" in slack_message
+    assert "not merge approval" in comment
     for section in ["Hermes Runtime Validation", "VERIFIED", "ASSUMED", "UNVERIFIED"]:
         assert section in comment
 
@@ -228,20 +293,23 @@ def test_dgx_labeled_request_returns_not_enabled_result_when_disabled() -> None:
         pr_payload(labels=["dgx", "runtime-agent", "evidence", "bb-review-needed"]),
     )
     github = FakeGitHubClient()
+    hermes = FakeHermesClient()
 
     result = run(
         dispatch_hermes_runtime_validation(
             parsed,
             settings(hermes_dgx_enable_dispatch=False),
             github_client=github,
+            hermes_client=hermes,
             registry=InMemoryHermesDispatchRegistry(),
         )
     )
 
     assert result.hermes_node == "DGX"
-    assert result.status == "BLOCKED"
-    assert result.error == "Hermes DGX dispatch is not enabled."
-    assert github.labels == [("marcus937/riseos-agent-orchestrator", 51, "agent-blocked")]
+    assert result.attempted is False
+    assert result.skipped_reason == "HERMES_DGX_ENABLE_DISPATCH=false."
+    assert github.labels == []
+    assert hermes.jobs == []
 
 
 def test_pull_request_review_submitted_with_runtime_labels_dispatches() -> None:
@@ -261,10 +329,10 @@ def test_pull_request_review_submitted_with_runtime_labels_dispatches() -> None:
     assert result.attempted is True
 
 
-def test_build_job_payload_uses_default_validation_target() -> None:
+def test_build_job_payload_can_use_phase_four_placeholder_target() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
 
-    payload = build_hermes_job_payload(parsed, settings(), route="pull_request_labeled")
+    payload = build_hermes_job_payload(parsed, settings(hermes_default_target="https://example.com"), route="pull_request_labeled")
 
     assert payload["type"] == "playwright"
     assert payload["targetUrl"] == "https://example.com"
