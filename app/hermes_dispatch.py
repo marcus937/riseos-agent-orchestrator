@@ -230,7 +230,7 @@ async def dispatch_hermes_runtime_validation(
             hermes_node=node,
             dispatch_key=dispatch_key,
             correlation_id=correlation_id,
-            skipped_reason="Hermes validation was already dispatched for this item commit and target.",
+            skipped_reason=f"Hermes validation was already dispatched for this {_duplicate_subject_label(parsed)} commit and target.",
         )
 
     trigger_label_error = await _apply_canonical_hermes_trigger_labels(
@@ -533,13 +533,18 @@ def _github_subject_label(parsed: ParsedGitHubEvent) -> str:
     return "Issue" if _subject_kind(parsed) == "issue" else "PR"
 
 
+def _duplicate_subject_label(parsed: ParsedGitHubEvent) -> str:
+    return "item" if _subject_kind(parsed) == "issue" else "PR"
+
+
 def _dispatch_key(parsed: ParsedGitHubEvent, settings: Settings, *, node: Literal["M2", "DGX"]) -> str | None:
     repo = parsed.repository
     subject_number = _subject_number(parsed)
     commit_sha = parsed.head_sha or "unknown"
     if not repo or not subject_number:
         return None
-    return f"{node}:{repo}:{_subject_kind(parsed)}:{subject_number}:sha:{commit_sha}:target:{settings.hermes_default_target}"
+    redacted_target = _redact_sensitive_text(settings.hermes_default_target, settings) or settings.hermes_default_target
+    return f"{node}:{repo}:{_subject_kind(parsed)}:{subject_number}:sha:{commit_sha}:target:{redacted_target}"
 
 
 def _hermes_correlation_id(parsed: ParsedGitHubEvent, *, node: Literal["M2", "DGX"]) -> str:
@@ -680,12 +685,14 @@ async def _notify_and_writeback(
     result.message = final_message
 
     owns_slack = slack_client is None
-    if settings.hermes_slack_webhook_url or settings.slack_bot_token:
-        slack_client = slack_client or SlackClient(webhook_url=settings.hermes_slack_webhook_url, bot_token=settings.slack_bot_token)
+    webhook_url = settings.hermes_slack_webhook_url or settings.slack_webhook_url
+    channel = settings.hermes_slack_channel or settings.slack_channel
+    if webhook_url or settings.slack_bot_token:
+        slack_client = slack_client or SlackClient(webhook_url=webhook_url, bot_token=settings.slack_bot_token)
         try:
-            await slack_client.post_message(channel=settings.hermes_slack_channel, text=request_message)
+            await slack_client.post_message(channel=channel, text=request_message)
             if final_message != request_message:
-                await slack_client.post_message(channel=settings.hermes_slack_channel, text=final_message)
+                await slack_client.post_message(channel=channel, text=final_message)
         except Exception as exc:
             result.error = result.error or _redact_sensitive_text(str(exc), settings)
         finally:
