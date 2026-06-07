@@ -71,6 +71,7 @@ def log_events(records: list[logging.LogRecord]) -> list[dict[str, Any]]:
 def assert_secret_absent(value: Any) -> None:
     serialized = json.dumps(value, default=str)
     assert "secret-token" not in serialized
+    assert "url-secret" not in serialized
     assert "Bearer secret-token" not in serialized
     assert "X-Hermes-Token: secret-token" not in serialized
 
@@ -96,21 +97,49 @@ def test_issue_labeled_runtime_request_dispatches_hermes_m2_and_comments(caplog:
 
     assert result.success is True
     assert result.status == "PASSED"
-    assert result.correlation_id == "hermes-m2-marcus937-riseos-agent-orchestrator-pr-53-unknown"
+    assert result.correlation_id == "hermes-m2-marcus937-riseos-agent-orchestrator-issue-53-unknown"
     assert route_log["route"] == "issue_labeled_hermes_validate"
     assert route_log["labels_request_hermes"] is True
     assert hermes.jobs[0][2]["correlationId"] == result.correlation_id
     assert hermes.jobs[0][2]["payload"]["trigger"] == "issue_labeled_hermes_validate"
     assert hermes.jobs[0][2]["payload"]["repo"] == "marcus937/riseos-agent-orchestrator"
-    assert hermes.jobs[0][2]["payload"]["prNumber"] == 53
+    assert hermes.jobs[0][2]["payload"]["subjectType"] == "issue"
+    assert hermes.jobs[0][2]["payload"]["issueNumber"] == 53
+    assert "prNumber" not in hermes.jobs[0][2]["payload"]
+    assert hermes.jobs[0][2]["payload"]["screenshotName"] == "issue-53-validation.png"
     assert github.labels == [("marcus937/riseos-agent-orchestrator", 53, "agent-verified")]
     assert "Job ID: issue-job-123" in github.comments[0][2]
-    assert "Correlation ID: hermes-m2-marcus937-riseos-agent-orchestrator-pr-53-unknown" in github.comments[0][2]
+    assert "Correlation ID: hermes-m2-marcus937-riseos-agent-orchestrator-issue-53-unknown" in github.comments[0][2]
     for artifact in ["summary.json", "console.json", "network.json", "page.json", "screenshot.png"]:
         assert artifact in github.comments[0][2]
     assert_secret_absent(events)
     assert_secret_absent(result.model_dump())
     assert_secret_absent(github.comments)
+
+
+def test_issue_labeled_testing_runtime_label_remains_backward_compatible(caplog: Any) -> None:
+    parsed = parse_github_event("issues", issue_payload(labels=["agent-ready", "testing"], label="testing"))
+    hermes = FakeHermesClient()
+
+    with caplog.at_level(logging.INFO, logger="riseos_agent_orchestrator"):
+        result = run(
+            dispatch_hermes_runtime_validation(
+                parsed,
+                settings(enable_github_writeback=False),
+                hermes_client=hermes,
+                registry=InMemoryHermesDispatchRegistry(),
+            )
+        )
+
+    events = log_events(caplog.records)
+    route_log = next(event for event in events if event["event"] == "hermes_route_evaluated")
+
+    assert result.attempted is True
+    assert result.success is True
+    assert len(hermes.jobs) == 1
+    assert route_log["labels_request_hermes"] is True
+    assert route_log["runtime_label_match"] is True
+    assert_secret_absent(events)
 
 
 def test_issue_labeled_runtime_failure_applies_agent_blocked() -> None:
@@ -136,7 +165,7 @@ def test_issue_labeled_runtime_failure_applies_agent_blocked() -> None:
 
 
 def test_issue_labeled_without_required_label_set_skips_dispatch(caplog: Any) -> None:
-    parsed = parse_github_event("issues", issue_payload(labels=["agent-ready", "testing"]))
+    parsed = parse_github_event("issues", issue_payload(labels=["agent-ready"]))
     hermes = FakeHermesClient()
 
     with caplog.at_level(logging.INFO, logger="riseos_agent_orchestrator"):
