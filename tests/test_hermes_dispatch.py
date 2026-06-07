@@ -50,7 +50,6 @@ def run(coro: Any) -> Any:
 
 def settings(**overrides: Any) -> Settings:
     base = {
-        "slack_webhook_url": "https://hooks.slack.test/services/test",
         "slack_channel": "#jarvis-agent-orchestrator",
         "enable_github_writeback": True,
         "hermes_m2_base_url": "http://100.70.83.13:8787",
@@ -86,7 +85,7 @@ def test_pr_label_runtime_request_dispatches_hermes_m2() -> None:
     result = run(
         dispatch_hermes_runtime_validation(
             parsed,
-            settings(),
+            settings(slack_webhook_url="https://hooks.slack.test/services/test"),
             slack_client=slack,
             github_client=github,
             hermes_client=hermes,
