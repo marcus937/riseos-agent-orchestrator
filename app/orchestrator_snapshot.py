@@ -32,6 +32,14 @@ class OrchestratorSnapshotOverview(BaseModel):
     recent_failure_count: int
 
 
+class OrchestratorWorkforceSnapshot(BaseModel):
+    overview: OrchestratorSnapshotOverview
+    agents: list[ReviewLifecycleVisibility]
+    issues: list[ReviewWorkItem]
+    prs: list[ReviewWorkItem]
+    events: list[EventRecord]
+
+
 class HermesDispatchStatus(BaseModel):
     default_target_configured: bool
     m2_dispatch_enabled: bool
@@ -52,11 +60,7 @@ class OrchestratorRuntime(BaseModel):
 class OrchestratorSnapshot(BaseModel):
     schema_version: str = ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    overview: OrchestratorSnapshotOverview
-    agents: list[ReviewLifecycleVisibility]
-    issues: list[ReviewWorkItem]
-    prs: list[ReviewWorkItem]
-    events: list[EventRecord]
+    workforce: OrchestratorWorkforceSnapshot
     queue: ReviewQueueStats
     health: DebugHealth
     runtime: OrchestratorRuntime
@@ -75,25 +79,27 @@ def build_orchestrator_snapshot(
     recent_failures: list[RecentFailure],
 ) -> OrchestratorSnapshot:
     return OrchestratorSnapshot(
-        overview=OrchestratorSnapshotOverview(
-            status="ok",
-            app_env=settings.app_env,
-            work_branch=settings.work_branch,
-            base_branch=settings.base_branch,
-            webhook_count=health.webhook_count,
-            accepted_count=health.accepted_count,
-            rejected_count=health.rejected_count,
-            review_queue_count=health.review_queue_count,
-            pending_review_count=health.pending_review_count,
-            active_reviewing_count=worker_stats.active_reviewing_count,
-            approved_for_human_review_count=health.approved_for_human_review_count,
-            blocked_count=health.blocked_count,
-            recent_failure_count=queue.recent_failure_count,
+        workforce=OrchestratorWorkforceSnapshot(
+            overview=OrchestratorSnapshotOverview(
+                status="ok",
+                app_env=settings.app_env,
+                work_branch=settings.work_branch,
+                base_branch=settings.base_branch,
+                webhook_count=health.webhook_count,
+                accepted_count=health.accepted_count,
+                rejected_count=health.rejected_count,
+                review_queue_count=health.review_queue_count,
+                pending_review_count=health.pending_review_count,
+                active_reviewing_count=worker_stats.active_reviewing_count,
+                approved_for_human_review_count=health.approved_for_human_review_count,
+                blocked_count=health.blocked_count,
+                recent_failure_count=queue.recent_failure_count,
+            ),
+            agents=lifecycle,
+            issues=[item for item in review_items if item.issue_number is not None and item.pr_number is None],
+            prs=[item for item in review_items if item.pr_number is not None],
+            events=events,
         ),
-        agents=lifecycle,
-        issues=[item for item in review_items if item.issue_number is not None and item.pr_number is None],
-        prs=[item for item in review_items if item.pr_number is not None],
-        events=events,
         queue=queue,
         health=health,
         runtime=OrchestratorRuntime(
