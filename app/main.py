@@ -9,9 +9,11 @@ from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, 
 from app.github_context import hydrate_github_context
 from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
+from app.hermes_dispatch import dispatch_hermes_runtime_validation
 from app.operational_logging import (
     log_github_writeback_result,
     log_github_writeback_attempted,
+    log_hermes_dispatch_result,
     log_openai_review_attempted,
     log_openai_review_result,
     log_queue_item_created,
@@ -366,6 +368,14 @@ async def github_webhook(
     else:
         slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings)
     log_slack_issue_dispatch_result(parsed, slack_dispatch)
+
+    github_client = GitHubClient(token=settings.github_token) if settings.enable_github_writeback else None
+    try:
+        hermes_dispatch = await dispatch_hermes_runtime_validation(parsed, settings, github_client=github_client)
+    finally:
+        if github_client is not None:
+            await github_client.aclose()
+    log_hermes_dispatch_result(parsed, hermes_dispatch)
 
     _schedule_auto_process_work_item(work_item, settings, storage, background_tasks)
 

@@ -199,6 +199,27 @@ def log_slack_issue_dispatch_result(parsed: ParsedGitHubEvent, result: SlackIssu
     )
 
 
+def log_hermes_dispatch_result(parsed: ParsedGitHubEvent, result: Any) -> None:
+    event_name = _hermes_dispatch_event_name(result)
+    log_event(
+        event_name,
+        attempted=result.attempted,
+        success=result.success,
+        status=result.status,
+        hermes_node=result.hermes_node,
+        dispatch_key=result.dispatch_key,
+        correlation_id=result.correlation_id or correlation_id_from_parsed(parsed),
+        repo_full_name=parsed.repository,
+        issue_number=parsed.issue_number,
+        pr_number=parsed.pull_request_number,
+        action=parsed.action,
+        skipped_reason=result.skipped_reason,
+        error=result.error,
+        label=result.label,
+        job_id=result.job_id,
+    )
+
+
 def _slack_dispatch_event_name(result: SlackIssueDispatchResult) -> str:
     if result.success:
         return "slack_issue_dispatch_succeeded"
@@ -211,6 +232,18 @@ def _slack_dispatch_event_name(result: SlackIssueDispatchResult) -> str:
     if result.skipped_reason == "Repository is not approved for Circuit Slack dispatch.":
         return "slack_issue_dispatch_invalid_repo"
     return "slack_issue_dispatch_skipped"
+
+
+def _hermes_dispatch_event_name(result: Any) -> str:
+    if result.success:
+        return "hermes_dispatch_succeeded"
+    if result.status == "BLOCKED":
+        return "hermes_dispatch_blocked"
+    if result.error:
+        return "hermes_dispatch_failed"
+    if result.skipped_reason and "already dispatched" in result.skipped_reason:
+        return "hermes_dispatch_duplicate_suppressed"
+    return "hermes_dispatch_skipped"
 
 
 def _duplicate_source(event_id: str) -> str:
