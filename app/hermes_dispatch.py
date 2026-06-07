@@ -14,7 +14,7 @@ from app.correlation import branch_from_parsed, correlation_id_from_parsed
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.slack_issue_dispatch import SlackClient, SlackIssueDispatchClient, _sanitize_slack_text
 
-HERMES_RUNTIME_LABELS = {"runtime-agent", "playwright", "evidence"}
+HERMES_RUNTIME_LABELS = {"runtime-agent", "playwright", "evidence", "testing"}
 HERMES_LIFECYCLE_LABELS = {"bb-review-needed", "agent-review", "agent-ready", "agent-next"}
 CANONICAL_HERMES_TRIGGER_LABELS = ("runtime-agent", "playwright", "bb-review-needed")
 CIRCUIT_HERMES_PR_ACTIONS = {"opened", "synchronize", "ready_for_review"}
@@ -131,6 +131,7 @@ async def dispatch_hermes_runtime_validation(
     node = _hermes_node(parsed.labels)
     _log_hermes_decision(
         parsed,
+        settings,
         "hermes_route_evaluated",
         node=node,
         route=route,
@@ -157,6 +158,7 @@ async def dispatch_hermes_runtime_validation(
     )
     _log_hermes_decision(
         parsed,
+        settings,
         "hermes_dispatch_eligibility_evaluated",
         node=node,
         route=route,
@@ -173,7 +175,7 @@ async def dispatch_hermes_runtime_validation(
         return HermesDispatchResult(
             hermes_node=node,
             correlation_id=correlation_id,
-            skipped_reason="PR dispatch key could not be determined.",
+            skipped_reason="Hermes dispatch key could not be determined.",
         )
 
     if disabled:
@@ -228,7 +230,7 @@ async def dispatch_hermes_runtime_validation(
             hermes_node=node,
             dispatch_key=dispatch_key,
             correlation_id=correlation_id,
-            skipped_reason="Hermes validation was already dispatched for this PR commit and target.",
+            skipped_reason="Hermes validation was already dispatched for this item commit and target.",
         )
 
     trigger_label_error = await _apply_canonical_hermes_trigger_labels(
@@ -244,6 +246,7 @@ async def dispatch_hermes_runtime_validation(
     base_url = _node_base_url(settings, node)
     _log_hermes_decision(
         parsed,
+        settings,
         "hermes_post_attempted",
         node=node,
         route=route,
@@ -258,6 +261,7 @@ async def dispatch_hermes_runtime_validation(
         result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
         _log_hermes_decision(
             parsed,
+            settings,
             "hermes_post_completed",
             node=node,
             route=route,
@@ -275,6 +279,7 @@ async def dispatch_hermes_runtime_validation(
         error = _redact_sensitive_text(str(exc), settings)
         _log_hermes_decision(
             parsed,
+            settings,
             "hermes_post_failed",
             node=node,
             route=route,
@@ -307,33 +312,42 @@ def build_hermes_job_payload(
     route: str | None = None,
 ) -> dict[str, Any]:
     commit_sha = parsed.head_sha or "unknown"
-    pr_number = parsed.pull_request_number or parsed.issue_number
+    subject_kind = _subject_kind(parsed)
+    subject_number = _subject_number(parsed)
     branch = branch_from_parsed(parsed) or settings.work_branch
     labels = set(parsed.labels)
     if _is_circuit_pr(parsed):
         labels.update(CANONICAL_HERMES_TRIGGER_LABELS)
+
+    payload: dict[str, Any] = {
+        "source": "riseos-agent-orchestrator",
+        "repo": parsed.repository,
+        "subjectType": subject_kind,
+        "commitSha": commit_sha,
+        "branch": branch,
+        "screenshotName": f"{subject_kind}-{subject_number}-validation.png",
+        "labels": sorted(labels),
+        "hermesNode": node,
+        "trigger": route,
+    }
+    if subject_kind == "issue":
+        payload["issueNumber"] = subject_number
+    else:
+        payload["prNumber"] = subject_number
+
     return {
         "type": "playwright",
         "dryRun": False,
         "targetUrl": settings.hermes_default_target,
         "correlationId": correlation_id or _hermes_correlation_id(parsed, node=node),
-        "payload": {
-            "source": "riseos-agent-orchestrator",
-            "repo": parsed.repository,
-            "prNumber": pr_number,
-            "commitSha": commit_sha,
-            "branch": branch,
-            "screenshotName": f"pr-{pr_number}-validation.png",
-            "labels": sorted(labels),
-            "hermesNode": node,
-            "trigger": route,
-        },
+        "payload": payload,
     }
 
 
 def build_hermes_slack_message(parsed: ParsedGitHubEvent, result: HermesDispatchResult, settings: Settings) -> str:
     repo = _sanitize_slack_text(parsed.repository or "unknown repo")
-    pr_number = parsed.pull_request_number or parsed.issue_number or "unknown"
+    subject_number = _subject_number(parsed) or "unknown"
+    subject_label = _github_subject_label(parsed)
     labels = ", ".join(_sanitize_slack_text(label) for label in parsed.labels) if parsed.labels else "none"
     if result.status == "BLOCKED":
         reason = _sanitize_slack_text(_redact_sensitive_text(result.error or result.skipped_reason or "Hermes validation could not run.", settings))
@@ -341,7 +355,7 @@ def build_hermes_slack_message(parsed: ParsedGitHubEvent, result: HermesDispatch
             "Hermes validation blocked\n"
             f"Reason: {reason}\n"
             f"Repo: {repo}\n"
-            f"PR: #{pr_number}\n"
+            f"{subject_label}: #{subject_number}\n"
             f"Node: {result.hermes_node}\n"
             f"Correlation ID: {_sanitize_slack_text(result.correlation_id or 'unknown')}"
         )
@@ -349,7 +363,7 @@ def build_hermes_slack_message(parsed: ParsedGitHubEvent, result: HermesDispatch
         return (
             "Hermes validation complete\n"
             f"Repo: {repo}\n"
-            f"PR: #{pr_number}\n"
+            f"{subject_label}: #{subject_number}\n"
             f"Status: {result.status}\n"
             f"Job ID: {_sanitize_slack_text(result.job_id or 'unknown')}\n"
             f"Evidence: {', '.join(EVIDENCE_FILES)}"
@@ -357,7 +371,7 @@ def build_hermes_slack_message(parsed: ParsedGitHubEvent, result: HermesDispatch
     return (
         "Hermes validation requested\n"
         f"Repo: {repo}\n"
-        f"PR: #{pr_number}\n"
+        f"{subject_label}: #{subject_number}\n"
         f"Labels: {labels}\n"
         f"Node: {result.hermes_node}\n"
         f"Correlation ID: {_sanitize_slack_text(result.correlation_id or 'unknown')}"
@@ -374,7 +388,7 @@ def build_hermes_pr_comment(parsed: ParsedGitHubEvent, result: HermesDispatchRes
         "## Hermes Runtime Validation\n\n"
         f"Status: {result.status}\n"
         f"Hermes node: {result.hermes_node}\n"
-        f"Target: {settings.hermes_default_target}\n"
+        f"Target: {_redact_sensitive_text(settings.hermes_default_target, settings)}\n"
         f"Job ID: {result.job_id or 'not-created'}\n"
         f"Correlation ID: {result.correlation_id or 'unknown'}\n"
         f"Commit: {commit_sha}\n\n"
@@ -507,20 +521,32 @@ def _node_token(settings: Settings, node: Literal["M2", "DGX"]) -> str:
     return settings.hermes_dgx_token if node == "DGX" else settings.hermes_m2_token  # type: ignore[return-value]
 
 
+def _subject_kind(parsed: ParsedGitHubEvent) -> Literal["issue", "pr"]:
+    return "issue" if parsed.event_type == GitHubEventType.ISSUES else "pr"
+
+
+def _subject_number(parsed: ParsedGitHubEvent) -> int | None:
+    return parsed.issue_number if _subject_kind(parsed) == "issue" else parsed.pull_request_number
+
+
+def _github_subject_label(parsed: ParsedGitHubEvent) -> str:
+    return "Issue" if _subject_kind(parsed) == "issue" else "PR"
+
+
 def _dispatch_key(parsed: ParsedGitHubEvent, settings: Settings, *, node: Literal["M2", "DGX"]) -> str | None:
     repo = parsed.repository
-    pr_number = parsed.pull_request_number or parsed.issue_number
+    subject_number = _subject_number(parsed)
     commit_sha = parsed.head_sha or "unknown"
-    if not repo or not pr_number:
+    if not repo or not subject_number:
         return None
-    return f"{node}:{repo}:pr:{pr_number}:sha:{commit_sha}:target:{settings.hermes_default_target}"
+    return f"{node}:{repo}:{_subject_kind(parsed)}:{subject_number}:sha:{commit_sha}:target:{settings.hermes_default_target}"
 
 
 def _hermes_correlation_id(parsed: ParsedGitHubEvent, *, node: Literal["M2", "DGX"]) -> str:
     repo = (parsed.repository or "unknown/unknown").replace("/", "-")
-    pr_number = parsed.pull_request_number or parsed.issue_number or "unknown"
+    subject_number = _subject_number(parsed) or "unknown"
     short_sha = (parsed.head_sha or "unknown")[:7]
-    return f"hermes-{node.lower()}-{repo}-pr-{pr_number}-{short_sha}"
+    return f"hermes-{node.lower()}-{repo}-{_subject_kind(parsed)}-{subject_number}-{short_sha}"
 
 
 def _eligibility_blocker(
@@ -546,6 +572,18 @@ def _redact_sensitive_text(value: str | None, settings: Settings) -> str | None:
     return redacted
 
 
+def _redact_sensitive_value(value: Any, settings: Settings) -> Any:
+    if isinstance(value, str):
+        return _redact_sensitive_text(value, settings)
+    if isinstance(value, list):
+        return [_redact_sensitive_value(item, settings) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive_value(item, settings) for item in value)
+    if isinstance(value, dict):
+        return {key: _redact_sensitive_value(item, settings) for key, item in value.items()}
+    return value
+
+
 def _known_secret_values(settings: Settings) -> list[str]:
     names = (
         "github_webhook_secret",
@@ -569,6 +607,7 @@ def _known_secret_values(settings: Settings) -> list[str]:
 
 def _log_hermes_decision(
     parsed: ParsedGitHubEvent,
+    settings: Settings,
     event: str,
     *,
     node: Literal["M2", "DGX"],
@@ -591,7 +630,8 @@ def _log_hermes_decision(
         "route": route,
         **fields,
     }
-    LOGGER.info(json.dumps({key: value for key, value in payload.items() if value is not None or key == "route"}, sort_keys=True, default=str))
+    sanitized = _redact_sensitive_value(payload, settings)
+    LOGGER.info(json.dumps({key: value for key, value in sanitized.items() if value is not None or key == "route"}, sort_keys=True, default=str))
 
 
 def _result_from_hermes_response(
@@ -653,13 +693,13 @@ async def _notify_and_writeback(
                 await slack_client.aclose()
 
     if github_client is not None and settings.enable_github_writeback and result.label:
-        pr_number = parsed.pull_request_number or parsed.issue_number
-        if parsed.repository and pr_number:
+        subject_number = _subject_number(parsed)
+        if parsed.repository and subject_number:
             comment = build_hermes_pr_comment(parsed, result, settings)
             result.comment = comment
             try:
-                await github_client.post_issue_comment(parsed.repository, pr_number, comment)
-                await github_client.apply_label(parsed.repository, pr_number, result.label)
+                await github_client.post_issue_comment(parsed.repository, subject_number, comment)
+                await github_client.apply_label(parsed.repository, subject_number, result.label)
             except Exception as exc:
                 result.error = result.error or _redact_sensitive_text(str(exc), settings)
 
