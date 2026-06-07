@@ -6,9 +6,7 @@ from app.github_events import parse_github_event
 from app.slack_issue_dispatch import (
     AGENT_READY_LABEL,
     InMemoryDispatchedIssueRegistry,
-    _route_channel,
-    _route_webhook_url,
-    _slack_route_for_text,
+    SlackClient,
     dispatch_ready_issue_to_slack,
 )
 
@@ -19,6 +17,29 @@ class FakeSlackClient:
 
     async def post_message(self, *, channel: str, text: str) -> None:
         self.messages.append((channel, text))
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        self._payload = payload or {"ok": True}
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class FakeHTTPClient:
+    def __init__(self) -> None:
+        self.posts: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> FakeHTTPResponse:
+        self.posts.append({"url": url, **kwargs})
+        return FakeHTTPResponse()
+
+    async def aclose(self) -> None:
+        return None
 
 
 def run(coro: Any) -> Any:
@@ -63,17 +84,44 @@ def test_orchestrator_notification_uses_orchestrator_channel() -> None:
     assert "Channel: #jarvis-agent-orchestrator" in result.message
 
 
-def test_hermes_runtime_message_routes_to_hermes_destination(monkeypatch: Any) -> None:
-    monkeypatch.setenv("ORCHESTRATOR_SLACK_WEBHOOK_URL", "https://hooks.slack.test/orchestrator")
-    monkeypatch.setenv("ORCHESTRATOR_SLACK_CHANNEL", "#jarvis-agent-orchestrator")
-    monkeypatch.setenv("HERMES_SLACK_WEBHOOK_URL", "https://hooks.slack.test/hermes")
-    monkeypatch.setenv("HERMES_SLACK_CHANNEL", "#jarvis-hermes-runtime")
+def test_real_slack_client_posts_orchestrator_destination_from_settings() -> None:
+    http_client = FakeHTTPClient()
+    settings = Settings(
+        orchestrator_slack_webhook_url="https://hooks.slack.test/orchestrator",
+        orchestrator_slack_channel="#jarvis-agent-orchestrator",
+        hermes_slack_webhook_url="https://hooks.slack.test/hermes",
+        hermes_slack_channel="#jarvis-hermes-runtime",
+    )
+    client = SlackClient(webhook_url=settings.orchestrator_slack_webhook_url, bot_token=None, http_client=http_client)
 
-    route = _slack_route_for_text("Hermes validation complete\nStatus: PASSED")
+    run(client.post_message(channel=settings.orchestrator_slack_channel, text="@circuit-forge Circuit task ready"))
 
-    assert route == "hermes"
-    assert _route_webhook_url(route, fallback="https://hooks.slack.test/fallback") == "https://hooks.slack.test/hermes"
-    assert _route_channel(route, fallback="#jarvis-agent-orchestrator") == "#jarvis-hermes-runtime"
+    assert http_client.posts == [
+        {
+            "url": "https://hooks.slack.test/orchestrator",
+            "json": {"channel": "#jarvis-agent-orchestrator", "text": "@circuit-forge Circuit task ready"},
+        }
+    ]
+
+
+def test_real_slack_client_posts_hermes_destination_from_settings() -> None:
+    http_client = FakeHTTPClient()
+    settings = Settings(
+        orchestrator_slack_webhook_url="https://hooks.slack.test/orchestrator",
+        orchestrator_slack_channel="#jarvis-agent-orchestrator",
+        hermes_slack_webhook_url="https://hooks.slack.test/hermes",
+        hermes_slack_channel="#jarvis-hermes-runtime",
+    )
+    client = SlackClient(webhook_url=settings.hermes_slack_webhook_url, bot_token=None, http_client=http_client)
+
+    run(client.post_message(channel=settings.hermes_slack_channel, text="Hermes validation complete\nStatus: PASSED"))
+
+    assert http_client.posts == [
+        {
+            "url": "https://hooks.slack.test/hermes",
+            "json": {"channel": "#jarvis-hermes-runtime", "text": "Hermes validation complete\nStatus: PASSED"},
+        }
+    ]
 
 
 def test_legacy_slack_configuration_remains_compatible(monkeypatch: Any) -> None:
@@ -91,8 +139,6 @@ def test_legacy_slack_configuration_remains_compatible(monkeypatch: Any) -> None
     assert settings.orchestrator_slack_channel == "#project_riseos"
     assert settings.hermes_slack_webhook_url == "https://hooks.slack.test/legacy"
     assert settings.hermes_slack_channel == "#project_riseos"
-    assert _route_webhook_url("hermes", fallback=None) == "https://hooks.slack.test/legacy"
-    assert _route_channel("hermes", fallback="#jarvis-agent-orchestrator") == "#project_riseos"
 
 
 def test_orchestrator_dispatch_does_not_duplicate_messages() -> None:
