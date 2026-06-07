@@ -28,6 +28,10 @@ class Settings:
     slack_webhook_url: str | None = None
     slack_bot_token: str | None = None
     slack_channel: str = "#jarvis-agent-orchestrator"
+    orchestrator_slack_webhook_url: str | None = None
+    orchestrator_slack_channel: str = "#jarvis-agent-orchestrator"
+    hermes_slack_webhook_url: str | None = None
+    hermes_slack_channel: str = "#jarvis-hermes-runtime"
     work_branch: str = "agent-integration"
     base_branch: str = "main"
     hermes_base_url: str | None = None
@@ -44,6 +48,12 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    legacy_slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    legacy_slack_channel = os.getenv("SLACK_CHANNEL")
+    orchestrator_slack_webhook_url = os.getenv("ORCHESTRATOR_SLACK_WEBHOOK_URL") or legacy_slack_webhook_url
+    orchestrator_slack_channel = os.getenv("ORCHESTRATOR_SLACK_CHANNEL") or legacy_slack_channel or "#jarvis-agent-orchestrator"
+    hermes_slack_webhook_url = os.getenv("HERMES_SLACK_WEBHOOK_URL") or legacy_slack_webhook_url
+    hermes_slack_channel = os.getenv("HERMES_SLACK_CHANNEL") or legacy_slack_channel or "#jarvis-hermes-runtime"
     hermes_m2_base_url = os.getenv("HERMES_M2_BASE_URL") or os.getenv("HERMES_BASE_URL")
     hermes_m2_token = os.getenv("HERMES_M2_TOKEN") or os.getenv("HERMES_TOKEN")
     hermes_m2_enable_dispatch = _bool_env("HERMES_M2_ENABLE_DISPATCH") or _bool_env("HERMES_ENABLE_DISPATCH")
@@ -67,9 +77,13 @@ def get_settings() -> Settings:
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
-        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        slack_webhook_url=legacy_slack_webhook_url,
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
-        slack_channel=os.getenv("SLACK_CHANNEL", "#jarvis-agent-orchestrator"),
+        slack_channel=legacy_slack_channel or orchestrator_slack_channel,
+        orchestrator_slack_webhook_url=orchestrator_slack_webhook_url,
+        orchestrator_slack_channel=orchestrator_slack_channel,
+        hermes_slack_webhook_url=hermes_slack_webhook_url,
+        hermes_slack_channel=hermes_slack_channel,
         work_branch=os.getenv("WORK_BRANCH", "agent-integration"),
         base_branch=os.getenv("BASE_BRANCH", "main"),
         hermes_base_url=hermes_m2_base_url,
