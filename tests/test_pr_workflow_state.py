@@ -44,3 +44,27 @@ def test_blocker_labels_prevent_ready_to_merge() -> None:
     labels = {"runtime-agent", "playwright", "agent-verified", "bb2-approved", "agent-revisions"}
 
     assert ready_to_merge_allowed(labels) is False
+
+
+def test_stale_ready_to_merge_does_not_override_bb2_needs_changes() -> None:
+    labels = {"ready-to-merge", "bb2-needs-changes"}
+
+    assert workflow_state_from_labels(labels) == PRWorkflowState.BB2_NEEDS_CHANGES
+
+
+def test_stale_ready_to_merge_does_not_override_bb2_blocked() -> None:
+    labels = {"ready-to-merge", "bb2-blocked"}
+
+    assert workflow_state_from_labels(labels) == PRWorkflowState.BB2_BLOCKED
+
+
+def test_stale_ready_to_merge_does_not_override_agent_revisions() -> None:
+    labels = {"ready-to-merge", "agent-revisions"}
+
+    assert workflow_state_from_labels(labels) == PRWorkflowState.HERMES_REVISIONS
+
+
+def test_stale_ready_to_merge_does_not_override_agent_blocked() -> None:
+    labels = {"ready-to-merge", "agent-blocked"}
+
+    assert workflow_state_from_labels(labels) == PRWorkflowState.HERMES_BLOCKED
