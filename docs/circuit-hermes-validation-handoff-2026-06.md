@@ -22,16 +22,17 @@ These labels mean the PR should enter the Hermes runtime validation path. They a
 2. Circuit works only inside the allowed branch rule, currently `agent-integration` for this orchestrator lane.
 3. Circuit opens or updates a draft PR into `main` from `agent-integration`.
 4. The orchestrator accepts the `pull_request` webhook.
-5. If the PR head branch is `agent-integration`, the orchestrator treats the PR as Hermes-eligible even when the trigger labels are not already present.
-6. When GitHub writeback is enabled, the orchestrator applies `runtime-agent`, `playwright`, and `bb-review-needed` to the PR.
-7. The orchestrator sends Hermes a validation job payload containing repo, PR number, branch, commit SHA, target URL, trigger route, and canonical labels.
-8. Hermes runs the configured runtime validation profile and returns status plus evidence.
-9. The orchestrator comments the Hermes packet and applies the result label:
-   - `agent-verified` for passed validation.
-   - `agent-revisions` for failed validation.
-   - `agent-blocked` when Hermes cannot validate.
-10. BB2 reviews the Circuit packet and Hermes runtime packet together.
-11. Marcus remains the only merge authority.
+5. If the PR head branch is `agent-integration` and the base branch is `main`, the orchestrator treats the PR as Hermes-eligible even when the trigger labels are not already present.
+6. The orchestrator checks Hermes dispatch safety gates first: dispatch enabled, supported node, required config, valid target, and duplicate-dispatch suppression.
+7. When those gates pass and GitHub writeback is enabled, the orchestrator applies `runtime-agent`, `playwright`, and `bb-review-needed` to the PR.
+8. The orchestrator sends Hermes a validation job payload containing repo, PR number, branch, commit SHA, target URL, trigger route, and canonical labels.
+9. Hermes runs the configured runtime validation profile and returns status plus evidence.
+10. The orchestrator comments the Hermes packet and applies the result label:
+    - `agent-verified` for passed validation.
+    - `agent-revisions` for failed validation.
+    - `agent-blocked` when Hermes cannot validate.
+11. BB2 reviews the Circuit packet and Hermes runtime packet together.
+12. Marcus remains the only merge authority.
 
 ## GitHub Actions Role
 
@@ -56,18 +57,21 @@ Hermes must remain read-only by default:
 - no production writes
 - no secrets in comments, labels, screenshots, or artifacts
 
+GitHub writeback is limited to comments and labels when `ENABLE_GITHUB_WRITEBACK=true`. Disabled or duplicate Hermes dispatch must not apply trigger labels, post comments, or enqueue jobs.
+
 Blocked Hermes runs should produce a `BLOCKED` packet explaining what input or environment is needed before BB2 continues.
 
 ## VERIFIED
 
-- Circuit PRs from `agent-integration` now enter Hermes routing on `opened`, `synchronize`, and `ready_for_review` events.
+- Circuit PRs from `agent-integration` into `main` now enter Hermes routing on `opened`, `synchronize`, and `ready_for_review` events.
 - The canonical Hermes trigger labels are `runtime-agent`, `playwright`, and `bb-review-needed`.
-- When GitHub writeback is enabled, those trigger labels are applied automatically before the Hermes job is dispatched.
+- When dispatch safety gates pass and GitHub writeback is enabled, those trigger labels are applied automatically before the Hermes job is dispatched.
 - Hermes job payloads include the canonical labels for Circuit PRs even if the webhook payload did not already contain them.
 
 ## ASSUMED
 
 - `agent-integration` remains the current Circuit work branch for this orchestrator lane.
+- `main` remains the intended base branch for the Circuit PR handoff into human review.
 - `HERMES_DEFAULT_TARGET` is configured to the intended preview, staging, local, or simulator target before live validation is enabled.
 - `ENABLE_GITHUB_WRITEBACK=true` is required for the orchestrator to apply labels or comment back to GitHub.
 
