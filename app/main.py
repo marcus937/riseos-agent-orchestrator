@@ -23,6 +23,7 @@ from app.operational_logging import (
     log_webhook_accepted,
     log_webhook_duplicate_suppressed,
 )
+from app.orchestrator_snapshot import OrchestratorSnapshot, build_orchestrator_snapshot
 from app.reviewer.decision import ReviewDecisionType
 from app.reviewer.openai_review import request_openai_review_decision
 from app.review_queue import (
@@ -85,29 +86,62 @@ def _review_items() -> list[ReviewWorkItem]:
     return review_queue.list_items()
 
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/debug/recent-events", response_model=list[EventRecord])
-async def recent_events(
-    _: None = Depends(_require_debug_read_access),
-) -> list[EventRecord]:
+def _recent_events() -> list[EventRecord]:
     storage = _storage()
     if storage is not None:
         return storage.recent_events()
     return event_store.recent_events()
 
 
-@app.get("/debug/health", response_model=DebugHealth)
-async def debug_health(
-    _: None = Depends(_require_debug_read_access),
-) -> DebugHealth:
+def _review_queue_stats(items: list[ReviewWorkItem]) -> ReviewQueueStats:
+    storage = _storage()
+    if storage is not None:
+        return build_queue_stats(items, counters=storage.review_queue_counters())
+    return build_queue_stats(items, counters=review_queue.counters())
+
+
+def _debug_health() -> DebugHealth:
     storage = _storage()
     if storage is not None:
         return event_store.debug_health(storage.review_queue_counters(), accepted_count=storage.event_count())
     return event_store.debug_health(review_queue.counters())
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/v1/orchestrator/snapshot", response_model=OrchestratorSnapshot)
+async def orchestrator_snapshot(
+    _: None = Depends(_require_debug_read_access),
+    settings: Settings = Depends(get_settings),
+) -> OrchestratorSnapshot:
+    items = _review_items()
+    return build_orchestrator_snapshot(
+        settings=settings,
+        health=_debug_health(),
+        queue=_review_queue_stats(items),
+        worker_stats=build_worker_stats(items, auto_processing_enabled=settings.enable_auto_review_processing),
+        lifecycle=build_lifecycle_visibility(items),
+        review_items=items,
+        events=_recent_events(),
+        recent_failures=build_recent_failures(items),
+    )
+
+
+@app.get("/debug/recent-events", response_model=list[EventRecord])
+async def recent_events(
+    _: None = Depends(_require_debug_read_access),
+) -> list[EventRecord]:
+    return _recent_events()
+
+
+@app.get("/debug/health", response_model=DebugHealth)
+async def debug_health(
+    _: None = Depends(_require_debug_read_access),
+) -> DebugHealth:
+    return _debug_health()
 
 
 @app.get("/debug/review-queue", response_model=list[ReviewWorkItem])
@@ -121,10 +155,7 @@ async def debug_review_queue(
 async def debug_review_queue_stats(
     _: None = Depends(_require_debug_read_access),
 ) -> ReviewQueueStats:
-    storage = _storage()
-    if storage is not None:
-        return build_queue_stats(storage.list_review_work_items(), counters=storage.review_queue_counters())
-    return build_queue_stats(review_queue.list_items(), counters=review_queue.counters())
+    return _review_queue_stats(_review_items())
 
 
 @app.get("/debug/workers/stats", response_model=WorkerStats)
