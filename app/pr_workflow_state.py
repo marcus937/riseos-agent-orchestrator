@@ -86,15 +86,11 @@ def ready_to_merge_allowed(labels: list[str] | set[str] | tuple[str, ...] | None
     current = normalize_labels(labels)
     if LABEL_BB2_APPROVED not in current:
         return False
+    if not current & HERMES_SUCCESS_LABELS:
+        return False
     if current & BLOCKING_LABELS:
         return False
-    if _runtime_validation_required(current) and not current & HERMES_SUCCESS_LABELS:
-        return False
     return True
-
-
-def _runtime_validation_required(labels: set[str]) -> bool:
-    return bool(labels & HERMES_TRIGGER_LABELS)
 
 
 def _missing_labels(labels: list[str], current: set[str]) -> list[str]:
