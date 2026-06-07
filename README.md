@@ -217,5 +217,3 @@ If no eligible issue is found, `task_dispatch_error` is `No queued agent-ready i
 Deploy behind HTTPS. Configure the GitHub webhook secret in the hosting secret manager. Point GitHub webhooks at `POST /webhooks/github`. Keep GitHub App credentials, OpenAI credentials, and Slack credentials in managed secrets only.
 
 For the MVP, enabled GitHub writeback and task dispatch may only comment on issues/PRs or apply labels. Slack dispatch may only post notifications. Human review remains required for merges.
-
-Smoke test validation line for issue #57.
