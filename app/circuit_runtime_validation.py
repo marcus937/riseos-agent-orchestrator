@@ -2,23 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import socket
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Callable, Literal, Protocol
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
+from app.circuit_hermes_adapter import CircuitHermesClient, canonical_job_id, format_optional_bool, redact_runtime_text
 from app.config import Settings
-from app.hermes_dispatch import (
-    HermesDispatchResult,
-    HermesEvidenceSnapshot,
-    HermesHTTPClient,
-    _canonical_hermes_job_id,
-    _collect_hermes_evidence,
-    _format_optional_bool,
-    _redact_sensitive_text,
-)
+from app.hermes_dispatch import HermesDispatchResult, HermesEvidenceSnapshot
 
 RuntimeValidationStatus = Literal["blocked", "completed", "failed", "pending"]
 
@@ -89,9 +83,24 @@ class RuntimeValidationResult(BaseModel):
     error: str | None = None
 
 
+class RuntimeHermesClient(Protocol):
+    async def post_runtime_validation(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def collect_evidence(
+        self,
+        base_url: str,
+        token: str,
+        job_id: str,
+        settings: Settings,
+    ) -> HermesEvidenceSnapshot | None: ...
+
+    async def aclose(self) -> None: ...
+
+
 class RuntimeValidationStore:
-    def __init__(self) -> None:
+    def __init__(self, hermes_client_factory: Callable[[], RuntimeHermesClient] = CircuitHermesClient) -> None:
         self._items: dict[str, RuntimeValidationResult] = {}
+        self._hermes_client_factory = hermes_client_factory
 
     def get(self, validation_id: str) -> RuntimeValidationResult | None:
         return self._items.get(validation_id)
@@ -101,7 +110,7 @@ class RuntimeValidationStore:
         correlation_id = request.correlation_id or f"runtime-validation-{validation_id[:8]}"
         target_url = request.target_url or settings.hermes_default_target
         created_at = datetime.now(UTC)
-        blocked = _target_url_blocker(target_url)
+        blocked = _target_url_blocker(target_url, settings)
         if blocked is None:
             blocked = _hermes_config_blocker(settings)
         if blocked is not None:
@@ -142,17 +151,16 @@ class RuntimeValidationStore:
         )
         self._items[validation_id] = result
 
-        hermes_client = HermesHTTPClient()
+        hermes_client = self._hermes_client_factory()
         try:
-            response = await hermes_client.post_job(
+            response = await hermes_client.post_runtime_validation(
                 settings.hermes_m2_base_url or "",
                 settings.hermes_m2_token or "",
                 _build_runtime_payload(request, target_url, correlation_id, settings),
             )
             dispatch = _dispatch_result_from_response(response, target_url=target_url, correlation_id=correlation_id, settings=settings)
             if dispatch.job_id and dispatch.status in {"PASSED", "FAILED"}:
-                dispatch.evidence = await _collect_hermes_evidence(
-                    hermes_client,
+                dispatch.evidence = await hermes_client.collect_evidence(
                     settings.hermes_m2_base_url or "",
                     settings.hermes_m2_token or "",
                     dispatch.job_id,
@@ -185,21 +193,62 @@ def _hermes_config_blocker(settings: Settings) -> str | None:
     return None
 
 
-def _target_url_blocker(target_url: str | None) -> str | None:
+def _target_url_blocker(target_url: str | None, settings: Settings) -> str | None:
     if not target_url:
         return "target_url is required."
     parsed = urlparse(target_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return "target_url must be an http or https URL."
+    if parsed.username or parsed.password:
+        return "target_url must not include embedded credentials."
     host = (parsed.hostname or "").lower()
+    if not _host_allowed(host, settings):
+        return "target_url host must be a trusted Vercel preview host or the configured Hermes default target host."
     if host in {"localhost", "127.0.0.1", "0.0.0.0"} or host.endswith(".local"):
         return "target_url must not point at localhost or a local-only host."
+    literal_error = _ip_address_blocker(host)
+    if literal_error is not None:
+        return literal_error
+    return _dns_resolution_blocker(host)
+
+
+def _host_allowed(host: str, settings: Settings) -> bool:
+    if _is_vercel_preview_host(host):
+        return True
+    default_host = (urlparse(settings.hermes_default_target).hostname or "").lower()
+    return bool(default_host and host == default_host)
+
+
+def _ip_address_blocker(host: str) -> str | None:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         return None
+    return _unsafe_address_error(address)
+
+
+def _dns_resolution_blocker(host: str) -> str | None:
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return f"target_url host could not be resolved safely: {exc}"
+    addresses = {info[4][0] for info in infos if info and len(info) >= 5 and info[4]}
+    if not addresses:
+        return "target_url host did not resolve to an IP address."
+    for raw_address in addresses:
+        try:
+            address = ipaddress.ip_address(raw_address)
+        except ValueError:
+            return f"target_url host resolved to an invalid IP address: {raw_address}"
+        error = _unsafe_address_error(address)
+        if error is not None:
+            return error
+    return None
+
+
+def _unsafe_address_error(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
     if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_multicast:
-        return "target_url must not point at a private, loopback, link-local, reserved, or multicast address."
+        return "target_url must not resolve to a private, loopback, link-local, reserved, or multicast address."
     return None
 
 
@@ -265,7 +314,7 @@ def _dispatch_result_from_response(
         correlation_id=correlation_id,
         target_url=_safe_text(target_url, settings),
         target_source="runtime_validation_api",
-        job_id=_canonical_hermes_job_id(response),
+        job_id=canonical_job_id(response),
         error=_safe_text(str(response.get("error")), settings) if response.get("error") else None,
     )
 
@@ -381,13 +430,17 @@ def _safe_text(value: Any, settings: Settings) -> str | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        return _format_optional_bool(value)
-    redacted = _redact_sensitive_text(str(value), settings) or ""
+        return format_optional_bool(value)
+    redacted = redact_runtime_text(str(value), settings) or ""
     return redacted if len(redacted) <= 500 else redacted[:497] + "..."
 
 
 def _is_vercel_preview_url(target_url: str) -> bool:
     host = (urlparse(target_url).hostname or "").lower()
+    return _is_vercel_preview_host(host)
+
+
+def _is_vercel_preview_host(host: str) -> bool:
     return host == "vercel.app" or host.endswith(".vercel.app")
 
 
