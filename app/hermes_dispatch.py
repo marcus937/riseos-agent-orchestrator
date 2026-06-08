@@ -72,11 +72,13 @@ async def _collect_hermes_evidence(
     return snapshot
 
 
-def _evidence_slack_status(result: _impl.HermesDispatchResult) -> str:
+def _evidence_slack_status(result: _impl.HermesDispatchResult) -> str | None:
     if result.evidence and result.evidence.manifest_fetched:
         identifier = result.job_id or result.evidence.job_id
         return f"manifest fetched ({identifier}/manifest.json)" if identifier else "manifest fetched"
-    return "manifest unavailable"
+    if result.evidence is None:
+        return None
+    return "manifest not fetched"
 
 
 def build_hermes_slack_message(
@@ -94,7 +96,9 @@ def build_hermes_slack_message(
         return f"Hermes validation blocked\nReason: {reason}\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nNode: {result.hermes_node}\nCorrelation ID: {_impl._sanitize_slack_text(result.correlation_id or 'unknown')}"
     if result.status in {"PASSED", "FAILED"}:
         evidence_status = _evidence_slack_status(result)
-        return f"Hermes validation complete\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nStatus: {result.status}\nJob ID: {_impl._sanitize_slack_text(result.job_id or 'unknown')}\nEvidence: {evidence_status}; {', '.join(_impl.EVIDENCE_FILES)}"
+        evidence_files = ", ".join(_impl.EVIDENCE_FILES)
+        evidence_line = f"{evidence_status}; {evidence_files}" if evidence_status else evidence_files
+        return f"Hermes validation complete\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nStatus: {result.status}\nJob ID: {_impl._sanitize_slack_text(result.job_id or 'unknown')}\nEvidence: {evidence_line}"
     return f"Hermes validation requested\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nLabels: {labels}\nNode: {result.hermes_node}\nCorrelation ID: {_impl._sanitize_slack_text(result.correlation_id or 'unknown')}"
 
 
