@@ -17,6 +17,7 @@ ARTIFACT_SECRET_PATTERNS = (
     re.compile(r"(?i)((?:password|passwd|pwd|secret|client[_-]?secret)\s*[:=]\s*['\"]?)([^'\"\s,;}]+)"),
     re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token)\s*[:=]\s*['\"]?)([^'\"\s,;}]+)"),
 )
+LEFTOVER_BEARER_PATTERN = re.compile(r"(?i)((?:bearer|authorization:\s*\[REDACTED\])\s+)([^'\"\s,;}]+)")
 
 
 def _canonical_hermes_job_id(response: dict[str, Any]) -> str | None:
@@ -320,8 +321,8 @@ def _populate_evidence_from_artifact_jsons(snapshot: _impl.HermesEvidenceSnapsho
     console_sources = [console, logs, summary, snapshot.manifest]
     snapshot.console_warning_count = _coalesce_int(snapshot.console_warning_count, _first_deep_int(console_sources, ("consoleWarningCount", "console_warning_count", "warningCount", "warnings")), _count_console_entries(console, {"warning", "warn"}), _count_console_entries(logs, {"warning", "warn"}))
     snapshot.console_error_count = _coalesce_int(snapshot.console_error_count, _first_deep_int(console_sources, ("consoleErrorCount", "console_error_count", "errorCount", "errors")), _count_console_entries(console, {"error"}), _count_console_entries(logs, {"error"}))
-    _set_extra(snapshot, "console_info_count", _coalesce_int(_get_extra(snapshot, "console_info_count"), _first_deep_int(console_sources, ("consoleInfoCount", "console_info_count", "infoCount", "infos")), _count_console_entries(console, {"info"}), _count_console_entries(logs, {"info"})))
-    _set_extra(snapshot, "console_log_count", _coalesce_int(_get_extra(snapshot, "console_log_count"), _first_deep_int(console_sources, ("consoleLogCount", "console_log_count", "logCount", "logs")), _count_console_entries(console, {"log"}), _count_console_entries(logs, {"log"})))
+    _set_extra(snapshot, "console_info_count", _coalesce_int(_get_extra(snapshot, "console_info_count"), _first_deep_int(console_sources, ("consoleInfoCount", "console_info_count", "infoCount", "infos")), _sum_optional_int(_count_console_entries(console, {"info"}), _count_console_entries(logs, {"info"}))))
+    _set_extra(snapshot, "console_log_count", _coalesce_int(_get_extra(snapshot, "console_log_count"), _first_deep_int(console_sources, ("consoleLogCount", "console_log_count", "logCount", "logs")), _sum_optional_int(_count_console_entries(console, {"log"}), _count_console_entries(logs, {"log"}))))
     _set_extra(snapshot, "console_warning_excerpts", _console_excerpts([console, logs], {"warning", "warn"}))
     _set_extra(snapshot, "console_error_excerpts", _console_excerpts([console, logs], {"error"}))
 
@@ -364,6 +365,11 @@ def _coalesce_int(*values: int | None) -> int | None:
         if value is not None:
             return value
     return None
+
+
+def _sum_optional_int(*values: int | None) -> int | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
 
 
 def _count_console_entries(value: Any, levels: set[str]) -> int | None:
@@ -473,6 +479,7 @@ def _redact_artifact_text(value: str | None, settings: _impl.Settings) -> str | 
     if value is None:
         return None
     redacted = _impl._redact_sensitive_text(str(value), settings) or ""
+    redacted = LEFTOVER_BEARER_PATTERN.sub(lambda match: f"{match.group(1)}{_impl.SECRET_REDACTION}", redacted)
     for pattern in ARTIFACT_SECRET_PATTERNS:
         redacted = pattern.sub(lambda match: f"{match.group(1)}{_impl.SECRET_REDACTION}", redacted)
     return redacted
@@ -544,13 +551,19 @@ def _build_evidence_packet_section(result: _impl.HermesDispatchResult, settings:
     artifacts = evidence.artifacts or [_impl.HermesEvidenceArtifact(file_name=item) for item in _impl.EVIDENCE_FILES]
     for artifact in artifacts:
         retrieval = _retrieval_reference(evidence.job_id, artifact.file_name)
-        lines.append("| " + " | ".join([
-            _safe_md_cell(artifact.file_name, settings),
-            _safe_md_cell(artifact.content_type, settings),
-            _safe_md_cell(_impl._format_optional_int(artifact.size), settings),
-            _safe_md_cell(artifact.sha256, settings),
-            _safe_md_cell(retrieval, settings),
-        ]) + " |")
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _safe_md_cell(artifact.file_name, settings),
+                    _safe_md_cell(artifact.content_type, settings),
+                    _safe_md_cell(_impl._format_optional_int(artifact.size), settings),
+                    _safe_md_cell(artifact.sha256, settings),
+                    _safe_md_cell(retrieval, settings),
+                ]
+            )
+            + " |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -580,11 +593,40 @@ def build_hermes_slack_message(parsed: _impl.ParsedGitHubEvent, result: _impl.He
     return f"Hermes validation requested\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nLabels: {labels}\nNode: {result.hermes_node}\nCorrelation ID: {_impl._sanitize_slack_text(result.correlation_id or 'unknown')}"
 
 
+_ORIGINAL_NOTIFY_AND_WRITEBACK = _impl._notify_and_writeback
+
+
+def _sanitize_result_outputs(result: _impl.HermesDispatchResult, settings: _impl.Settings) -> _impl.HermesDispatchResult:
+    for field_name in ("dispatch_key", "target_url", "preview_url", "skipped_reason", "error", "message", "comment"):
+        value = getattr(result, field_name, None)
+        if isinstance(value, str):
+            setattr(result, field_name, _redact_artifact_text(value, settings))
+    return result
+
+
+async def _notify_and_writeback(
+    parsed: _impl.ParsedGitHubEvent,
+    settings: _impl.Settings,
+    result: _impl.HermesDispatchResult,
+    *,
+    slack_client: _impl.SlackIssueDispatchClient | None,
+    github_client: _impl.HermesWritebackClient | None,
+) -> _impl.HermesDispatchResult:
+    return await _ORIGINAL_NOTIFY_AND_WRITEBACK(
+        parsed,
+        settings,
+        _sanitize_result_outputs(result, settings),
+        slack_client=slack_client,
+        github_client=github_client,
+    )
+
+
 _impl.HermesHTTPClient = HermesHTTPClient
 _impl._result_from_hermes_response = _result_from_hermes_response
 _impl._collect_hermes_evidence = _collect_hermes_evidence
 _impl._build_evidence_packet_section = _build_evidence_packet_section
 _impl.build_hermes_slack_message = build_hermes_slack_message
+_impl._notify_and_writeback = _notify_and_writeback
 
 for _name in dir(_impl):
     if not _name.startswith("__"):
