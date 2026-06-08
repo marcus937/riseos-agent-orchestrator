@@ -21,12 +21,19 @@ class FakeGitHubClient:
 
 
 class FakeHermesEvidenceClient:
-    def __init__(self, *, response: dict[str, Any] | None = None, manifest_error: Exception | None = None, bundle_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        response: dict[str, Any] | None = None,
+        manifest_error: Exception | None = None,
+        bundle_error: Exception | None = None,
+    ) -> None:
         self.response = response if response is not None else {"status": "PASSED", "jobId": "job-123"}
         self.manifest_error = manifest_error
         self.bundle_error = bundle_error
         self.jobs: list[tuple[str, str, dict[str, Any]]] = []
         self.manifest_calls: list[tuple[str, str, str]] = []
+        self.file_calls: list[tuple[str, str, str, str]] = []
         self.bundle_calls: list[tuple[str, str, str]] = []
 
     async def post_job(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +44,19 @@ class FakeHermesEvidenceClient:
         self.manifest_calls.append((base_url, token, job_id))
         if self.manifest_error:
             raise self.manifest_error
+        return self._manifest_payload()
+
+    async def get_evidence_file(self, base_url: str, token: str, job_id: str, file_name: str) -> dict[str, Any]:
+        self.file_calls.append((base_url, token, job_id, file_name))
+        raise RuntimeError(f"{file_name} unavailable")
+
+    async def get_evidence_bundle(self, base_url: str, token: str, job_id: str) -> dict[str, Any]:
+        self.bundle_calls.append((base_url, token, job_id))
+        if self.bundle_error:
+            raise self.bundle_error
+        return {"content_type": "application/zip", "size": 4096}
+
+    def _manifest_payload(self) -> dict[str, Any]:
         return {
             "page": {"title": "Runtime Proof", "finalUrl": "https://preview.vercel.app/final", "httpStatus": 200},
             "console": {"warningCount": 2, "errorCount": 1},
@@ -46,12 +66,6 @@ class FakeHermesEvidenceClient:
                 {"fileName": "screenshot.png", "contentType": "image/png", "size": 2048, "sha256": "def456"},
             ],
         }
-
-    async def get_evidence_bundle(self, base_url: str, token: str, job_id: str) -> dict[str, Any]:
-        self.bundle_calls.append((base_url, token, job_id))
-        if self.bundle_error:
-            raise self.bundle_error
-        return {"content_type": "application/zip", "size": 4096}
 
 
 def run(coro: Any) -> Any:
@@ -97,6 +111,7 @@ def test_successful_manifest_and_bundle_fetch_are_written_to_github_packet() -> 
     assert result.evidence.manifest_fetched is True
     assert result.evidence.bundle_fetched is True
     assert hermes.manifest_calls == [("http://100.70.83.13:8787", "secret-token", "job-123")]
+    assert hermes.file_calls == []
     assert hermes.bundle_calls == [("http://100.70.83.13:8787", "secret-token", "job-123")]
     assert "Page title: Runtime Proof" in comment
     assert "Final URL: https://preview.vercel.app/final" in comment
@@ -105,6 +120,39 @@ def test_successful_manifest_and_bundle_fetch_are_written_to_github_packet() -> 
     assert "Console warning count: 2" in comment
     assert "Network non-2xx count: 4" in comment
     assert "| screenshot.png | image/png | 2048 | def456 | GET /api/v1/evidence/job-123/files/screenshot.png |" in comment
+
+
+def test_nested_job_id_fetches_canonical_manifest_and_bundle() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesEvidenceClient(response={"status": "PASSED", "job": {"id": "job-nested-123"}})
+
+    result = run(dispatch_hermes_runtime_validation(parsed, settings(), github_client=github, hermes_client=hermes, registry=InMemoryHermesDispatchRegistry()))
+
+    assert result.job_id == "job-nested-123"
+    assert result.evidence is not None
+    assert result.evidence.manifest_fetched is True
+    assert hermes.manifest_calls == [("http://100.70.83.13:8787", "secret-token", "job-nested-123")]
+    assert hermes.file_calls == []
+    assert hermes.bundle_calls == [("http://100.70.83.13:8787", "secret-token", "job-nested-123")]
+    assert "Job ID: job-nested-123" in github.comments[0][2]
+
+
+def test_manifest_endpoint_failure_does_not_fall_back_to_manifest_file() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesEvidenceClient(manifest_error=RuntimeError("manifest endpoint unavailable"))
+
+    result = run(dispatch_hermes_runtime_validation(parsed, settings(), github_client=github, hermes_client=hermes, registry=InMemoryHermesDispatchRegistry()))
+
+    comment = github.comments[0][2]
+    assert result.evidence is not None
+    assert result.evidence.manifest_fetched is False
+    assert result.evidence.bundle_fetched is True
+    assert hermes.manifest_calls == [("http://100.70.83.13:8787", "secret-token", "job-123")]
+    assert hermes.file_calls == []
+    assert "Evidence manifest could not be fetched from Hermes." not in comment
+    assert "manifest endpoint unavailable" in comment
 
 
 def test_missing_job_id_keeps_existing_writeback_without_evidence_fetch() -> None:
@@ -117,6 +165,7 @@ def test_missing_job_id_keeps_existing_writeback_without_evidence_fetch() -> Non
     assert result.job_id is None
     assert result.evidence is None
     assert hermes.manifest_calls == []
+    assert hermes.file_calls == []
     assert hermes.bundle_calls == []
     assert "Job ID: not-created" in github.comments[0][2]
 
