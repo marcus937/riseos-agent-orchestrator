@@ -1,4 +1,7 @@
 import asyncio
+import io
+import json
+import zipfile
 from typing import Any
 
 from app.config import Settings
@@ -25,10 +28,14 @@ class FakeHermesEvidenceClient:
         self,
         *,
         response: dict[str, Any] | None = None,
+        manifest_payload: dict[str, Any] | None = None,
+        bundle_content: bytes | None = None,
         manifest_error: Exception | None = None,
         bundle_error: Exception | None = None,
     ) -> None:
         self.response = response if response is not None else {"status": "PASSED", "jobId": "job-123"}
+        self.manifest_payload = manifest_payload
+        self.bundle_content = bundle_content
         self.manifest_error = manifest_error
         self.bundle_error = bundle_error
         self.jobs: list[tuple[str, str, dict[str, Any]]] = []
@@ -44,7 +51,7 @@ class FakeHermesEvidenceClient:
         self.manifest_calls.append((base_url, token, job_id))
         if self.manifest_error:
             raise self.manifest_error
-        return self._manifest_payload()
+        return self.manifest_payload if self.manifest_payload is not None else self._manifest_payload()
 
     async def get_evidence_file(self, base_url: str, token: str, job_id: str, file_name: str) -> dict[str, Any]:
         self.file_calls.append((base_url, token, job_id, file_name))
@@ -54,7 +61,11 @@ class FakeHermesEvidenceClient:
         self.bundle_calls.append((base_url, token, job_id))
         if self.bundle_error:
             raise self.bundle_error
-        return {"content_type": "application/zip", "size": 4096}
+        bundle = {"content_type": "application/zip", "size": 4096}
+        if self.bundle_content is not None:
+            bundle["content"] = self.bundle_content
+            bundle["size"] = len(self.bundle_content)
+        return bundle
 
     def _manifest_payload(self) -> dict[str, Any]:
         return {
@@ -99,6 +110,15 @@ def pr_payload() -> dict[str, Any]:
     }
 
 
+def zip_bundle(files: dict[str, Any]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for file_name, payload in files.items():
+            content = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+            archive.writestr(file_name, content)
+    return buffer.getvalue()
+
+
 def test_successful_manifest_and_bundle_fetch_are_written_to_github_packet() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     github = FakeGitHubClient()
@@ -120,6 +140,59 @@ def test_successful_manifest_and_bundle_fetch_are_written_to_github_packet() -> 
     assert "Console warning count: 2" in comment
     assert "Network non-2xx count: 4" in comment
     assert "| screenshot.png | image/png | 2048 | def456 | GET /api/v1/evidence/job-123/files/screenshot.png |" in comment
+
+
+def test_bundle_artifact_jsons_hydrate_unknown_manifest_metrics() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesEvidenceClient(
+        manifest_payload={"artifacts": ["summary.json", "page.json", "console.json", "network.json", "screenshot.png"]},
+        bundle_content=zip_bundle(
+            {
+                "artifacts/summary.json": {"status": "passed"},
+                "artifacts/page.json": {
+                    "title": "Jarvis Mission Control",
+                    "finalUrl": "https://riseos-preview.vercel.app/dashboard",
+                    "httpStatus": 200,
+                },
+                "artifacts/console.json": {
+                    "messages": [
+                        {"level": "warning", "text": "hydration warning"},
+                        {"level": "error", "text": "hydration error"},
+                    ]
+                },
+                "artifacts/network.json": {
+                    "requests": [
+                        {"url": "https://riseos-preview.vercel.app", "status": 200},
+                        {"url": "https://api.test/fail", "status": 503},
+                        {"url": "https://api.test/error", "error": "ECONNRESET"},
+                    ]
+                },
+                "artifacts/screenshot.png": b"png-bytes",
+            }
+        ),
+    )
+
+    result = run(dispatch_hermes_runtime_validation(parsed, settings(), github_client=github, hermes_client=hermes, registry=InMemoryHermesDispatchRegistry()))
+
+    comment = github.comments[0][2]
+    assert result.evidence is not None
+    assert result.evidence.page_title == "Jarvis Mission Control"
+    assert result.evidence.final_url == "https://riseos-preview.vercel.app/dashboard"
+    assert result.evidence.http_status == 200
+    assert result.evidence.console_warning_count == 1
+    assert result.evidence.console_error_count == 1
+    assert result.evidence.network_failure_count == 1
+    assert result.evidence.network_non_2xx_count == 1
+    assert result.evidence.screenshot_present is True
+    assert "Page title: Jarvis Mission Control" in comment
+    assert "Final URL: https://riseos-preview.vercel.app/dashboard" in comment
+    assert "HTTP status: 200" in comment
+    assert "Console warning count: 1" in comment
+    assert "Console error count: 1" in comment
+    assert "Network failure count: 1" in comment
+    assert "Network non-2xx count: 1" in comment
+    assert "Screenshot presence: yes" in comment
 
 
 def test_nested_job_id_fetches_canonical_manifest_and_bundle() -> None:
