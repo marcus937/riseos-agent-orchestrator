@@ -1,6 +1,31 @@
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
+
+
+def _install_runtime_validation_route_patch() -> None:
+    try:
+        from fastapi import FastAPI
+    except ImportError:
+        return
+
+    if getattr(FastAPI, "_circuit_runtime_validation_patch_installed", False):
+        return
+
+    original_init = FastAPI.__init__
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
+
+        register_circuit_runtime_validation_routes(self)
+
+    FastAPI.__init__ = patched_init
+    FastAPI._circuit_runtime_validation_patch_installed = True
+
+
+_install_runtime_validation_route_patch()
 
 
 @dataclass(frozen=True, slots=True)
