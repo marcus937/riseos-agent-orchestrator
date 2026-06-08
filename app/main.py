@@ -224,6 +224,9 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     patch_truncated = False
     github_context_available = False
     github_context_error: str | None = None
+    runtime_evidence_context: list[dict[str, object]] = []
+    runtime_evidence_error: str | None = None
+    runtime_evidence_truncated = False
 
     if not settings.enable_github_context_hydration:
         pass
@@ -248,6 +251,9 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         patch_truncated = github_context.patch_truncated
         github_context_available = github_context.github_context_available
         github_context_error = github_context.github_context_error
+        runtime_evidence_context = github_context.runtime_evidence_context
+        runtime_evidence_error = github_context.runtime_evidence_error
+        runtime_evidence_truncated = github_context.runtime_evidence_truncated
 
     if settings.enable_openai_review:
         log_openai_review_attempted(reviewer_model=settings.openai_review_model)
@@ -261,6 +267,9 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         patch_truncated=patch_truncated,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
+        runtime_evidence_context=runtime_evidence_context,
+        runtime_evidence_error=runtime_evidence_error,
+        runtime_evidence_truncated=runtime_evidence_truncated,
     )
     log_openai_review_result(
         attempted=openai_review.attempted,
@@ -284,6 +293,9 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         patch_truncated=patch_truncated,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
+        runtime_evidence_context=runtime_evidence_context,
+        runtime_evidence_error=runtime_evidence_error,
+        runtime_evidence_truncated=runtime_evidence_truncated,
         openai_review_attempted=openai_review.attempted,
         openai_review_success=openai_review.success,
         openai_review_error=openai_review.error,
