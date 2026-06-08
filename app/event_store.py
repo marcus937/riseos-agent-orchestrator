@@ -21,6 +21,7 @@ class EventRecord(BaseModel):
     commit_sha: str | None = None
     issue_number: int | None = None
     pr_number: int | None = None
+    pr_merged: bool | None = None
     received_at: datetime
     raw_action: str | None = None
 
@@ -112,6 +113,7 @@ def event_record_from_parsed(parsed: ParsedGitHubEvent, *, event_id: str | None 
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
+        pr_merged=parsed.pull_request_merged,
         received_at=datetime.now(UTC),
         raw_action=parsed.action,
     )
