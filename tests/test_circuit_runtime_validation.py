@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.circuit_runtime_validation import runtime_validation_store
+from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
 from app.main import app
@@ -85,9 +86,13 @@ def _request(target_url: str = "https://jarvis-mission-control-gules.vercel.app"
     }
 
 
-def test_runtime_validation_routes_are_registered_explicitly() -> None:
+def test_runtime_validation_routes_are_registered_explicitly_and_idempotently() -> None:
+    route_count = len(app.routes)
+    register_circuit_runtime_validation_routes(app)
+    register_circuit_runtime_validation_routes(app)
     route_paths = {getattr(route, "path", None) for route in app.routes}
 
+    assert len(app.routes) == route_count
     assert not hasattr(FastAPI, "_circuit_runtime_validation_patch_installed")
     assert "/api/v1/runtime-validations" in route_paths
     assert "/api/v1/runtime-validations/{validation_id}" in route_paths
