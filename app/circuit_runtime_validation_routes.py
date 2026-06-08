@@ -14,7 +14,6 @@ from app.circuit_runtime_validation import (
     runtime_validation_store,
 )
 from app.config import Settings, get_settings
-from app.workflow_routes import register_workflow_routes
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
 
@@ -82,4 +81,3 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
         return
     app.include_router(router)
     app.state.circuit_runtime_validation_routes_registered = True
-    register_workflow_routes(app)
