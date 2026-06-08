@@ -30,12 +30,14 @@ class FakeHermesEvidenceClient:
         response: dict[str, Any] | None = None,
         manifest_payload: dict[str, Any] | None = None,
         bundle_content: bytes | None = None,
+        file_payloads: dict[str, Any] | None = None,
         manifest_error: Exception | None = None,
         bundle_error: Exception | None = None,
     ) -> None:
         self.response = response if response is not None else {"status": "PASSED", "jobId": "job-123"}
         self.manifest_payload = manifest_payload
         self.bundle_content = bundle_content
+        self.file_payloads = file_payloads if file_payloads is not None else self._file_payloads()
         self.manifest_error = manifest_error
         self.bundle_error = bundle_error
         self.jobs: list[tuple[str, str, dict[str, Any]]] = []
@@ -55,7 +57,10 @@ class FakeHermesEvidenceClient:
 
     async def get_evidence_file(self, base_url: str, token: str, job_id: str, file_name: str) -> dict[str, Any]:
         self.file_calls.append((base_url, token, job_id, file_name))
-        raise RuntimeError(f"{file_name} unavailable")
+        if file_name not in self.file_payloads:
+            raise RuntimeError(f"{file_name} unavailable")
+        content = json.dumps(self.file_payloads[file_name]).encode("utf-8")
+        return {"content_type": "application/json", "size": len(content), "content": content}
 
     async def get_evidence_bundle(self, base_url: str, token: str, job_id: str) -> dict[str, Any]:
         self.bundle_calls.append((base_url, token, job_id))
@@ -76,6 +81,15 @@ class FakeHermesEvidenceClient:
                 {"fileName": "page.json", "contentType": "application/json", "size": 128, "sha256": "abc123"},
                 {"fileName": "screenshot.png", "contentType": "image/png", "size": 2048, "sha256": "def456"},
             ],
+        }
+
+    def _file_payloads(self) -> dict[str, Any]:
+        return {
+            "summary.json": {"status": "passed"},
+            "page.json": {"title": "Runtime Proof", "finalUrl": "https://preview.vercel.app/final", "httpStatus": 200},
+            "console.json": {"messages": [{"level": "warning", "text": "runtime warning"}, {"level": "error", "text": "runtime error"}]},
+            "network.json": {"requests": [{"url": "https://preview.vercel.app", "status": 200}]},
+            "logs.json": {"messages": [{"level": "info", "text": "runtime info"}, {"level": "log", "text": "runtime log"}]},
         }
 
 
@@ -119,7 +133,7 @@ def zip_bundle(files: dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
-def test_successful_manifest_and_bundle_fetch_are_written_to_github_packet() -> None:
+def test_successful_manifest_bundle_and_file_fetch_are_written_to_github_packet() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     github = FakeGitHubClient()
     hermes = FakeHermesEvidenceClient()
@@ -131,13 +145,14 @@ def test_successful_manifest_and_bundle_fetch_are_written_to_github_packet() -> 
     assert result.evidence.manifest_fetched is True
     assert result.evidence.bundle_fetched is True
     assert hermes.manifest_calls == [("http://100.70.83.13:8787", "secret-token", "job-123")]
-    assert hermes.file_calls == []
+    assert {call[3] for call in hermes.file_calls} == {"summary.json", "page.json", "console.json", "network.json", "logs.json"}
     assert hermes.bundle_calls == [("http://100.70.83.13:8787", "secret-token", "job-123")]
     assert "Page title: Runtime Proof" in comment
     assert "Final URL: https://preview.vercel.app/final" in comment
     assert "HTTP status: 200" in comment
     assert "Screenshot presence: yes" in comment
     assert "Console warning count: 2" in comment
+    assert "Console info count: 1" in comment
     assert "Network non-2xx count: 4" in comment
     assert "| screenshot.png | image/png | 2048 | def456 | GET /api/v1/evidence/job-123/files/screenshot.png |" in comment
 
@@ -154,6 +169,9 @@ def test_bundle_artifact_jsons_hydrate_unknown_manifest_metrics() -> None:
                     "title": "Jarvis Mission Control",
                     "finalUrl": "https://riseos-preview.vercel.app/dashboard",
                     "httpStatus": 200,
+                    "viewport": {"width": 1440, "height": 900},
+                    "userAgent": "Playwright Chromium",
+                    "loadDurationMs": 1234,
                 },
                 "artifacts/console.json": {
                     "messages": [
@@ -185,14 +203,54 @@ def test_bundle_artifact_jsons_hydrate_unknown_manifest_metrics() -> None:
     assert result.evidence.network_failure_count == 1
     assert result.evidence.network_non_2xx_count == 1
     assert result.evidence.screenshot_present is True
+    assert {call[3] for call in hermes.file_calls} == {"logs.json"}
     assert "Page title: Jarvis Mission Control" in comment
     assert "Final URL: https://riseos-preview.vercel.app/dashboard" in comment
     assert "HTTP status: 200" in comment
+    assert "Viewport: 1440x900" in comment
+    assert "User agent: Playwright Chromium" in comment
+    assert "Load duration: 1234" in comment
     assert "Console warning count: 1" in comment
     assert "Console error count: 1" in comment
+    assert "Console warning excerpts: hydration warning" in comment
+    assert "Network request count: 3" in comment
     assert "Network failure count: 1" in comment
     assert "Network non-2xx count: 1" in comment
+    assert "Network failed requests: https://api.test/error ECONNRESET" in comment
     assert "Screenshot presence: yes" in comment
+
+
+def test_raw_artifact_file_bodies_hydrate_when_manifest_has_only_inventory() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    github = FakeGitHubClient()
+    hermes = FakeHermesEvidenceClient(
+        manifest_payload={"artifacts": ["summary.json", "page.json", "console.json", "network.json", "logs.json"]},
+        file_payloads={
+            "summary.json": {"targetUrl": "https://jmc-preview.vercel.app"},
+            "page.json": {"pageTitle": "Jarvis Mission Control", "final_url": "https://jmc-preview.vercel.app/", "status": 200},
+            "console.json": {"entries": [{"type": "warn", "message": "minor warning"}, {"type": "error", "message": "real error"}]},
+            "network.json": {"entries": [{"url": "https://jmc-preview.vercel.app", "statusCode": 200}, {"url": "https://api.example.test", "statusCode": 404}]},
+            "logs.json": {"entries": [{"level": "info", "message": "loaded"}]},
+        },
+    )
+
+    result = run(dispatch_hermes_runtime_validation(parsed, settings(), github_client=github, hermes_client=hermes, registry=InMemoryHermesDispatchRegistry()))
+
+    comment = github.comments[0][2]
+    assert result.evidence is not None
+    assert result.evidence.page_title == "Jarvis Mission Control"
+    assert result.evidence.final_url == "https://jmc-preview.vercel.app/"
+    assert result.evidence.http_status == 200
+    assert result.evidence.console_warning_count == 1
+    assert result.evidence.console_error_count == 1
+    assert result.evidence.network_non_2xx_count == 1
+    assert {call[3] for call in hermes.file_calls} == {"summary.json", "page.json", "console.json", "network.json", "logs.json"}
+    assert "Page title: Jarvis Mission Control" in comment
+    assert "Final URL: https://jmc-preview.vercel.app/" in comment
+    assert "HTTP status: 200" in comment
+    assert "Console warning excerpts: minor warning" in comment
+    assert "Console error excerpts: real error" in comment
+    assert "Network non-2xx requests: https://api.example.test status=404" in comment
 
 
 def test_nested_job_id_fetches_canonical_manifest_and_bundle() -> None:
@@ -206,7 +264,7 @@ def test_nested_job_id_fetches_canonical_manifest_and_bundle() -> None:
     assert result.evidence is not None
     assert result.evidence.manifest_fetched is True
     assert hermes.manifest_calls == [("http://100.70.83.13:8787", "secret-token", "job-nested-123")]
-    assert hermes.file_calls == []
+    assert {call[3] for call in hermes.file_calls} == {"summary.json", "page.json", "console.json", "network.json", "logs.json"}
     assert hermes.bundle_calls == [("http://100.70.83.13:8787", "secret-token", "job-nested-123")]
     assert "Job ID: job-nested-123" in github.comments[0][2]
 
@@ -223,7 +281,7 @@ def test_manifest_endpoint_failure_does_not_fall_back_to_manifest_file() -> None
     assert result.evidence.manifest_fetched is False
     assert result.evidence.bundle_fetched is True
     assert hermes.manifest_calls == [("http://100.70.83.13:8787", "secret-token", "job-123")]
-    assert hermes.file_calls == []
+    assert {call[3] for call in hermes.file_calls} == {"summary.json", "page.json", "console.json", "network.json", "logs.json"}
     assert "Evidence manifest could not be fetched from Hermes." not in comment
     assert "manifest endpoint unavailable" in comment
 
