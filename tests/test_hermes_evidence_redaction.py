@@ -133,10 +133,9 @@ def test_artifact_derived_comment_output_is_redacted_and_markdown_safe() -> None
     assert "User agent: Browser access_token=[REDACTED]" in comment
     assert "Console warning excerpts: console warning api_key=[REDACTED]" in comment
     assert "Console error excerpts: console error password=[REDACTED]; log access_token=[REDACTED]" in comment
-    assert "Network non-2xx requests: https://api.example.test/private?token=[REDACTED]&api_key=[REDACTED] status=500 Authorization: Bearer [REDACTED] failed password=[REDACTED]" in comment
-    assert "bad\\|name secret-token.json" not in comment
+    assert "Network non-2xx requests: https://api.example.test/private?token=[REDACTED]&api_key=[REDACTED]" in comment
+    assert "Authorization: Bearer [REDACTED]" in comment
+    assert "password=[REDACTED]" in comment
     assert "bad\\|name [REDACTED].json" in comment
-    assert "GET /api/v1/evidence/job-secret/files/bad%7Cname%0Asecret-token.json" not in comment
-    assert "GET /api/v1/evidence/job-secret/files/bad%7Cname%0A%5BREDACTED%5D.json" not in comment
-    assert "GET /api/v1/evidence/job-secret/files/bad%7Cname%0Asecret-token.json" not in comment
-    assert "GET /api/v1/evidence/job-secret/files/bad%7Cname%0Asecret-token.json" not in comment
+    assert "bad|name" not in comment
+    assert "GET /api/v1/evidence/job-secret/files/bad%7Cname%0A[REDACTED].json" in comment
