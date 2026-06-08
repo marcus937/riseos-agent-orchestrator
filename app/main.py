@@ -4,6 +4,7 @@ from typing import Annotated, Any
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
+from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.clients.github import GitHubClient
 from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, event_store, webhook_delivery_key
 from app.github_context import hydrate_github_context
@@ -52,6 +53,7 @@ from app.task_dispatch import dispatch_next_agent_task
 
 
 app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
+register_circuit_runtime_validation_routes(app)
 
 
 @app.on_event("startup")
