@@ -51,7 +51,7 @@ def build_workflows(review_items: list[ReviewWorkItem], events: list[EventRecord
     item_keys = {_workflow_identity_key(workflow) for workflow in workflows}
     for record in events:
         projection = build_event_workflow_projection(record)
-        if not projection.workflow_state:
+        if not projection.canonical_workflow_state:
             continue
         event_workflow = _workflow_from_event(record)
         if _workflow_identity_key(event_workflow) in item_keys:
@@ -67,7 +67,7 @@ def find_workflow(workflows: list[WorkflowRecord], workflow_id: str) -> Workflow
 def build_workflow_summary_counts(workflows: list[WorkflowRecord]) -> WorkflowSummaryCounts:
     return WorkflowSummaryCounts(
         active=sum(1 for workflow in workflows if workflow.current_state not in _TERMINAL_STATES),
-        blocked=sum(1 for workflow in workflows if workflow.current_state == WorkflowState.BLOCKED),
+        blocked=sum(1 for workflow in workflows if workflow.current_state in _BLOCKED_STATES),
         reviewing=sum(1 for workflow in workflows if workflow.current_state in _REVIEWING_STATES),
         verified=sum(1 for workflow in workflows if workflow.current_state == WorkflowState.VERIFIED),
     )
@@ -76,7 +76,7 @@ def build_workflow_summary_counts(workflows: list[WorkflowRecord]) -> WorkflowSu
 def _workflow_from_item(item: ReviewWorkItem) -> WorkflowRecord:
     projection = build_work_item_workflow_projection(item)
     timeline = projection.workflow_events
-    current_state = projection.workflow_state or WorkflowState.CREATED
+    current_state = projection.canonical_workflow_state or WorkflowState.CREATED
     created_at = timeline[0].occurred_at if timeline else item.created_at
     updated_at = (item.updated_at or timeline[-1].occurred_at) if timeline else item.created_at
     return WorkflowRecord(
@@ -98,7 +98,7 @@ def _workflow_from_item(item: ReviewWorkItem) -> WorkflowRecord:
 def _workflow_from_event(record: EventRecord) -> WorkflowRecord:
     projection = build_event_workflow_projection(record)
     timeline = projection.workflow_events
-    current_state = projection.workflow_state or WorkflowState.CREATED
+    current_state = projection.canonical_workflow_state or WorkflowState.CREATED
     workflow_id = f"wf-{record.correlation_id or record.event_id}"
     return WorkflowRecord(
         workflow_id=workflow_id,
@@ -129,8 +129,15 @@ def _assigned_agent(item: ReviewWorkItem | None, state: WorkflowState) -> str | 
 
 
 def _route_history_entry(event: WorkflowEvent) -> str:
-    return f"{event.actor or event.owner.value}: {event.new_state or event.state}"
+    return f"{event.actor or event.owner.value}: {event.new_state or event.canonical_state}"
 
 
-_TERMINAL_STATES = {WorkflowState.MERGED, WorkflowState.DEPLOYED, WorkflowState.VERIFIED}
+_TERMINAL_STATES = {
+    WorkflowState.MERGED,
+    WorkflowState.CLOSED_UNMERGED,
+    WorkflowState.ABANDONED,
+    WorkflowState.DEPLOYED,
+    WorkflowState.VERIFIED,
+}
+_BLOCKED_STATES = {WorkflowState.BLOCKED, WorkflowState.HERMES_FAILED, WorkflowState.CLOSED_UNMERGED, WorkflowState.ABANDONED}
 _REVIEWING_STATES = {WorkflowState.HERMES_VALIDATING, WorkflowState.BB2_REVIEWING, WorkflowState.CHANGES_REQUESTED}
