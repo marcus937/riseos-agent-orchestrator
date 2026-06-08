@@ -88,6 +88,18 @@ class GitHubClient:
             raise GitHubAPIError("GET", f"/repos/{repo_full_name}/commits/{ref}/check-runs", 200, "Expected check_runs list.")
         return [item for item in check_runs if isinstance(item, dict)]
 
+    async def list_issue_comments(self, repo_full_name: str, issue_number: int) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(issue_number)
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/issues/{issue_number}/comments",
+            params={"per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/issues/{issue_number}/comments", 200, "Expected list response.")
+        return payload
+
     async def list_open_issues(
         self,
         repo_full_name: str,
