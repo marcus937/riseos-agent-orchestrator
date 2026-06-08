@@ -1,25 +1,55 @@
 from __future__ import annotations
 
-import json
-from typing import Any
+from typing import Any, Literal
 
 from app import hermes_dispatch_impl as _impl
 
 
-async def _get_evidence_file(self: _impl.HermesHTTPClient, base_url: str, token: str, job_id: str, file_name: str) -> Any:
-    response = await self._http_client.get(
-        f"{base_url.rstrip('/')}/api/v1/evidence/{job_id}/files/{file_name}",
-        headers={"X-Hermes-Token": token},
+def _canonical_hermes_job_id(response: dict[str, Any]) -> str | None:
+    direct = _impl._first_string(response, "jobId", "job_id", "id")
+    if direct:
+        return direct
+
+    for key in ("job", "data", "payload", "validation"):
+        nested = response.get(key)
+        if isinstance(nested, dict):
+            nested_id = _impl._first_string(nested, "jobId", "job_id", "id")
+            if nested_id:
+                return nested_id
+    return None
+
+
+def _result_from_hermes_response(
+    response: dict[str, Any],
+    *,
+    node: Literal["M2", "DGX"],
+    dispatch_key: str,
+    correlation_id: str,
+) -> _impl.HermesDispatchResult:
+    status_value = str(response.get("status") or response.get("result") or "PASSED").upper()
+    job_id = _canonical_hermes_job_id(response)
+    if status_value in {"FAILED", "FAIL"}:
+        status: Literal["FAILED", "PASSED", "BLOCKED", "SKIPPED"] = "FAILED"
+        label = "agent-revisions"
+        success = False
+    elif status_value in {"BLOCKED", "ERROR"}:
+        status = "BLOCKED"
+        label = "agent-blocked"
+        success = False
+    else:
+        status = "PASSED"
+        label = "agent-verified"
+        success = True
+    return _impl.HermesDispatchResult(
+        attempted=True,
+        success=success,
+        status=status,
+        hermes_node=node,
+        dispatch_key=dispatch_key,
+        correlation_id=correlation_id,
+        label=label,
+        job_id=job_id,
     )
-    response.raise_for_status()
-    content_type = response.headers.get("content-type") or ""
-    if "json" in content_type or file_name.endswith(".json"):
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            data = json.loads(response.text)
-        return data if isinstance(data, dict) else {"raw": data}
-    return response.content
 
 
 async def _collect_hermes_evidence(
@@ -30,9 +60,8 @@ async def _collect_hermes_evidence(
     settings: _impl.Settings,
 ) -> _impl.HermesEvidenceSnapshot | None:
     get_manifest = getattr(hermes_client, "get_evidence_manifest", None)
-    get_file = getattr(hermes_client, "get_evidence_file", None)
     get_bundle = getattr(hermes_client, "get_evidence_bundle", None)
-    if get_manifest is None and get_file is None and get_bundle is None:
+    if get_manifest is None and get_bundle is None:
         return None
 
     snapshot = _impl.HermesEvidenceSnapshot(job_id=job_id)
@@ -46,16 +75,6 @@ async def _collect_hermes_evidence(
             _impl._populate_evidence_from_manifest(snapshot)
         except Exception as exc:
             errors.append(f"manifest fetch failed: {_impl._redact_sensitive_text(str(exc), settings)}")
-
-    if not snapshot.manifest_fetched and get_file is not None:
-        try:
-            manifest_file = await get_file(base_url, token, job_id, "manifest.json")
-            snapshot.manifest_fetched = True
-            snapshot.manifest = manifest_file if isinstance(manifest_file, dict) else {"raw": manifest_file}
-            _impl._populate_evidence_from_manifest(snapshot)
-            errors = [error for error in errors if not error.startswith("manifest fetch failed:")]
-        except Exception as exc:
-            errors.append(f"manifest file fetch failed: {_impl._redact_sensitive_text(str(exc), settings)}")
 
     if get_bundle is not None:
         try:
@@ -75,7 +94,7 @@ async def _collect_hermes_evidence(
 def _evidence_slack_status(result: _impl.HermesDispatchResult) -> str | None:
     if result.evidence and result.evidence.manifest_fetched:
         identifier = result.job_id or result.evidence.job_id
-        return f"manifest fetched ({identifier}/manifest.json)" if identifier else "manifest fetched"
+        return f"manifest fetched (GET /api/v1/evidence/{identifier}/manifest)" if identifier else "manifest fetched"
     if result.evidence is None:
         return None
     return "manifest not fetched"
@@ -102,7 +121,7 @@ def build_hermes_slack_message(
     return f"Hermes validation requested\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nLabels: {labels}\nNode: {result.hermes_node}\nCorrelation ID: {_impl._sanitize_slack_text(result.correlation_id or 'unknown')}"
 
 
-_impl.HermesHTTPClient.get_evidence_file = _get_evidence_file  # type: ignore[attr-defined]
+_impl._result_from_hermes_response = _result_from_hermes_response
 _impl._collect_hermes_evidence = _collect_hermes_evidence
 _impl.build_hermes_slack_message = build_hermes_slack_message
 
