@@ -11,11 +11,21 @@ def run(coro: Any) -> Any:
 
 
 class FakeGitHubClient:
-    def __init__(self, *, response: dict[str, Any] | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        response: dict[str, Any] | None = None,
+        comments: list[dict[str, Any]] | None = None,
+        error: Exception | None = None,
+        comments_error: Exception | None = None,
+    ) -> None:
         self.response = response or {}
+        self.comments = comments or []
         self.error = error
+        self.comments_error = comments_error
         self.fetch_commit_calls: list[tuple[str, str]] = []
         self.compare_branch_calls: list[tuple[str, str, str]] = []
+        self.list_issue_comments_calls: list[tuple[str, int]] = []
         self.post_issue_comment_calls = 0
         self.apply_label_calls = 0
 
@@ -30,6 +40,12 @@ class FakeGitHubClient:
         if self.error:
             raise self.error
         return self.response
+
+    async def list_issue_comments(self, repo_full_name: str, issue_number: int) -> list[dict[str, Any]]:
+        self.list_issue_comments_calls.append((repo_full_name, issue_number))
+        if self.comments_error:
+            raise self.comments_error
+        return self.comments
 
     async def post_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> None:
         self.post_issue_comment_calls += 1
@@ -58,6 +74,9 @@ def test_hydration_disabled_preserves_existing_response_defaults() -> None:
     assert response.diff_summary is None
     assert response.github_context_available is False
     assert response.github_context_error is None
+    assert response.runtime_evidence_context == []
+    assert response.runtime_evidence_error is None
+    assert response.runtime_evidence_truncated is False
     assert response.decision.decision == "APPROVED_FOR_HUMAN_REVIEW"
 
 
@@ -95,10 +114,14 @@ def test_valid_commit_hydration_adds_changed_files() -> None:
         patch_truncated=context.patch_truncated,
         github_context_available=context.github_context_available,
         github_context_error=context.github_context_error,
+        runtime_evidence_context=context.runtime_evidence_context,
+        runtime_evidence_error=context.runtime_evidence_error,
+        runtime_evidence_truncated=context.runtime_evidence_truncated,
     )
 
     assert client.fetch_commit_calls == [("riseos/example", "abc123")]
     assert client.compare_branch_calls == []
+    assert client.list_issue_comments_calls == []
     assert response.github_context_available is True
     assert response.github_context_error is None
     assert response.changed_files == ["app/main.py", "tests/test_main.py"]
@@ -143,9 +166,81 @@ def test_valid_pr_hydration_compares_base_and_head() -> None:
 
     assert client.compare_branch_calls == [("riseos/example", "main", "feature/task")]
     assert client.fetch_commit_calls == []
+    assert client.list_issue_comments_calls == [("riseos/example", 7)]
     assert context.github_context_available is True
     assert context.changed_files == ["README.md"]
     assert context.diff_patches[0]["patch"] == "@@ -1 +1 @@\n-old docs\n+new docs"
+
+
+def test_pr_hydration_attaches_hermes_evidence_comments() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "agent-integration", "sha": "def456"}},
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    client = FakeGitHubClient(
+        response={"files": [{"filename": "app/main.py", "status": "modified", "additions": 1, "deletions": 0}]},
+        comments=[
+            {"id": 1, "body": "Ordinary review comment", "user": {"login": "marcus937"}},
+            {
+                "id": 2,
+                "body": "## Hermes Runtime Validation\n\nStatus: PASSED\n\n### Evidence Packet\n- Manifest fetched: True\n- Bundle fetched: True",
+                "created_at": "2026-06-08T00:00:00Z",
+                "html_url": "https://github.com/riseos/example/pull/7#issuecomment-2",
+                "user": {"login": "github-actions[bot]"},
+            },
+        ],
+    )
+
+    context = run(hydrate_github_context(item, client, base_branch="main"))
+    response = process_review_work_item(
+        item,
+        changed_files=context.changed_files,
+        diff_summary=context.diff_summary,
+        runtime_evidence_context=context.runtime_evidence_context,
+        runtime_evidence_error=context.runtime_evidence_error,
+        runtime_evidence_truncated=context.runtime_evidence_truncated,
+    )
+
+    assert client.list_issue_comments_calls == [("riseos/example", 7)]
+    assert context.runtime_evidence_error is None
+    assert context.runtime_evidence_truncated is False
+    assert response.runtime_evidence_context == [
+        {
+            "source": "github_issue_comment",
+            "comment_id": 2,
+            "author": "github-actions[bot]",
+            "created_at": "2026-06-08T00:00:00Z",
+            "html_url": "https://github.com/riseos/example/pull/7#issuecomment-2",
+            "summary": "## Hermes Runtime Validation\n\nStatus: PASSED\n\n### Evidence Packet\n- Manifest fetched: True\n- Bundle fetched: True",
+        }
+    ]
+
+
+def test_pr_hydration_records_runtime_evidence_comment_errors() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "agent-integration", "sha": "def456"}},
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    client = FakeGitHubClient(
+        response={"files": [{"filename": "app/main.py"}]},
+        comments_error=RuntimeError("comments unavailable"),
+    )
+
+    context = run(hydrate_github_context(item, client, base_branch="main"))
+
+    assert context.github_context_available is True
+    assert context.runtime_evidence_context == []
+    assert context.runtime_evidence_error == "comments unavailable"
 
 
 def test_patch_truncation_limits_files_and_chars() -> None:
