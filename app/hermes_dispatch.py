@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from app import hermes_dispatch_impl as _impl
 
-ARTIFACT_JSON_FILES = {"summary.json", "page.json", "console.json", "network.json"}
+ARTIFACT_JSON_FILES = {"summary.json", "page.json", "console.json", "network.json", "logs.json"}
 
 
 def _canonical_hermes_job_id(response: dict[str, Any]) -> str | None:
@@ -195,21 +195,25 @@ def _populate_evidence_from_artifact_jsons(snapshot: _impl.HermesEvidenceSnapsho
     page = artifact_jsons.get("page.json")
     console = artifact_jsons.get("console.json")
     network = artifact_jsons.get("network.json")
+    logs = artifact_jsons.get("logs.json")
 
     page_sources = [source for source in (page, summary) if source is not None]
     snapshot.page_title = snapshot.page_title or _first_deep_string(page_sources, ("pageTitle", "page_title", "title"))
     snapshot.final_url = snapshot.final_url or _first_deep_string(page_sources, ("finalUrl", "final_url", "url"))
     snapshot.http_status = snapshot.http_status if snapshot.http_status is not None else _first_deep_int(page_sources, ("httpStatus", "http_status", "statusCode", "status_code", "status"))
 
+    console_sources = [console, logs, summary]
     snapshot.console_warning_count = _coalesce_int(
         snapshot.console_warning_count,
-        _first_deep_int([console, summary], ("consoleWarningCount", "console_warning_count", "warningCount", "warnings")),
+        _first_deep_int(console_sources, ("consoleWarningCount", "console_warning_count", "warningCount", "warnings")),
         _count_console_entries(console, {"warning", "warn"}),
+        _count_console_entries(logs, {"warning", "warn"}),
     )
     snapshot.console_error_count = _coalesce_int(
         snapshot.console_error_count,
-        _first_deep_int([console, summary], ("consoleErrorCount", "console_error_count", "errorCount", "errors")),
+        _first_deep_int(console_sources, ("consoleErrorCount", "console_error_count", "errorCount", "errors")),
         _count_console_entries(console, {"error"}),
+        _count_console_entries(logs, {"error"}),
     )
     snapshot.network_failure_count = _coalesce_int(
         snapshot.network_failure_count,
@@ -247,7 +251,7 @@ def _coalesce_int(*values: int | None) -> int | None:
 
 
 def _count_console_entries(value: Any, levels: set[str]) -> int | None:
-    entries = _as_list(value, "messages", "entries", "console")
+    entries = _as_list(value, "messages", "entries", "console", "logs")
     if entries is None:
         return None
     count = 0
