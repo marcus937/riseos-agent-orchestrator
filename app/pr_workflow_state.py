@@ -81,7 +81,7 @@ def bb2_decision_transition_labels(
             labels.append(LABEL_READY_TO_MERGE)
         return _missing_labels(labels, current)
     if decision == ReviewDecisionType.NEEDS_CHANGES:
-        return _missing_labels([LABEL_BB2_NEEDS_CHANGES], current)
+        return _missing_labels([LABEL_BB2_NEEDS_CHANGES, LABEL_AGENT_NEXT], current)
     return _missing_labels([LABEL_BB2_BLOCKED], current)
 
 
