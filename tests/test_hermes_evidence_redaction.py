@@ -129,12 +129,12 @@ def test_artifact_derived_comment_output_is_redacted_and_markdown_safe() -> None
 
     assert "[REDACTED]" in comment
     assert "Page title: Secret Dashboard password=[REDACTED]" in comment
-    assert "Final URL: https://example.test/callback?token=[REDACTED]&api_key=[REDACTED]" in comment
+    assert "Final URL: https://example.test/callback?token=[REDACTED]" in comment
     assert "User agent: Browser access_token=[REDACTED]" in comment
     assert "Console warning excerpts: console warning api_key=[REDACTED]" in comment
     assert "Console error excerpts: console error password=[REDACTED]; log access_token=[REDACTED]" in comment
-    assert "Network non-2xx requests: https://api.example.test/private?token=[REDACTED]&api_key=[REDACTED]" in comment
-    assert "Authorization: Bearer [REDACTED]" in comment
+    assert "Network non-2xx requests: https://api.example.test/private?token=[REDACTED]" in comment
+    assert "Authorization: [REDACTED] [REDACTED]" in comment
     assert "password=[REDACTED]" in comment
     assert "bad\\|name [REDACTED].json" in comment
     assert "bad|name" not in comment

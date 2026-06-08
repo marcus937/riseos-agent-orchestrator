@@ -13,12 +13,14 @@ from app.review_queue import (
     WorkerStats,
 )
 from app.workflow_lifecycle import (
+    LegacyWorkflowState,
     WorkflowEvent,
     WorkflowOwner,
     WorkflowState,
     build_event_workflow_projection,
     build_work_item_workflow_projection,
 )
+from app.workflows import WorkflowSummaryCounts, build_workflow_summary_counts, build_workflows
 
 ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v1"
 
@@ -41,7 +43,8 @@ class OrchestratorSnapshotOverview(BaseModel):
 
 class WorkflowFields(BaseModel):
     workflow_events: list[WorkflowEvent] = Field(default_factory=list)
-    workflow_state: WorkflowState | None = None
+    workflow_state: LegacyWorkflowState | None = None
+    canonical_workflow_state: WorkflowState | None = None
     workflow_state_history: list[WorkflowEvent] = Field(default_factory=list)
     workflow_duration_seconds: float | None = None
     current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
@@ -88,6 +91,7 @@ class OrchestratorSnapshot(BaseModel):
     schema_version: str = ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     workforce: OrchestratorWorkforceSnapshot
+    workflows: WorkflowSummaryCounts
     queue: ReviewQueueStats
     health: DebugHealth
     runtime: OrchestratorRuntime
@@ -106,6 +110,7 @@ def build_orchestrator_snapshot(
     recent_failures: list[RecentFailure],
 ) -> OrchestratorSnapshot:
     workflow_items = [_workflow_work_item_snapshot(item) for item in review_items]
+    workflows = build_workflows(review_items, events)
     return OrchestratorSnapshot(
         workforce=OrchestratorWorkforceSnapshot(
             overview=OrchestratorSnapshotOverview(
@@ -128,6 +133,7 @@ def build_orchestrator_snapshot(
             prs=[item for item in workflow_items if item.pr_number is not None],
             events=[_workflow_event_snapshot(event) for event in events],
         ),
+        workflows=build_workflow_summary_counts(workflows),
         queue=queue,
         health=health,
         runtime=OrchestratorRuntime(

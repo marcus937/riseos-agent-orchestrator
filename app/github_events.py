@@ -25,6 +25,7 @@ class ParsedGitHubEvent(BaseModel):
     issue_state: str | None = None
     action_label: str | None = None
     pull_request_number: int | None = None
+    pull_request_merged: bool | None = None
     ref: str | None = None
     before: str | None = None
     after: str | None = None
@@ -136,6 +137,7 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     return ParsedGitHubEvent(
         **base,
         pull_request_number=pull_request.get("number") or payload.get("number"),
+        pull_request_merged=pull_request.get("merged"),
         action_label=_action_label(payload),
         head_sha=head.get("sha"),
         head_ref=head.get("ref"),

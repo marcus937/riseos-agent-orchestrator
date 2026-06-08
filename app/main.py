@@ -50,9 +50,11 @@ from app.security import verify_github_signature
 from app.slack_issue_dispatch import dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
 from app.task_dispatch import dispatch_next_agent_task
+from app.workflow_routes import register_workflow_routes
 
 
 app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
+register_workflow_routes(app)
 register_circuit_runtime_validation_routes(app)
 
 
@@ -437,7 +439,7 @@ def _webhook_response(parsed: ParsedGitHubEvent, workflow: Any) -> WebhookAccept
         task_state=workflow.task_state.value,
         issue_number=workflow.issue_number,
         pull_request_number=workflow.pull_request_number,
-        commit_sha=workflow.commit_sha,
+        commit_sha=parsed.head_sha,
         review_context=workflow.review_context.model_dump(mode="json") if workflow.review_context else None,
         next_intended_action=workflow.next_intended_action,
     )

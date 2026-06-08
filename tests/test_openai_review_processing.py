@@ -301,8 +301,11 @@ def test_writeback_uses_validated_openai_decision() -> None:
     result = run(writeback_review_decision(response, client))
 
     assert result.success is True
-    assert client.labels == [("riseos/example", 7, "bb2-needs-changes")]
+    assert result.labels == ["bb2-needs-changes", "agent-next"]
+    assert client.labels == [("riseos/example", 7, "bb2-needs-changes"), ("riseos/example", 7, "agent-next")]
     assert "NEEDS_CHANGES" in client.comments[0][2]
+    assert "bb2-needs-changes" in client.comments[0][2]
+    assert "agent-next" in client.comments[0][2]
 
 
 def test_no_forbidden_github_mutation_behavior_exists() -> None:

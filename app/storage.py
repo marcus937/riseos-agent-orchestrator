@@ -32,6 +32,7 @@ class SQLiteStateStore:
                     commit_sha TEXT,
                     issue_number INTEGER,
                     pr_number INTEGER,
+                    pr_merged INTEGER,
                     received_at TEXT NOT NULL,
                     raw_action TEXT
                 )
@@ -39,6 +40,7 @@ class SQLiteStateStore:
             )
             _ensure_column(conn, "event_records", "diagnostic_stage", "TEXT NOT NULL DEFAULT 'webhook_accepted'")
             _ensure_column(conn, "event_records", "correlation_key", "TEXT")
+            _ensure_column(conn, "event_records", "pr_merged", "INTEGER")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issue_dispatch_claims (
@@ -84,9 +86,10 @@ class SQLiteStateStore:
                     commit_sha,
                     issue_number,
                     pr_number,
+                    pr_merged,
                     received_at,
                     raw_action
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.event_id,
@@ -98,6 +101,7 @@ class SQLiteStateStore:
                     record.commit_sha,
                     record.issue_number,
                     record.pr_number,
+                    _bool(record.pr_merged),
                     record.received_at.isoformat(),
                     record.raw_action,
                 ),
@@ -374,7 +378,10 @@ class SQLiteStateStore:
         return len(ids)
 
     def _event_record_from_row(self, row: sqlite3.Row) -> EventRecord:
-        return EventRecord.model_validate(dict(row))
+        data = dict(row)
+        if data.get("pr_merged") is not None:
+            data["pr_merged"] = bool(data["pr_merged"])
+        return EventRecord.model_validate(data)
 
     def _review_work_item_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
         data = dict(row)
