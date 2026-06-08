@@ -10,31 +10,28 @@ from app.review_queue import ReviewLifecycleStage, ReviewWorkItem, ReviewWorkIte
 
 
 class WorkflowState(StrEnum):
-    ISSUE_CREATED = "ISSUE_CREATED"
-    AGENT_READY = "AGENT_READY"
-    CIRCUIT_CLAIMED = "CIRCUIT_CLAIMED"
-    CIRCUIT_IN_PROGRESS = "CIRCUIT_IN_PROGRESS"
+    CREATED = "CREATED"
+    ASSIGNED = "ASSIGNED"
+    CIRCUIT_WORKING = "CIRCUIT_WORKING"
     PR_OPENED = "PR_OPENED"
-    HERMES_VALIDATION_REQUESTED = "HERMES_VALIDATION_REQUESTED"
-    HERMES_VALIDATION_RUNNING = "HERMES_VALIDATION_RUNNING"
-    HERMES_VALIDATION_PASSED = "HERMES_VALIDATION_PASSED"
-    BB2_REVIEW_REQUESTED = "BB2_REVIEW_REQUESTED"
-    BB2_NEEDS_CHANGES = "BB2_NEEDS_CHANGES"
-    CIRCUIT_REWORK = "CIRCUIT_REWORK"
-    HERMES_REVALIDATION = "HERMES_REVALIDATION"
-    BB2_APPROVED = "BB2_APPROVED"
-    READY_TO_MERGE = "READY_TO_MERGE"
+    HERMES_VALIDATING = "HERMES_VALIDATING"
+    HERMES_FAILED = "HERMES_FAILED"
+    BB2_REVIEWING = "BB2_REVIEWING"
+    CHANGES_REQUESTED = "CHANGES_REQUESTED"
+    APPROVED = "APPROVED"
     MERGED = "MERGED"
     DEPLOYED = "DEPLOYED"
+    VERIFIED = "VERIFIED"
+    BLOCKED = "BLOCKED"
 
 
 class WorkflowOwner(StrEnum):
-    ORCHESTRATOR = "Orchestrator"
-    CIRCUIT = "Circuit"
-    HERMES = "Hermes"
-    BB2 = "BB2"
-    HUMAN = "Human"
-    UNKNOWN = "Unknown"
+    ORCHESTRATOR = "orchestrator"
+    CIRCUIT = "circuit-forge"
+    HERMES = "hermes"
+    BB2 = "bb2"
+    HUMAN = "human"
+    UNKNOWN = "unknown"
 
 
 class WorkflowEvent(BaseModel):
@@ -42,7 +39,11 @@ class WorkflowEvent(BaseModel):
     occurred_at: datetime
     owner: WorkflowOwner
     source: str
+    event_type: str = "workflow.lifecycle.changed"
     previous_state: WorkflowState | None = None
+    new_state: WorkflowState | None = None
+    actor: str | None = None
+    timestamp: datetime | None = None
     duration_seconds: float | None = None
     item_id: str | None = None
     repo_full_name: str | None = None
@@ -52,6 +53,14 @@ class WorkflowEvent(BaseModel):
     commit_sha: str | None = None
     github_event: GitHubEventType | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.new_state is None:
+            self.new_state = self.state
+        if self.actor is None:
+            self.actor = self.owner.value
+        if self.timestamp is None:
+            self.timestamp = self.occurred_at
 
 
 class WorkflowStateProjection(BaseModel):
@@ -183,9 +192,7 @@ def _projection_from_events(events: list[WorkflowEvent]) -> WorkflowStateProject
             event.duration_seconds = round((event.occurred_at - previous.occurred_at).total_seconds(), 3)
         previous = event
     current = ordered[-1] if ordered else None
-    duration = None
-    if ordered:
-        duration = round((datetime.now(UTC) - ordered[0].occurred_at).total_seconds(), 3)
+    duration = round((datetime.now(UTC) - ordered[0].occurred_at).total_seconds(), 3) if ordered else None
     return WorkflowStateProjection(
         workflow_events=ordered,
         workflow_state=current.state if current else None,
@@ -210,32 +217,32 @@ def _dedupe_events(events: list[WorkflowEvent]) -> list[WorkflowEvent]:
 def _initial_state_for_item(item: ReviewWorkItem) -> WorkflowState:
     if item.pr_number is not None or item.event_type == GitHubEventType.PULL_REQUEST:
         return WorkflowState.PR_OPENED
-    if "agent-ready" in item.labels or "agent-next" in item.labels:
-        return WorkflowState.AGENT_READY
+    if "agent-next" in item.labels:
+        return WorkflowState.ASSIGNED
     if item.commit_sha:
-        return WorkflowState.CIRCUIT_IN_PROGRESS
-    return WorkflowState.ISSUE_CREATED
+        return WorkflowState.CIRCUIT_WORKING
+    return WorkflowState.CREATED
 
 
 def _state_from_review_stage(stage: ReviewLifecycleStage, item: ReviewWorkItem) -> WorkflowState | None:
     if stage == ReviewLifecycleStage.WORKER_CLAIMED:
-        return WorkflowState.HERMES_VALIDATION_REQUESTED
+        return WorkflowState.HERMES_VALIDATING
     if stage == ReviewLifecycleStage.REVIEW_STARTED:
-        return WorkflowState.HERMES_VALIDATION_RUNNING
+        return WorkflowState.HERMES_VALIDATING
     if stage == ReviewLifecycleStage.OPENAI_REVIEW_ATTEMPTED:
-        return WorkflowState.BB2_REVIEW_REQUESTED
+        return WorkflowState.BB2_REVIEWING
     if stage == ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED:
-        return _state_from_work_item_status(item.status) or WorkflowState.BB2_APPROVED
+        return _state_from_work_item_status(item.status) or WorkflowState.APPROVED
     if stage == ReviewLifecycleStage.OPENAI_REVIEW_FAILED:
-        return WorkflowState.BB2_NEEDS_CHANGES
+        return WorkflowState.CHANGES_REQUESTED
     if stage == ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED:
-        return WorkflowState.BB2_REVIEW_REQUESTED
+        return WorkflowState.BB2_REVIEWING
     if stage == ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED:
-        return WorkflowState.READY_TO_MERGE if item.github_writeback_success else WorkflowState.BB2_NEEDS_CHANGES
+        return WorkflowState.APPROVED if item.github_writeback_success else WorkflowState.CHANGES_REQUESTED
     if stage == ReviewLifecycleStage.REVIEW_COMPLETED:
         return _state_from_work_item_status(item.status)
     if stage == ReviewLifecycleStage.REVIEW_FAILED:
-        return WorkflowState.BB2_NEEDS_CHANGES
+        return WorkflowState.BLOCKED
     return None
 
 
@@ -243,22 +250,22 @@ def _state_from_work_item_status(status: ReviewWorkItemStatus) -> WorkflowState 
     if status == ReviewWorkItemStatus.PENDING_REVIEW:
         return None
     if status == ReviewWorkItemStatus.REVIEWING:
-        return WorkflowState.HERMES_VALIDATION_RUNNING
+        return WorkflowState.HERMES_VALIDATING
     if status == ReviewWorkItemStatus.NEEDS_CHANGES:
-        return WorkflowState.BB2_NEEDS_CHANGES
+        return WorkflowState.CHANGES_REQUESTED
     if status == ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW:
-        return WorkflowState.READY_TO_MERGE
+        return WorkflowState.APPROVED
     if status == ReviewWorkItemStatus.BLOCKED:
-        return WorkflowState.BB2_NEEDS_CHANGES
+        return WorkflowState.BLOCKED
     return None
 
 
 def _state_from_event_record(record: EventRecord) -> WorkflowState | None:
     if record.github_event == GitHubEventType.ISSUES:
         if record.raw_action == "opened":
-            return WorkflowState.ISSUE_CREATED
+            return WorkflowState.CREATED
         if record.raw_action in {"labeled", "edited", "reopened"}:
-            return WorkflowState.AGENT_READY
+            return WorkflowState.ASSIGNED
     if record.github_event == GitHubEventType.PULL_REQUEST:
         if record.raw_action in {"opened", "reopened", "synchronize"}:
             return WorkflowState.PR_OPENED
@@ -266,32 +273,19 @@ def _state_from_event_record(record: EventRecord) -> WorkflowState | None:
             return WorkflowState.MERGED
     if record.github_event == GitHubEventType.PULL_REQUEST_REVIEW:
         if record.raw_action == "submitted":
-            return WorkflowState.BB2_REVIEW_REQUESTED
+            return WorkflowState.BB2_REVIEWING
     if record.github_event == GitHubEventType.PUSH:
-        return WorkflowState.CIRCUIT_IN_PROGRESS
+        return WorkflowState.CIRCUIT_WORKING
     return None
 
 
 def _owner_for_state(state: WorkflowState) -> WorkflowOwner:
-    if state in {
-        WorkflowState.CIRCUIT_CLAIMED,
-        WorkflowState.CIRCUIT_IN_PROGRESS,
-        WorkflowState.CIRCUIT_REWORK,
-    }:
+    if state == WorkflowState.CIRCUIT_WORKING:
         return WorkflowOwner.CIRCUIT
-    if state in {
-        WorkflowState.HERMES_VALIDATION_REQUESTED,
-        WorkflowState.HERMES_VALIDATION_RUNNING,
-        WorkflowState.HERMES_VALIDATION_PASSED,
-        WorkflowState.HERMES_REVALIDATION,
-    }:
+    if state in {WorkflowState.HERMES_VALIDATING, WorkflowState.HERMES_FAILED}:
         return WorkflowOwner.HERMES
-    if state in {
-        WorkflowState.BB2_REVIEW_REQUESTED,
-        WorkflowState.BB2_NEEDS_CHANGES,
-        WorkflowState.BB2_APPROVED,
-    }:
+    if state in {WorkflowState.BB2_REVIEWING, WorkflowState.CHANGES_REQUESTED, WorkflowState.APPROVED, WorkflowState.BLOCKED}:
         return WorkflowOwner.BB2
-    if state in {WorkflowState.READY_TO_MERGE, WorkflowState.MERGED, WorkflowState.DEPLOYED}:
+    if state in {WorkflowState.MERGED, WorkflowState.DEPLOYED, WorkflowState.VERIFIED}:
         return WorkflowOwner.HUMAN
     return WorkflowOwner.ORCHESTRATOR
