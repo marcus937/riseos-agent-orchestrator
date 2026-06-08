@@ -68,14 +68,17 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
     assert data["health"]["accepted_count"] == 1
     assert workforce["agents"][0]["item_id"]
     assert workforce["agents"][0]["repo_full_name"] == "riseos/example"
-    assert workforce["agents"][0]["workflow_state"] == "CIRCUIT_WORKING"
-    assert workforce["agents"][0]["current_owner"] == "circuit-forge"
+    assert workforce["agents"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
+    assert workforce["agents"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
+    assert workforce["agents"][0]["current_owner"] == "Circuit"
     assert workforce["agents"][0]["workflow_duration_seconds"] >= 0
-    assert workforce["agents"][0]["workflow_state_history"][0]["new_state"] == "CIRCUIT_WORKING"
+    assert workforce["agents"][0]["workflow_state_history"][0]["state"] == "CIRCUIT_IN_PROGRESS"
+    assert workforce["agents"][0]["workflow_state_history"][0]["canonical_state"] == "CIRCUIT_WORKING"
     assert workforce["agents"][0]["workflow_events"][0]["source"] == "review_work_item"
     assert workforce["events"][0]["repo_full_name"] == "riseos/example"
     assert workforce["events"][0]["commit_sha"] == "abc123"
-    assert workforce["events"][0]["workflow_state"] == "CIRCUIT_WORKING"
+    assert workforce["events"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
+    assert workforce["events"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
     assert workforce["events"][0]["workflow_state_history"][0]["source"] == "github_webhook"
     assert workforce["issues"] == []
     assert workforce["prs"] == []
