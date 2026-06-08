@@ -53,6 +53,14 @@ def test_openai_prompt_includes_bb_context_when_enabled() -> None:
             diff_patches=[{"filename": "app/main.py", "patch": "@@ -1 +1 @@\n-old\n+new"}],
             github_context_available=True,
             github_context_error=None,
+            runtime_evidence_context=[
+                {
+                    "source": "github_issue_comment",
+                    "comment_id": 44,
+                    "summary": "## Hermes Runtime Validation\n\nStatus: PASSED\n\n### Evidence Packet\n- Manifest fetched: True",
+                }
+            ],
+            runtime_evidence_truncated=False,
             reviewer=reviewer,
         )
     )
@@ -74,6 +82,9 @@ def test_openai_prompt_includes_bb_context_when_enabled() -> None:
     assert "app/services_refactor/chat_service.py" in reviewer.prompt
     assert "Diff summary:\n1 changed file" in reviewer.prompt
     assert "@@ -1 +1 @@" in reviewer.prompt
+    assert "runtime_evidence_context" in reviewer.prompt
+    assert "Hermes Runtime Validation" in reviewer.prompt
+    assert "Manifest fetched: True" in reviewer.prompt
     assert "Human approval is required before merge" in reviewer.prompt
 
 
