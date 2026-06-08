@@ -46,6 +46,9 @@ async def request_openai_review_decision(
     github_context_error: str | None,
     diff_patches: list[dict[str, object]] | None = None,
     patch_truncated: bool = False,
+    runtime_evidence_context: list[dict[str, object]] | None = None,
+    runtime_evidence_error: str | None = None,
+    runtime_evidence_truncated: bool = False,
     reviewer: ReviewDecisionRequester | None = None,
 ) -> OpenAIReviewResult:
     if not settings.enable_openai_review:
@@ -69,7 +72,15 @@ async def request_openai_review_decision(
     )
     prompt = _build_prompt(
         reviewer,
-        task_context=_task_context(item, github_context_available, github_context_error, patch_truncated),
+        task_context=_task_context(
+            item,
+            github_context_available,
+            github_context_error,
+            patch_truncated,
+            runtime_evidence_context=runtime_evidence_context or [],
+            runtime_evidence_error=runtime_evidence_error,
+            runtime_evidence_truncated=runtime_evidence_truncated,
+        ),
         changed_files=changed_files,
         diff=diff_summary or "No diff summary available.",
         diff_patches=diff_patches or [],
@@ -133,12 +144,19 @@ def _task_context(
     github_context_available: bool,
     github_context_error: str | None,
     patch_truncated: bool,
+    *,
+    runtime_evidence_context: list[dict[str, object]],
+    runtime_evidence_error: str | None,
+    runtime_evidence_truncated: bool,
 ) -> dict[str, object]:
     return {
         "review_work_item": item.model_dump(mode="json"),
         "github_context_available": github_context_available,
         "github_context_error": github_context_error,
         "patch_truncated": patch_truncated,
+        "runtime_evidence_context": runtime_evidence_context,
+        "runtime_evidence_error": runtime_evidence_error,
+        "runtime_evidence_truncated": runtime_evidence_truncated,
     }
 
 

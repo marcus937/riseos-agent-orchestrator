@@ -67,6 +67,9 @@ class ReviewProcessResponse(BaseModel):
     patch_truncated: bool = False
     github_context_available: bool = False
     github_context_error: str | None = None
+    runtime_evidence_context: list[dict[str, object]] = Field(default_factory=list)
+    runtime_evidence_error: str | None = None
+    runtime_evidence_truncated: bool = False
     github_writeback_attempted: bool = False
     github_writeback_success: bool = False
     github_writeback_error: str | None = None
@@ -411,6 +414,9 @@ def process_review_work_item(
     patch_truncated: bool = False,
     github_context_available: bool = False,
     github_context_error: str | None = None,
+    runtime_evidence_context: list[dict[str, object]] | None = None,
+    runtime_evidence_error: str | None = None,
+    runtime_evidence_truncated: bool = False,
     github_writeback_attempted: bool = False,
     github_writeback_success: bool = False,
     github_writeback_error: str | None = None,
@@ -439,6 +445,9 @@ def process_review_work_item(
         patch_truncated=patch_truncated,
         github_context_available=github_context_available,
         github_context_error=github_context_error,
+        runtime_evidence_context=runtime_evidence_context or [],
+        runtime_evidence_error=runtime_evidence_error,
+        runtime_evidence_truncated=runtime_evidence_truncated,
         github_writeback_attempted=github_writeback_attempted,
         github_writeback_success=github_writeback_success,
         github_writeback_error=github_writeback_error,

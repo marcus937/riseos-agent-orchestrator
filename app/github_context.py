@@ -7,6 +7,14 @@ from app.review_queue import ReviewWorkItem
 MAX_PATCH_FILES = 20
 MAX_PATCH_CHARS_PER_FILE = 8_000
 MAX_PATCH_CHARS_TOTAL = 40_000
+MAX_HERMES_EVIDENCE_COMMENTS = 5
+MAX_HERMES_EVIDENCE_CHARS_PER_COMMENT = 4_000
+MAX_HERMES_EVIDENCE_CHARS_TOTAL = 12_000
+HERMES_EVIDENCE_MARKERS = (
+    "## Hermes Runtime Validation",
+    "### Evidence Packet",
+    "### Evidence",
+)
 
 
 class GitHubContextClient(Protocol):
@@ -24,6 +32,9 @@ class GitHubContextResult(BaseModel):
     patch_truncated: bool = False
     github_context_available: bool = False
     github_context_error: str | None = None
+    runtime_evidence_context: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_evidence_error: str | None = None
+    runtime_evidence_truncated: bool = False
 
 
 async def hydrate_github_context(
@@ -38,17 +49,23 @@ async def hydrate_github_context(
     try:
         if item.pr_number is not None and item.branch:
             payload = await client.compare_branch(item.repo_full_name, base_branch, item.branch)
-            return _context_from_payload(payload, source=f"compare {base_branch}...{item.branch}")
+            result = _context_from_payload(payload, source=f"compare {base_branch}...{item.branch}")
+            await _attach_runtime_evidence_context(item, client, result)
+            return result
 
         if item.commit_sha:
             payload = await client.fetch_commit(item.repo_full_name, item.commit_sha)
-            return _context_from_payload(payload, source=f"commit {item.commit_sha}")
+            result = _context_from_payload(payload, source=f"commit {item.commit_sha}")
+            await _attach_runtime_evidence_context(item, client, result)
+            return result
     except Exception as exc:
         return GitHubContextResult(github_context_error=str(exc))
 
-    return GitHubContextResult(
+    result = GitHubContextResult(
         github_context_error="Not enough commit or pull request context to hydrate GitHub data."
     )
+    await _attach_runtime_evidence_context(item, client, result)
+    return result
 
 
 def _context_from_payload(payload: dict[str, Any] | list[dict[str, Any]], *, source: str) -> GitHubContextResult:
@@ -83,6 +100,87 @@ def _context_from_payload(payload: dict[str, Any] | list[dict[str, Any]], *, sou
         patch_truncated=patch_truncated,
         github_context_available=True,
     )
+
+
+async def _attach_runtime_evidence_context(
+    item: ReviewWorkItem,
+    client: GitHubContextClient,
+    result: GitHubContextResult,
+) -> None:
+    target_number = item.pr_number or item.issue_number
+    if not item.repo_full_name or target_number is None:
+        return
+
+    list_comments = getattr(client, "list_issue_comments", None)
+    if list_comments is None:
+        return
+
+    try:
+        comments = await list_comments(item.repo_full_name, target_number)
+    except Exception as exc:
+        result.runtime_evidence_error = str(exc)
+        return
+
+    evidence, truncated = _runtime_evidence_context_from_comments(comments)
+    result.runtime_evidence_context = evidence
+    result.runtime_evidence_truncated = truncated
+
+
+def _runtime_evidence_context_from_comments(comments: Any) -> tuple[list[dict[str, Any]], bool]:
+    if not isinstance(comments, list):
+        return [], False
+
+    evidence: list[dict[str, Any]] = []
+    total_chars = 0
+    truncated = False
+    for comment in reversed(comments):
+        if len(evidence) >= MAX_HERMES_EVIDENCE_COMMENTS:
+            truncated = True
+            break
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or not _is_hermes_evidence_comment(body):
+            continue
+
+        remaining_total = MAX_HERMES_EVIDENCE_CHARS_TOTAL - total_chars
+        if remaining_total <= 0:
+            truncated = True
+            break
+
+        max_chars = min(MAX_HERMES_EVIDENCE_CHARS_PER_COMMENT, remaining_total)
+        summary = body.strip()
+        if len(summary) > max_chars:
+            summary = summary[:max_chars]
+            truncated = True
+
+        total_chars += len(summary)
+        evidence.append(
+            {
+                "source": "github_issue_comment",
+                "comment_id": comment.get("id"),
+                "author": _login_from_comment(comment),
+                "created_at": comment.get("created_at"),
+                "html_url": comment.get("html_url"),
+                "summary": summary,
+            }
+        )
+
+    if evidence and sum(1 for comment in comments if isinstance(comment, dict) and _is_hermes_evidence_comment(str(comment.get("body") or ""))) > len(evidence):
+        truncated = True
+
+    return list(reversed(evidence)), truncated
+
+
+def _is_hermes_evidence_comment(body: str) -> bool:
+    return any(marker in body for marker in HERMES_EVIDENCE_MARKERS)
+
+
+def _login_from_comment(comment: dict[str, Any]) -> str | None:
+    user = comment.get("user")
+    if isinstance(user, dict) and user.get("login"):
+        return str(user["login"])
+    return None
 
 
 def _int_field(payload: dict[str, Any], key: str) -> int:
