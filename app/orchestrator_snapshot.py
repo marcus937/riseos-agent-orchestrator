@@ -13,6 +13,7 @@ from app.review_queue import (
     WorkerStats,
 )
 from app.workflow_lifecycle import (
+    LegacyWorkflowState,
     WorkflowEvent,
     WorkflowOwner,
     WorkflowState,
@@ -42,7 +43,8 @@ class OrchestratorSnapshotOverview(BaseModel):
 
 class WorkflowFields(BaseModel):
     workflow_events: list[WorkflowEvent] = Field(default_factory=list)
-    workflow_state: WorkflowState | None = None
+    workflow_state: LegacyWorkflowState | None = None
+    canonical_workflow_state: WorkflowState | None = None
     workflow_state_history: list[WorkflowEvent] = Field(default_factory=list)
     workflow_duration_seconds: float | None = None
     current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
