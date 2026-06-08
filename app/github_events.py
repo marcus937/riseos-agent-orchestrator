@@ -44,7 +44,7 @@ class UnsupportedGitHubEventError(ValueError):
 
 
 COMMENT_COMMIT_SHA_PATTERN = re.compile(
-    r"(?im)^\s*(?:commit(?:[\s_-]+)?sha|sha)\s*:\s*([0-9a-f]{7,40})"
+    r"(?im)^\s*(?:commit(?:[\s_-]+sha)?|sha)\s*:\s*([0-9a-f]{7,40})"
 )
 
 
