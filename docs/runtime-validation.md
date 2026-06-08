@@ -72,7 +72,9 @@ Minimum trigger request:
 }
 ```
 
-The trigger path uses Hermes M2 settings: `HERMES_M2_BASE_URL`, `HERMES_M2_TOKEN`, and `HERMES_M2_ENABLE_DISPATCH=true`. It rejects missing targets, non-HTTP(S) URLs, localhost, and private, loopback, link-local, reserved, or multicast IP targets. Vercel preview URLs are treated as first-class public validation targets.
+The trigger path uses Hermes M2 settings: `HERMES_M2_BASE_URL`, `HERMES_M2_TOKEN`, and `HERMES_M2_ENABLE_DISPATCH=true`.
+
+Allowed runtime targets are restricted to trusted Vercel preview hosts (`vercel.app` or `*.vercel.app`) or the exact configured `HERMES_DEFAULT_TARGET` host. The API rejects missing targets, non-HTTP(S) URLs, credential-bearing URLs, localhost/local-only hosts, private IP literals, and hostnames whose DNS results include private, loopback, link-local, reserved, or multicast addresses.
 
 The response stores a compact result in process memory under `validation_id`. It includes:
 
@@ -80,7 +82,7 @@ The response stores a compact result in process memory under `validation_id`. It
 - `evidence`: page title, final URL, HTTP status, viewport, user agent, load duration, console counts, network counts, screenshot presence, and artifact filename/size/SHA metadata.
 - `bb2`: packet visibility with `packet_created`, `review_requested`, `review_status`, and a field propagation matrix showing which evidence fields were hydrated.
 
-The API returns summaries only. It does not expose raw secrets, raw headers, unbounded console or network bodies, or raw artifact content. Evidence values and errors reuse the Hermes redaction helpers before returning to Circuit.
+The API returns summaries only. It does not expose raw secrets, raw headers, unbounded console or network bodies, or raw artifact content. Evidence values and errors reuse the public Circuit Hermes adapter redaction path before returning to Circuit.
 
 ## Troubleshooting Guidance
 
@@ -90,7 +92,7 @@ If readiness times out, inspect `startup-readiness.json` and `logs/startup.log`.
 
 If diagnostics or review queue checks fail, inspect the matching file under `http-responses/` and then review the FastAPI route implementation in `app/main.py`. The workflow intentionally keeps `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=false` so these read-only debug routes are available in isolated CI without secrets.
 
-If Circuit runtime validation returns `blocked`, check the response `error` field first. Common causes are a missing admin token, Hermes dispatch disabled, missing Hermes M2 configuration, or an unsafe target URL.
+If Circuit runtime validation returns `blocked`, check the response `error` field first. Common causes are a missing admin token, Hermes dispatch disabled, missing Hermes M2 configuration, a target host outside the allowed policy, credential-bearing target URLs, or unsafe DNS resolution.
 
 If graceful shutdown fails, inspect `graceful-shutdown.txt` and `logs/startup.log`. The workflow sends `SIGTERM`, waits up to 10 seconds, and fails if the process must be killed.
 
