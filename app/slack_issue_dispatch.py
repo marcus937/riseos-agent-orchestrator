@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any, Protocol
 
 import httpx
@@ -13,6 +14,7 @@ AGENT_READY_LABEL = "agent-ready"
 APPROVED_REPO_FULL_NAMES = {
     "marcus937/Project-Jarvis",
     "marcus937/hermes-runtime-agent",
+    "marcus937/jarvis-agent-bus-mcp",
     "marcus937/jarvis-mission-control",
     "marcus937/riseos-agent-orchestrator",
     "marcus937/Rylinn-Field-App-Codex",
@@ -112,10 +114,11 @@ async def dispatch_ready_issue_to_slack(
     *,
     client: SlackIssueDispatchClient | None = None,
     registry: IssueDispatchRegistry = issue_dispatch_registry,
+    approved_repositories: Collection[str] | None = None,
 ) -> SlackIssueDispatchResult:
     issue_key = _issue_key(parsed)
     correlation_id = correlation_id_from_parsed(parsed)
-    skipped_reason = _skip_reason(parsed)
+    skipped_reason = _skip_reason(parsed, approved_repositories=approved_repositories)
     if skipped_reason:
         return SlackIssueDispatchResult(issue_key=issue_key, correlation_id=correlation_id, skipped_reason=skipped_reason)
 
@@ -185,12 +188,12 @@ def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> s
     )
 
 
-def _skip_reason(parsed: ParsedGitHubEvent) -> str | None:
+def _skip_reason(parsed: ParsedGitHubEvent, *, approved_repositories: Collection[str] | None = None) -> str | None:
     if parsed.event_type != GitHubEventType.ISSUES:
         return "Not a GitHub issues event."
     if parsed.action not in {"opened", "labeled"}:
         return "Issue action is not opened or labeled."
-    if not _is_approved_repo(parsed.repository):
+    if not _is_approved_repo(parsed.repository, approved_repositories=approved_repositories):
         return "Repository is not approved for Circuit Slack dispatch."
     if parsed.issue_state and parsed.issue_state != "open":
         return "Issue is not open."
@@ -201,8 +204,12 @@ def _skip_reason(parsed: ParsedGitHubEvent) -> str | None:
     return None
 
 
-def _is_approved_repo(repo_full_name: str | None) -> bool:
-    return repo_full_name in APPROVED_REPO_FULL_NAMES
+def _is_approved_repo(repo_full_name: str | None, *, approved_repositories: Collection[str] | None = None) -> bool:
+    if repo_full_name is None:
+        return False
+    return repo_full_name in APPROVED_REPO_FULL_NAMES or (
+        approved_repositories is not None and repo_full_name in approved_repositories
+    )
 
 
 def _issue_key(parsed: ParsedGitHubEvent) -> str | None:

@@ -30,8 +30,9 @@ class GitHubAPIError(GitHubClientError):
 class GitHubClient:
     """Safe GitHub API wrapper for read/review operations.
 
-    Write actions are intentionally limited to issue comments and labels. This
-    client does not support merge, branch deletion, or repository file writes.
+    Write actions are intentionally limited to issue comments, labels, and
+    repository webhook registration. This client does not support merge, branch
+    deletion, branch mutation, or repository file writes.
     """
 
     def __init__(
@@ -122,6 +123,53 @@ class GitHubClient:
         )
         if not isinstance(payload, list):
             raise GitHubAPIError("GET", f"/repos/{repo_full_name}/issues", 200, "Expected list response.")
+        return payload
+
+    async def list_owner_repositories(self, owner: str) -> list[dict[str, Any]]:
+        self._require_value(owner, "owner")
+        payload = await self._request(
+            "GET",
+            f"/users/{owner}/repos",
+            params={"type": "all", "per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/users/{owner}/repos", 200, "Expected list response.")
+        return payload
+
+    async def list_repository_webhooks(self, repo_full_name: str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        payload = await self._request("GET", f"/repos/{repo_full_name}/hooks", params={"per_page": 100})
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/hooks", 200, "Expected list response.")
+        return payload
+
+    async def create_repository_webhook(
+        self,
+        repo_full_name: str,
+        *,
+        callback_url: str,
+        secret: str,
+        events: list[str],
+    ) -> dict[str, Any]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(callback_url, "callback_url")
+        payload = await self._request(
+            "POST",
+            f"/repos/{repo_full_name}/hooks",
+            json={
+                "name": "web",
+                "active": True,
+                "events": events,
+                "config": {
+                    "url": callback_url,
+                    "content_type": "json",
+                    "secret": secret,
+                    "insecure_ssl": "0",
+                },
+            },
+        )
+        if not isinstance(payload, dict):
+            raise GitHubAPIError("POST", f"/repos/{repo_full_name}/hooks", 200, "Expected object response.")
         return payload
 
     async def post_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> GitHubResponse:
