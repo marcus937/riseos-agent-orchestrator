@@ -2,19 +2,37 @@
 
 Planning-first external automation layer for RiseOS coding agents.
 
-The orchestrator accepts GitHub webhooks, verifies GitHub signatures, persists review queue items, hydrates read-only GitHub context, can request BB/Jarvis Architect review decisions from OpenAI, can optionally write review comments and labels back to GitHub, and can notify Slack when approved `agent-ready` issues are queued. It does not implement auto-merge behavior, branch mutation, deploy behavior, or repository file writes.
+The orchestrator accepts GitHub webhooks, verifies GitHub signatures, persists review queue items, hydrates read-only GitHub context, can request BB/Jarvis Architect review decisions from OpenAI, can optionally write review comments and labels back to GitHub, and can notify Slack when approved `agent-ready` issues are queued. It does not implement auto-merge behavior, deploy behavior, protected-branch mutation, or repository file writes.
 
 ## Guardrails
 
 - No auto-merge behavior.
 - No deploy behavior.
-- No branch mutation.
-- No repository file writes.
+- No protected-branch mutation.
+- No repository file writes by the orchestrator.
 - No issue closing by the orchestrator.
 - Production secrets are not committed.
 - GitHub writes are limited to comments and labels when explicitly enabled.
 - Slack dispatch is notification-only.
 - Human approval remains required before merge.
+
+## Branch Strategy
+
+Agent task work uses a PR-based branch model:
+
+```text
+main
+|
+|-- agent-integration
+|-- circuit/*
+|-- bb2/*
+|-- orchestrator/*
+`-- hermes/*
+```
+
+`agent-integration` is the shared integration target. Agents create dedicated working branches, such as `circuit/work-queue-phase-3`, then open PRs into `agent-integration` for BB2 review. Agents must never commit directly to `main`, merge, deploy, force push, delete branches, or bypass branch protection.
+
+The orchestrator may tell agents which branch strategy to follow in Slack and issue comments, but it still does not create branches, update refs, merge, deploy, or write repository files itself.
 
 ## Supported Events
 
@@ -121,9 +139,9 @@ Dispatch rules:
 - Already-dispatched issue IDs are deduplicated in process memory.
 - Slack message posts to `SLACK_CHANNEL`, defaulting to `#project_riseos`.
 
-Slack messages mention `@circuit-forge` and include repo, issue number, title, labels, URL, branch rule, and no-merge/no-deploy reminder. User-controlled issue fields are escaped before posting so Slack control sequences such as channel-wide or user mentions are rendered as text.
+Slack messages mention `@circuit-forge` and include repo, issue number, title, labels, URL, target integration branch, working branch guidance, and no-merge/no-deploy/no-main reminder. User-controlled issue fields are escaped before posting so Slack control sequences such as channel-wide or user mentions are rendered as text.
 
-This dispatcher is notification-only. It does not close issues, mutate branches, open PRs, merge, deploy, or write repository files.
+This dispatcher is notification-only. It does not close issues, create branches, mutate refs, open PRs, merge, deploy, or write repository files.
 
 Follow-up recommendation: Priority 3A Persistent Dispatch Registry should move deduplication from process memory to persisted storage so service restarts cannot re-notify the same issue.
 
@@ -142,7 +160,7 @@ curl -X POST http://localhost:8000/debug/review-queue/<work-item-id>/process \
   -H "X-Orchestrator-Admin-Token: $ORCHESTRATOR_ADMIN_TOKEN"
 ```
 
-Read-only debug endpoints are public by default for local testing. Set `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true` to require `X-Orchestrator-Admin-Token` for all `/debug/*` routes. The processing endpoint always requires `ORCHESTRATOR_ADMIN_TOKEN`. Duplicate pending queue items are suppressed for the same repo, event type, commit SHA, PR number, and issue number.
+Read-only debug endpoints are public by default for local testing. Set `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true` to require `X-Orchestrator-Admin-Token` for all `/debug/*` endpoints. The processing endpoint always requires `ORCHESTRATOR_ADMIN_TOKEN`. Duplicate pending queue items are suppressed for the same repo, event type, commit SHA, PR number, and issue number.
 
 By default, processing does not call GitHub or OpenAI. To include read-only GitHub context in the dry-run response, set `ENABLE_GITHUB_CONTEXT_HYDRATION=true` and provide `GITHUB_TOKEN`. Commit work items fetch commit metadata. PR work items compare `BASE_BRANCH` to the work item branch when branch context is available. Hydration never comments, labels, mutates repositories, or merges.
 
@@ -166,7 +184,7 @@ Queued issues must be open and have both labels:
 - `agent-task`
 - `agent-ready`
 
-Issues with `bb2-blocked` are skipped. The selector chooses the oldest created eligible issue first. Dispatch posts a Circuit assignment comment and applies `agent-next`. It does not close issues, merge, mutate branches, open PRs, or write repository files.
+Issues with `bb2-blocked` are skipped. The selector chooses the oldest created eligible issue first. Dispatch posts a Circuit assignment comment and applies `agent-next`. The assignment comment tells Circuit to create a dedicated `circuit/<task>` branch, work only on that branch, open a PR into `agent-integration`, request BB2 review, avoid direct `main` commits, and never merge or deploy.
 
 Task labels:
 
@@ -186,14 +204,17 @@ Example assignment comment:
 
 Issue: #42 - Implement queue metrics
 
-Branch: `agent-integration` only.
+Target integration branch: `agent-integration`
+
+Working branch: create a dedicated `circuit/<task>` branch for this issue.
 
 Reminders:
-- Stay on `agent-integration`.
-- Comment `Status: Done` with the completed commit SHA when finished.
-- Do not merge.
-- Do not open a PR unless explicitly requested.
-- Do not mutate branches.
+- Work only on the dedicated `circuit/<task>` branch.
+- Open a PR into `agent-integration` when the task is ready for review.
+- Request BB2 review on the PR.
+- Never commit directly to `main`.
+- Never merge or deploy.
+- Comment `Status: Done` with the PR URL and completed commit SHA when finished.
 
 Task summary:
 Add queue metrics for review processing.
