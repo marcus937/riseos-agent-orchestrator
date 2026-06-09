@@ -130,12 +130,17 @@ def test_opened_agent_ready_issue_dispatches_to_slack() -> None:
     assert result.success is True
     assert result.issue_key == "marcus937/Project-Jarvis#11"
     assert client.messages[0][0] == "#jarvis-agent-orchestrator"
-    assert "@circuit-forge" in client.messages[0][1]
-    assert "Repo: marcus937/Project-Jarvis" in client.messages[0][1]
-    assert "Issue: #11 - Architecture plan: shared memory layer" in client.messages[0][1]
-    assert "Labels: agent-ready" in client.messages[0][1]
-    assert "Branch rule: agent-integration only" in client.messages[0][1]
-    assert "no merge, no deploy" in client.messages[0][1]
+    message = client.messages[0][1]
+    assert "@circuit-forge" in message
+    assert "Repo: marcus937/Project-Jarvis" in message
+    assert "Issue: #11 - Architecture plan: shared memory layer" in message
+    assert "Labels: agent-ready" in message
+    assert "Target integration branch: agent-integration" in message
+    assert "Working branch: dedicated `circuit/<task>` branch" in message
+    assert "open a PR into agent-integration" in message
+    assert "request BB2 review" in message
+    assert "never commit directly to main" in message
+    assert "never merge, never deploy" in message
 
 
 def test_labeled_agent_ready_issue_dispatches_to_slack() -> None:
@@ -268,8 +273,27 @@ def test_message_includes_required_fields() -> None:
     assert "Issue: #11 - Architecture plan: shared memory layer" in message
     assert "Labels: agent-ready, ARCHITECT_REVIEW_REQUIRED" in message
     assert "URL: https://github.com/marcus937/Project-Jarvis/issues/11" in message
-    assert "Branch rule: agent-integration only" in message
-    assert "no merge, no deploy, and no branch mutation" in message
+    assert "Target integration branch: agent-integration" in message
+    assert "Working branch: dedicated `circuit/<task>` branch" in message
+    assert "open a PR into agent-integration" in message
+    assert "request BB2 review" in message
+    assert "never commit directly to main" in message
+    assert "never merge, never deploy" in message
+    assert "does not create branches" in message
+    assert "mutate refs" in message
+    assert "retarget PRs" in message
+    assert "write repository files" in message
+
+
+def test_message_removes_legacy_branch_blockers() -> None:
+    parsed = parse_github_event("issues", issue_payload())
+
+    message = build_circuit_slack_message(parsed, channel="#jarvis-agent-orchestrator")
+
+    assert "agent-integration only" not in message
+    assert "stay on agent-integration" not in message.lower()
+    assert "do not mutate branches" not in message.lower()
+    assert "do not open a PR unless requested" not in message
 
 
 def test_message_sanitizes_slack_control_sequences() -> None:
