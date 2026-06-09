@@ -1,4 +1,5 @@
 import hmac
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
@@ -25,6 +26,13 @@ from app.operational_logging import (
     log_webhook_duplicate_suppressed,
 )
 from app.orchestrator_snapshot import OrchestratorSnapshot, build_orchestrator_snapshot
+from app.repository_discovery import (
+    RepositoryDiscoveryResult,
+    RepositoryRegistryStore,
+    build_repository_registry,
+    discover_repositories,
+    repository_diagnostics,
+)
 from app.reviewer.decision import ReviewDecisionType
 from app.reviewer.openai_review import request_openai_review_decision
 from app.review_queue import (
@@ -68,10 +76,58 @@ async def startup() -> None:
     if storage is not None:
         storage.reclaim_stale_review_claims(older_than_seconds=settings.review_claim_timeout_seconds)
     app.state.storage = storage
+    app.state.repository_registry = build_repository_registry(settings)
+    app.state.last_repository_discovery_error = None
+    if settings.enable_repository_discovery and settings.github_repository_owner:
+        github_client = GitHubClient(token=settings.github_token)
+        try:
+            await discover_repositories(
+                settings.github_repository_owner,
+                settings,
+                github_client,
+                _repository_registry(),
+            )
+        except Exception as exc:
+            app.state.last_repository_discovery_error = str(exc)
+        finally:
+            await github_client.aclose()
 
 
 def _storage() -> SQLiteStateStore | None:
     return getattr(app.state, "storage", None)
+
+
+def _repository_registry() -> RepositoryRegistryStore:
+    registry = getattr(app.state, "repository_registry", None)
+    if registry is None:
+        registry = build_repository_registry(get_settings())
+        app.state.repository_registry = registry
+    return registry
+
+
+def _approved_repository_names() -> set[str]:
+    return {
+        record.repo_full_name
+        for record in _repository_registry().list_repository_registry_records()
+        if record.orchestration_enabled and not record.archived
+    }
+
+
+def _record_repository_event(parsed: ParsedGitHubEvent, *, work_item_created: bool) -> None:
+    if not parsed.repository:
+        return
+    registry = _repository_registry()
+    record = registry.get_repository_registry_record(parsed.repository)
+    if record is None:
+        return
+    registry.save_repository_registry_record(
+        record.model_copy(
+            update={
+                "last_event": datetime.now(UTC).isoformat(),
+                "last_work_item_generated_at": datetime.now(UTC) if work_item_created else record.last_work_item_generated_at,
+            }
+        )
+    )
 
 
 def _require_debug_read_access(
@@ -132,6 +188,38 @@ async def orchestrator_snapshot(
         events=_recent_events(),
         recent_failures=build_recent_failures(items),
     )
+
+
+@app.get("/debug/repositories")
+async def debug_repositories(
+    _: None = Depends(_require_debug_read_access),
+) -> dict[str, object]:
+    return {
+        "repositories": repository_diagnostics(_repository_registry()),
+        "last_discovery_error": getattr(app.state, "last_repository_discovery_error", None),
+    }
+
+
+@app.post("/debug/repositories/discover", response_model=RepositoryDiscoveryResult)
+async def debug_discover_repositories(
+    x_orchestrator_admin_token: Annotated[str | None, Header(alias="X-Orchestrator-Admin-Token")] = None,
+    settings: Settings = Depends(get_settings),
+) -> RepositoryDiscoveryResult:
+    _require_admin_token(settings, x_orchestrator_admin_token)
+    if not settings.github_repository_owner:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GITHUB_REPOSITORY_OWNER is required.")
+    github_client = GitHubClient(token=settings.github_token)
+    try:
+        result = await discover_repositories(
+            settings.github_repository_owner,
+            settings,
+            github_client,
+            _repository_registry(),
+        )
+    finally:
+        await github_client.aclose()
+    app.state.last_repository_discovery_error = None
+    return result
 
 
 @app.get("/debug/recent-events", response_model=list[EventRecord])
@@ -409,11 +497,22 @@ async def github_webhook(
 
     log_webhook_accepted(parsed)
     work_item = _create_review_work_item(parsed, workflow.review_context is not None, settings)
+    _record_repository_event(parsed, work_item_created=work_item is not None)
+    approved_repositories = _approved_repository_names()
     if storage is not None:
-        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings, registry=storage)
+        slack_dispatch = await dispatch_ready_issue_to_slack(
+            parsed,
+            settings,
+            registry=storage,
+            approved_repositories=approved_repositories,
+        )
         storage.prune_processed_review_items(settings.orchestrator_max_review_items)
     else:
-        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings)
+        slack_dispatch = await dispatch_ready_issue_to_slack(
+            parsed,
+            settings,
+            approved_repositories=approved_repositories,
+        )
     log_slack_issue_dispatch_result(parsed, slack_dispatch)
 
     github_client = GitHubClient(token=settings.github_token) if settings.enable_github_writeback else None
