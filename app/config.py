@@ -8,6 +8,8 @@ class Settings:
     app_name: str = "RiseOS Agent Orchestrator"
     app_env: str = "local"
     github_webhook_secret: str = ""
+    github_webhook_callback_url: str | None = None
+    github_repository_owner: str | None = None
     github_token: str | None = None
     github_app_id: str | None = None
     github_app_private_key_path: str | None = None
@@ -22,6 +24,7 @@ class Settings:
     review_claim_timeout_seconds: int = 900
     require_admin_token_for_debug_reads: bool = False
     enable_auto_review_processing: bool = False
+    enable_repository_discovery: bool = False
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
@@ -60,6 +63,8 @@ def get_settings() -> Settings:
     return Settings(
         app_env=os.getenv("APP_ENV", "local"),
         github_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
+        github_webhook_callback_url=os.getenv("GITHUB_WEBHOOK_CALLBACK_URL"),
+        github_repository_owner=os.getenv("GITHUB_REPOSITORY_OWNER"),
         github_token=os.getenv("GITHUB_TOKEN"),
         github_app_id=os.getenv("GITHUB_APP_ID"),
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
@@ -74,6 +79,7 @@ def get_settings() -> Settings:
         review_claim_timeout_seconds=_int_env("ORCHESTRATOR_REVIEW_CLAIM_TIMEOUT_SECONDS", 900),
         require_admin_token_for_debug_reads=_bool_env("REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS"),
         enable_auto_review_processing=_bool_env("ENABLE_AUTO_REVIEW_PROCESSING"),
+        enable_repository_discovery=_bool_env("ENABLE_REPOSITORY_DISCOVERY"),
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
