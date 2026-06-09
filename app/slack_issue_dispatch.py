@@ -187,7 +187,7 @@ def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> s
         f"Target integration branch: {TARGET_INTEGRATION_BRANCH}\n"
         f"Working branch: {WORKING_BRANCH_RULE}\n"
         "Review path: open a PR into agent-integration and request BB2 review.\n"
-        "Agent limits: never commit directly to main, merge, deploy, force push, delete branches, or bypass branch protection.\n"
+        "Agent limits: never commit directly to main, never merge, never deploy, never force push, never delete branches, and never bypass branch protection.\n"
         "Orchestrator limits: notification only; it does not create branches, mutate refs, retarget PRs, merge, deploy, delete branches, or write repository files."
     )
 
