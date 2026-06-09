@@ -20,7 +20,7 @@ APPROVED_REPO_FULL_NAMES = {
     "marcus937/Rylinn-Field-App-Codex",
 }
 TARGET_INTEGRATION_BRANCH = "agent-integration"
-WORKING_BRANCH_RULE = "dedicated agent task branch"
+WORKING_BRANCH_RULE = "dedicated `circuit/<task>` branch"
 ORCHESTRATOR_SLACK_CHANNEL = "#jarvis-agent-orchestrator"
 HERMES_SLACK_CHANNEL = "#jarvis-hermes-runtime"
 
@@ -186,7 +186,9 @@ def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> s
         f"URL: {issue_url}\n"
         f"Target integration branch: {TARGET_INTEGRATION_BRANCH}\n"
         f"Working branch: {WORKING_BRANCH_RULE}\n"
-        "Reminder: create a dedicated branch, open a PR into agent-integration, never merge, never deploy, and never touch main."
+        "Review path: open a PR into agent-integration and request BB2 review.\n"
+        "Agent limits: never commit directly to main, merge, deploy, force push, delete branches, or bypass branch protection.\n"
+        "Orchestrator limits: notification only; it does not create branches, mutate refs, retarget PRs, merge, deploy, delete branches, or write repository files."
     )
 
 
