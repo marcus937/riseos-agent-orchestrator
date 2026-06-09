@@ -19,7 +19,8 @@ APPROVED_REPO_FULL_NAMES = {
     "marcus937/riseos-agent-orchestrator",
     "marcus937/Rylinn-Field-App-Codex",
 }
-DEFAULT_BRANCH_RULE = "agent-integration only"
+TARGET_INTEGRATION_BRANCH = "agent-integration"
+WORKING_BRANCH_RULE = "dedicated agent task branch"
 ORCHESTRATOR_SLACK_CHANNEL = "#jarvis-agent-orchestrator"
 HERMES_SLACK_CHANNEL = "#jarvis-hermes-runtime"
 
@@ -183,8 +184,9 @@ def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> s
         f"Issue: #{parsed.issue_number} - {title}\n"
         f"Labels: {labels}\n"
         f"URL: {issue_url}\n"
-        f"Branch rule: {DEFAULT_BRANCH_RULE}\n"
-        "Reminder: no merge, no deploy, and no branch mutation."
+        f"Target integration branch: {TARGET_INTEGRATION_BRANCH}\n"
+        f"Working branch: {WORKING_BRANCH_RULE}\n"
+        "Reminder: create a dedicated branch, open a PR into agent-integration, never merge, never deploy, and never touch main."
     )
 
 
