@@ -4,9 +4,9 @@ Status: operational contract for Circuit and BB2 issue-based task dispatch.
 
 ## Purpose
 
-GitHub Issues are the shared task queue between Circuit and BB2. Circuit works one queued task at a time on `agent-integration`; BB2 reviews the completed commit. When BB2 approves work for human review, the orchestrator may assign the next ready issue.
+GitHub Issues are the shared task queue between Circuit and BB2. Circuit works one queued task at a time on a dedicated `circuit/<task>` branch, opens a PR into `agent-integration`, and requests BB2 review. When BB2 approves work for human review, the orchestrator may assign the next ready issue.
 
-This workflow never merges, mutates branches, closes issues, opens PRs, or writes repository files.
+The orchestrator itself never creates branches, mutates refs, retargets PRs, merges, deploys, deletes branches, closes issues, writes repository files, or bypasses branch protection. Branch creation and PR creation are agent responsibilities described in the assignment comment.
 
 ## Feature Flags
 
@@ -16,6 +16,33 @@ This workflow never merges, mutates branches, closes issues, opens PRs, or write
 | `ENABLE_TASK_DISPATCH` | `false` | Allows next-task discovery and assignment comments/labels after approved BB2 review. |
 
 Task dispatch requires both flags to be `true`. If either flag is false, no task assignment comment or dispatch label is posted.
+
+## Branch Strategy
+
+Repository layout:
+
+```text
+main
+|
+|-- agent-integration
+|-- circuit/*
+|-- bb2/*
+|-- orchestrator/*
+`-- hermes/*
+```
+
+Workflow:
+
+1. Orchestrator dispatches an approved queued issue.
+2. The assigned agent creates a dedicated working branch such as `circuit/work-queue-phase-3`.
+3. The agent works only on that dedicated branch.
+4. The agent opens a PR into `agent-integration`.
+5. BB2 reviews the PR.
+6. Marcus performs any final human merge decision.
+
+Agents must never commit directly to `main`, merge, deploy, force push, delete branches, or bypass branch protection.
+
+Only agent workflow instructions may reference branch creation and PR creation. Orchestrator behavior remains limited to notification, review comments, and labels when the corresponding feature flags explicitly allow those writes.
 
 ## Labels
 
@@ -62,7 +89,7 @@ When a review queue item is processed and GitHub writeback succeeds:
 4. If a ready issue exists, the orchestrator posts a Circuit assignment comment and applies `agent-next`.
 5. If no ready issue exists, the process response includes `task_dispatch_error: "No queued agent-ready issue found"`.
 
-No other GitHub writes are allowed.
+No other orchestrator GitHub writes are allowed. In particular, task dispatch does not create branches, mutate refs, retarget PRs, merge, deploy, delete branches, or write repository files.
 
 ## Assignment Comment Shape
 
@@ -73,14 +100,17 @@ Example:
 
 Issue: #42 - Add read-only Mission Control traffic contract
 
-Branch: `agent-integration` only.
+Target integration branch: `agent-integration`
+
+Working branch: create a dedicated `circuit/<task>` branch for this issue.
 
 Reminders:
-- Stay on `agent-integration`.
-- Comment `Status: Done` with the completed commit SHA when finished.
-- Do not merge.
-- Do not open a PR unless explicitly requested.
-- Do not mutate branches.
+- Work only on the dedicated `circuit/<task>` branch.
+- Open a PR into `agent-integration` when the task is ready for review.
+- Request BB2 review on the PR.
+- Never commit directly to `main`.
+- Never merge or deploy.
+- Comment `Status: Done` with the PR URL and completed commit SHA when finished.
 
 Task summary:
 Implement the task from the issue body.

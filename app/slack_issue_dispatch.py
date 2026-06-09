@@ -19,7 +19,8 @@ APPROVED_REPO_FULL_NAMES = {
     "marcus937/riseos-agent-orchestrator",
     "marcus937/Rylinn-Field-App-Codex",
 }
-DEFAULT_BRANCH_RULE = "agent-integration only"
+TARGET_INTEGRATION_BRANCH = "agent-integration"
+WORKING_BRANCH_RULE = "dedicated `circuit/<task>` branch"
 ORCHESTRATOR_SLACK_CHANNEL = "#jarvis-agent-orchestrator"
 HERMES_SLACK_CHANNEL = "#jarvis-hermes-runtime"
 
@@ -183,8 +184,11 @@ def build_circuit_slack_message(parsed: ParsedGitHubEvent, *, channel: str) -> s
         f"Issue: #{parsed.issue_number} - {title}\n"
         f"Labels: {labels}\n"
         f"URL: {issue_url}\n"
-        f"Branch rule: {DEFAULT_BRANCH_RULE}\n"
-        "Reminder: no merge, no deploy, and no branch mutation."
+        f"Target integration branch: {TARGET_INTEGRATION_BRANCH}\n"
+        f"Working branch: {WORKING_BRANCH_RULE}\n"
+        "Review path: open a PR into agent-integration and request BB2 review.\n"
+        "Agent limits: never commit directly to main, never merge, never deploy, never force push, never delete branches, and never bypass branch protection.\n"
+        "Orchestrator limits: notification only; it does not create branches, mutate refs, retarget PRs, merge, deploy, delete branches, or write repository files."
     )
 
 

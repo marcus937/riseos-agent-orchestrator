@@ -126,12 +126,13 @@ def test_dispatch_posts_assignment_comment_and_agent_next_label() -> None:
     body = client.comments[0][2]
     assert "Circuit Assignment" in body
     assert "Wire dispatch" in body
-    assert "Branch: `agent-integration` only." in body
-    assert "Stay on `agent-integration`" in body
-    assert "Status: Done" in body
-    assert "completed commit SHA" in body
-    assert "Do not merge" in body
-    assert "Do not open a PR unless explicitly requested" in body
+    assert "Target integration branch: `agent-integration`" in body
+    assert "Working branch: create a dedicated `circuit/<task>` branch" in body
+    assert "Open a PR into `agent-integration`" in body
+    assert "Request BB2 review" in body
+    assert "Never commit directly to `main`" in body
+    assert "Never merge or deploy" in body
+    assert "PR URL and completed commit SHA" in body
     assert "Implement task dispatch." in body
 
 
@@ -147,10 +148,29 @@ def test_assignment_comment_body_includes_circuit_instructions() -> None:
 
     assert body.startswith("## Circuit Assignment")
     assert "Issue: #9 - Next queued task" in body
-    assert "Branch: `agent-integration` only." in body
-    assert "Comment `Status: Done` with the completed commit SHA" in body
-    assert "Do not merge" in body
+    assert "Target integration branch: `agent-integration`" in body
+    assert "Working branch: create a dedicated `circuit/<task>` branch" in body
+    assert "Work only on the dedicated `circuit/<task>` branch" in body
+    assert "Open a PR into `agent-integration`" in body
+    assert "Never commit directly to `main`" in body
+    assert "Never merge or deploy" in body
     assert "Task body here." in body
+
+
+def test_assignment_comment_body_removes_legacy_branch_blockers() -> None:
+    body = build_circuit_assignment_body(
+        AgentTaskIssue(
+            number=10,
+            title="Branch policy",
+            body="Task body here.",
+            labels=["agent-task", "agent-ready"],
+        )
+    )
+
+    assert "agent-integration` only" not in body
+    assert "Stay on `agent-integration`" not in body
+    assert "Do not open a PR unless explicitly requested" not in body
+    assert "Do not mutate branches" not in body
 
 
 def test_list_agent_ready_issues_filters_missing_labels_and_blocked() -> None:
