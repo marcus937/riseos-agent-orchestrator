@@ -3,6 +3,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
 
+from app.agent_task_routes import router as agent_task_router
+from app.agent_tasks import AgentTask, build_agent_task_store
 from app.config import Settings, get_settings
 from app.event_store import event_store
 from app.review_queue import review_queue
@@ -66,15 +68,25 @@ def register_workflow_routes(app: FastAPI) -> None:
     if getattr(app.state, "workflow_routes_registered", False):
         return
     app.include_router(router)
+    app.include_router(agent_task_router)
     app.state.workflow_routes_registered = True
 
 
 def _build_request_workflows(request: Request) -> list[WorkflowRecord]:
     storage = _storage(request)
+    agent_tasks = _agent_tasks(request)
     if storage is not None:
-        return build_workflows(storage.list_review_work_items(), storage.recent_events())
-    return build_workflows(review_queue.list_items(), event_store.recent_events())
+        return build_workflows(storage.list_review_work_items(), storage.recent_events(), agent_tasks)
+    return build_workflows(review_queue.list_items(), event_store.recent_events(), agent_tasks)
 
 
 def _storage(request: Request) -> SQLiteStateStore | None:
     return getattr(request.app.state, "storage", None)
+
+
+def _agent_tasks(request: Request) -> list[AgentTask]:
+    store = getattr(request.app.state, "agent_task_store", None)
+    if store is None:
+        store = build_agent_task_store(get_settings().orchestrator_db_path)
+        request.app.state.agent_task_store = store
+    return store.list_agent_tasks()
