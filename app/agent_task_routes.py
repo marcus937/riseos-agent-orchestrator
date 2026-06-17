@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from app.agent_task_dispatch import AgentTaskDispatchError, dispatch_agent_task_to_agent_bus
+from app.agent_task_dispatch import dispatch_agent_task_to_agent_bus
 from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
