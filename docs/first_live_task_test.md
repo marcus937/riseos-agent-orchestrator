@@ -5,18 +5,34 @@
 1. Deploy RiseOS Orchestrator from the `agent-integration` branch.
 2. Deploy Agent Bus with the `POST /work-items` endpoint available.
 3. Run the Codex Worker with an Agent Bus registration identity matching `AGENT_BUS_OWNER_AGENT`.
-4. Configure Orchestrator:
+4. Configure Orchestrator on Vultr:
 
 ```text
 ENABLE_GITHUB_WRITEBACK=true
 ENABLE_TASK_DISPATCH=true
 ENABLE_AGENT_BUS_DISPATCH=true
-AGENT_BUS_BASE_URL=<agent bus base URL>
-AGENT_BUS_TOKEN=<optional bearer token>
+AGENT_BUS_BASE_URL=https://agent-bus.riseconnect.us
+AGENT_BUS_TOKEN=<existing-agent-bus-token>
+AGENT_BUS_TIMEOUT_SECONDS=30
 AGENT_BUS_OWNER_AGENT=codex-m2
 AGENT_BUS_REVIEW_AGENT=bb2
 WORK_BRANCH=agent-integration
 ```
+
+Do not create a new Agent Bus token for this test. Use the existing deployment secret value for `AGENT_BUS_TOKEN`.
+
+## Agent Bus Reachability Check
+
+After deployment, run this from the Orchestrator host to prove it can reach Agent Bus with the configured token:
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" \
+  -H "Accept: application/json" \
+  "${AGENT_BUS_BASE_URL}/agents"
+```
+
+Expected result: JSON containing the current Agent Bus agent registry.
 
 ## Test Steps
 
