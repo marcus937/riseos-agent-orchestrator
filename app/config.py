@@ -28,6 +28,11 @@ class Settings:
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
+    enable_agent_bus_dispatch: bool = False
+    agent_bus_base_url: str | None = None
+    agent_bus_token: str | None = None
+    agent_bus_owner_agent: str = "codex-m2"
+    agent_bus_review_agent: str = "bb2"
     slack_webhook_url: str | None = None
     slack_bot_token: str | None = None
     slack_channel: str = "#jarvis-agent-orchestrator"
@@ -83,6 +88,11 @@ def get_settings() -> Settings:
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
+        enable_agent_bus_dispatch=_bool_env("ENABLE_AGENT_BUS_DISPATCH"),
+        agent_bus_base_url=os.getenv("AGENT_BUS_BASE_URL"),
+        agent_bus_token=os.getenv("AGENT_BUS_TOKEN"),
+        agent_bus_owner_agent=os.getenv("AGENT_BUS_OWNER_AGENT", "codex-m2"),
+        agent_bus_review_agent=os.getenv("AGENT_BUS_REVIEW_AGENT", "bb2"),
         slack_webhook_url=legacy_slack_webhook_url,
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
         slack_channel=legacy_slack_channel or orchestrator_slack_channel,
