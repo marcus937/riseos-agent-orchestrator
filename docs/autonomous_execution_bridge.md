@@ -93,11 +93,11 @@ Agent Bus already exposes the worker intake lifecycle. Workers should use these 
 ```text
 GET /agents/{agent_id}/inbox
 GET /agents/{agent_id}/queue
+GET /work-items/{work_item_id}
 POST /work-items/{work_item_id}/claim
 POST /work-items/{work_item_id}/transition
-POST /work-items/{work_item_id}/evidence-packets
+POST /evidence-packets
 POST /work-items/{work_item_id}/evidence
-GET /work-items/{work_item_id}
 ```
 
 Minimum `codex-m2` worker lifecycle:
@@ -107,7 +107,7 @@ Minimum `codex-m2` worker lifecycle:
 3. Claim the assigned WorkItem with `POST /work-items/{work_item_id}/claim`.
 4. Transition to `in_progress` with `POST /work-items/{work_item_id}/transition`.
 5. Execute Codex outside this PR's scope.
-6. Attach Agent Bus evidence if available.
+6. Create and attach Agent Bus evidence if available.
 7. POST the Orchestrator execution callback.
 
 ## Worker Lifecycle
