@@ -30,10 +30,12 @@ class AgentBusClient:
         *,
         base_url: str | None,
         token: str | None = None,
+        timeout_seconds: int = 30,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._token = token
+        self._timeout_seconds = timeout_seconds
         self._http_client = http_client
         self._owns_client = http_client is None
 
@@ -59,7 +61,7 @@ class AgentBusClient:
     @property
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=20.0)
+            self._http_client = httpx.AsyncClient(timeout=float(self._timeout_seconds))
         return self._http_client
 
     def _headers(self) -> dict[str, str]:
