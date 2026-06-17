@@ -31,6 +31,7 @@ class Settings:
     enable_agent_bus_dispatch: bool = False
     agent_bus_base_url: str | None = None
     agent_bus_token: str | None = None
+    agent_bus_timeout_seconds: int = 30
     agent_bus_owner_agent: str = "codex-m2"
     agent_bus_review_agent: str = "bb2"
     slack_webhook_url: str | None = None
@@ -91,6 +92,7 @@ def get_settings() -> Settings:
         enable_agent_bus_dispatch=_bool_env("ENABLE_AGENT_BUS_DISPATCH"),
         agent_bus_base_url=os.getenv("AGENT_BUS_BASE_URL"),
         agent_bus_token=os.getenv("AGENT_BUS_TOKEN"),
+        agent_bus_timeout_seconds=_int_env("AGENT_BUS_TIMEOUT_SECONDS", 30),
         agent_bus_owner_agent=os.getenv("AGENT_BUS_OWNER_AGENT", "codex-m2"),
         agent_bus_review_agent=os.getenv("AGENT_BUS_REVIEW_AGENT", "bb2"),
         slack_webhook_url=legacy_slack_webhook_url,
