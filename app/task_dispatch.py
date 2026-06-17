@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.reviewer.decision import ReviewDecisionType
 
@@ -35,6 +35,8 @@ BB2_DECISION_LABELS = {
     ReviewDecisionType.ESCALATE_TO_MARCUS: LABEL_BB2_BLOCKED,
 }
 
+DEFAULT_AGENT_BUS_PRIORITY = "normal"
+
 
 class TaskDispatchClient(Protocol):
     async def list_open_issues(
@@ -54,12 +56,18 @@ class TaskDispatchClient(Protocol):
         ...
 
 
+class AgentBusDispatchClient(Protocol):
+    async def create_work_item(self, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+
 class AgentTaskIssue(BaseModel):
     number: int
     title: str
     body: str | None = None
     labels: list[str]
     created_at: datetime | None = None
+    url: str | None = None
 
 
 class TaskDispatchResult(BaseModel):
@@ -68,6 +76,12 @@ class TaskDispatchResult(BaseModel):
     issue_number: int | None = None
     error: str | None = None
     assignment_body: str | None = None
+    agent_bus_attempted: bool = False
+    agent_bus_success: bool = False
+    agent_bus_work_item_id: str | None = None
+    agent_bus_error: str | None = None
+    agent_bus_payload: dict[str, Any] | None = None
+    lifecycle_events: list[str] = Field(default_factory=list)
 
 
 def should_dispatch_next_task(decision: ReviewDecisionType) -> bool:
@@ -97,6 +111,7 @@ async def list_agent_ready_issues(repo_full_name: str, client: TaskDispatchClien
                 body=raw_issue.get("body") if isinstance(raw_issue.get("body"), str) else None,
                 labels=sorted(labels),
                 created_at=_parse_datetime(raw_issue.get("created_at")),
+                url=raw_issue.get("html_url") if isinstance(raw_issue.get("html_url"), str) else None,
             )
         )
     return sorted(ready, key=lambda issue: (issue.created_at or datetime.min, issue.number))
@@ -122,12 +137,18 @@ async def dispatch_next_agent_task(
     client: TaskDispatchClient,
     *,
     enabled: bool,
+    agent_bus_client: AgentBusDispatchClient | None = None,
+    agent_bus_enabled: bool = False,
+    owner_agent: str = "codex-m2",
+    review_agent: str = "bb2",
+    work_branch: str = "agent-integration",
 ) -> TaskDispatchResult:
     if not enabled:
         return TaskDispatchResult()
     if not repo_full_name:
         return TaskDispatchResult(attempted=True, error="repo_full_name is required for task dispatch.")
 
+    lifecycle_events: list[str] = []
     try:
         issue = await select_next_agent_task(repo_full_name, client)
         if issue is None:
@@ -136,17 +157,88 @@ async def dispatch_next_agent_task(
                 success=False,
                 error="No queued unclaimed agent-ready issue found",
             )
+
+        agent_bus_attempted = False
+        agent_bus_success = False
+        agent_bus_work_item_id: str | None = None
+        agent_bus_error: str | None = None
+        agent_bus_payload = build_agent_bus_work_item_payload(
+            repo_full_name,
+            issue,
+            owner_agent=owner_agent,
+            review_agent=review_agent,
+            work_branch=work_branch,
+        )
+        if agent_bus_enabled:
+            lifecycle_events.append("agent_bus_dispatch_started")
+            agent_bus_attempted = True
+            if agent_bus_client is None:
+                agent_bus_error = "Agent Bus dispatch is enabled but no Agent Bus client is configured."
+            else:
+                try:
+                    agent_bus_response = await agent_bus_client.create_work_item(agent_bus_payload)
+                    raw_work_item_id = agent_bus_response.get("work_item_id") or agent_bus_response.get("id")
+                    agent_bus_work_item_id = str(raw_work_item_id) if raw_work_item_id else None
+                    agent_bus_success = agent_bus_work_item_id is not None
+                    if agent_bus_success:
+                        lifecycle_events.append("agent_bus_dispatch_completed")
+                    else:
+                        agent_bus_error = "Agent Bus work item response did not include work_item_id."
+                except Exception as exc:
+                    agent_bus_error = str(exc)
+
         assignment_body = build_circuit_assignment_body(issue)
         await post_circuit_assignment(repo_full_name, issue.number, assignment_body, client)
     except Exception as exc:
-        return TaskDispatchResult(attempted=True, success=False, error=str(exc))
+        return TaskDispatchResult(attempted=True, success=False, error=str(exc), lifecycle_events=lifecycle_events)
 
     return TaskDispatchResult(
         attempted=True,
         success=True,
         issue_number=issue.number,
         assignment_body=assignment_body,
+        agent_bus_attempted=agent_bus_attempted,
+        agent_bus_success=agent_bus_success,
+        agent_bus_work_item_id=agent_bus_work_item_id,
+        agent_bus_error=agent_bus_error,
+        agent_bus_payload=agent_bus_payload,
+        lifecycle_events=lifecycle_events,
     )
+
+
+def build_agent_bus_work_item_payload(
+    repo_full_name: str,
+    issue: AgentTaskIssue,
+    *,
+    owner_agent: str,
+    review_agent: str,
+    work_branch: str,
+) -> dict[str, Any]:
+    priority = _priority_from_labels(issue.labels)
+    return {
+        "title": issue.title,
+        "repository": repo_full_name,
+        "issue_number": issue.number,
+        "priority": priority,
+        "owner_agent": owner_agent,
+        "review_agent": review_agent,
+        "metadata": {
+            "objective": _trim_issue_body(issue.body),
+            "branch": work_branch,
+            "issue_url": issue.url,
+            "source": "riseos-agent-orchestrator",
+            "dispatch_label": LABEL_AGENT_NEXT,
+            "labels": issue.labels,
+            "routing": {
+                "owner_agent": owner_agent,
+                "owner_capabilities": ["coding", "github", "testing"],
+                "owner_agent_type": "implementation",
+                "review_agent": review_agent,
+                "reviewer_capabilities": ["pr_review"],
+                "reviewer_agent_type": "review",
+            },
+        },
+    }
 
 
 def build_circuit_assignment_body(issue: AgentTaskIssue) -> str:
@@ -182,6 +274,17 @@ def _label_names(raw_labels: Any) -> set[str]:
         elif isinstance(label, dict) and isinstance(label.get("name"), str):
             names.add(label["name"])
     return names
+
+
+def _priority_from_labels(labels: list[str]) -> str:
+    normalized = {label.lower() for label in labels}
+    if {"urgent", "priority:urgent", "priority-urgent", "p0"} & normalized:
+        return "urgent"
+    if {"high", "priority:high", "priority-high", "p1"} & normalized:
+        return "high"
+    if {"low", "priority:low", "priority-low", "p3"} & normalized:
+        return "low"
+    return DEFAULT_AGENT_BUS_PRIORITY
 
 
 def _parse_datetime(raw_value: Any) -> datetime | None:
