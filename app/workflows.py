@@ -115,7 +115,7 @@ def _workflow_from_agent_task(task: AgentTask) -> WorkflowRecord:
         agent_task_id=task.task_id,
         current_state=current_state,
         assigned_agent=task.target_agent,
-        last_actor=WorkflowOwner.ORCHESTRATOR.value,
+        last_actor=last_event.actor or WorkflowOwner.ORCHESTRATOR.value,
         created_at=task.created_at,
         updated_at=task.updated_at,
         last_activity_at=last_event.occurred_at,
@@ -149,62 +149,111 @@ def _workflow_from_event(record: EventRecord) -> WorkflowRecord:
 def _agent_task_events(task: AgentTask) -> list[WorkflowEvent]:
     events: list[WorkflowEvent] = []
     for lifecycle_event in task.lifecycle_events:
-        state = WorkflowState.CREATED if lifecycle_event.event == "created" else _state_from_agent_task_status(task.status)
-        legacy_state = LegacyWorkflowState.ISSUE_CREATED if lifecycle_event.event == "created" else LegacyWorkflowState.AGENT_READY
+        state = _state_from_agent_task_event(lifecycle_event.event, task.status)
         events.append(
             WorkflowEvent(
-                state=legacy_state,
+                state=_legacy_state_from_agent_task_state(state),
                 canonical_state=state,
                 occurred_at=lifecycle_event.occurred_at,
-                owner=WorkflowOwner.ORCHESTRATOR,
+                owner=_owner_from_agent_task_state(state),
                 source="agent_task",
                 event_type="agent_task.lifecycle.changed",
                 actor=lifecycle_event.actor,
                 item_id=task.task_id,
                 repo_full_name=task.repo_full_name,
                 issue_number=task.issue_number,
+                branch=task.branch,
+                commit_sha=task.commit_sha,
                 metadata={
                     "agent_task_id": task.task_id,
                     "agent_task_event": lifecycle_event.event,
                     "title": task.title,
                     "target_agent": task.target_agent,
                     "priority": task.priority.value,
+                    "agent_bus_work_item_id": task.agent_bus_work_item_id,
                     **lifecycle_event.metadata,
                 },
             )
         )
     if events:
         return events
+    state = _state_from_agent_task_status(task.status)
     return [
         WorkflowEvent(
-            state=LegacyWorkflowState.AGENT_READY,
-            canonical_state=_state_from_agent_task_status(task.status),
+            state=_legacy_state_from_agent_task_state(state),
+            canonical_state=state,
             occurred_at=task.created_at,
-            owner=WorkflowOwner.ORCHESTRATOR,
+            owner=_owner_from_agent_task_state(state),
             source="agent_task",
             event_type="agent_task.lifecycle.changed",
             item_id=task.task_id,
             repo_full_name=task.repo_full_name,
             issue_number=task.issue_number,
+            branch=task.branch,
+            commit_sha=task.commit_sha,
             metadata={"agent_task_id": task.task_id, "target_agent": task.target_agent},
         )
     ]
 
 
+def _state_from_agent_task_event(event: str, fallback_status: AgentTaskStatus) -> WorkflowState:
+    if event == "created":
+        return WorkflowState.CREATED
+    if event in {"queued", "assigned"}:
+        return WorkflowState.ASSIGNED
+    if event in {"claimed", "running", "in_progress"}:
+        return WorkflowState.CIRCUIT_WORKING
+    if event == "ready_for_review":
+        return WorkflowState.BB2_REVIEWING
+    if event == "completed":
+        return WorkflowState.COMPLETED
+    if event in {"failed", "cancelled", "agent_bus_dispatch_failed"}:
+        return WorkflowState.BLOCKED
+    return _state_from_agent_task_status(fallback_status)
+
+
 def _state_from_agent_task_status(status: AgentTaskStatus) -> WorkflowState:
     if status == AgentTaskStatus.CREATED:
         return WorkflowState.CREATED
-    if status == AgentTaskStatus.QUEUED:
+    if status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ASSIGNED}:
         return WorkflowState.ASSIGNED
-    if status == AgentTaskStatus.IN_PROGRESS:
+    if status in {AgentTaskStatus.CLAIMED, AgentTaskStatus.RUNNING, AgentTaskStatus.IN_PROGRESS}:
         return WorkflowState.CIRCUIT_WORKING
     if status == AgentTaskStatus.READY_FOR_REVIEW:
         return WorkflowState.BB2_REVIEWING
     if status == AgentTaskStatus.COMPLETED:
-        return WorkflowState.VERIFIED
-    if status == AgentTaskStatus.FAILED:
+        return WorkflowState.COMPLETED
+    if status in {AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED}:
         return WorkflowState.BLOCKED
     return WorkflowState.CREATED
+
+
+def _legacy_state_from_agent_task_state(state: WorkflowState) -> LegacyWorkflowState:
+    if state == WorkflowState.CREATED:
+        return LegacyWorkflowState.ISSUE_CREATED
+    if state == WorkflowState.ASSIGNED:
+        return LegacyWorkflowState.AGENT_READY
+    if state == WorkflowState.CIRCUIT_WORKING:
+        return LegacyWorkflowState.CIRCUIT_IN_PROGRESS
+    if state == WorkflowState.BB2_REVIEWING:
+        return LegacyWorkflowState.BB2_REVIEW_REQUESTED
+    if state == WorkflowState.COMPLETED:
+        return LegacyWorkflowState.COMPLETED
+    if state == WorkflowState.BLOCKED:
+        return LegacyWorkflowState.BLOCKED
+    return LegacyWorkflowState.ISSUE_CREATED
+
+
+def _owner_from_agent_task_state(state: WorkflowState) -> WorkflowOwner:
+    if state == WorkflowState.CIRCUIT_WORKING:
+        return WorkflowOwner.CIRCUIT
+    if state == WorkflowState.BB2_REVIEWING:
+        return WorkflowOwner.BB2
+    if state == WorkflowState.COMPLETED:
+        return WorkflowOwner.HUMAN
+    if state == WorkflowState.BLOCKED:
+        return WorkflowOwner.ORCHESTRATOR
+    return WorkflowOwner.ORCHESTRATOR
 
 
 def _workflow_identity_key(workflow: WorkflowRecord) -> tuple[str | None, int | None, int | None, str | None]:
@@ -223,6 +272,7 @@ def _route_history_entry(event: WorkflowEvent) -> str:
 
 
 _TERMINAL_STATES = {
+    WorkflowState.COMPLETED,
     WorkflowState.MERGED,
     WorkflowState.CLOSED_UNMERGED,
     WorkflowState.ABANDONED,

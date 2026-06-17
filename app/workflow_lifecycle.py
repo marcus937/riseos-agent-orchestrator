@@ -19,6 +19,7 @@ class WorkflowState(StrEnum):
     BB2_REVIEWING = "BB2_REVIEWING"
     CHANGES_REQUESTED = "CHANGES_REQUESTED"
     APPROVED = "APPROVED"
+    COMPLETED = "COMPLETED"
     MERGED = "MERGED"
     CLOSED_UNMERGED = "CLOSED_UNMERGED"
     ABANDONED = "ABANDONED"
@@ -43,6 +44,7 @@ class LegacyWorkflowState(StrEnum):
     HERMES_REVALIDATION = "HERMES_REVALIDATION"
     BB2_APPROVED = "BB2_APPROVED"
     READY_TO_MERGE = "READY_TO_MERGE"
+    COMPLETED = "COMPLETED"
     MERGED = "MERGED"
     CLOSED_UNMERGED = "CLOSED_UNMERGED"
     ABANDONED = "ABANDONED"
@@ -350,7 +352,14 @@ def _owner_for_state(state: WorkflowState) -> WorkflowOwner:
         return WorkflowOwner.HERMES
     if state in {WorkflowState.BB2_REVIEWING, WorkflowState.CHANGES_REQUESTED, WorkflowState.APPROVED, WorkflowState.BLOCKED}:
         return WorkflowOwner.BB2
-    if state in {WorkflowState.MERGED, WorkflowState.CLOSED_UNMERGED, WorkflowState.ABANDONED, WorkflowState.DEPLOYED, WorkflowState.VERIFIED}:
+    if state in {
+        WorkflowState.COMPLETED,
+        WorkflowState.MERGED,
+        WorkflowState.CLOSED_UNMERGED,
+        WorkflowState.ABANDONED,
+        WorkflowState.DEPLOYED,
+        WorkflowState.VERIFIED,
+    }:
         return WorkflowOwner.HUMAN
     return WorkflowOwner.ORCHESTRATOR
 
@@ -365,6 +374,7 @@ _LEGACY_STATE_BY_CANONICAL = {
     WorkflowState.BB2_REVIEWING: LegacyWorkflowState.BB2_REVIEW_REQUESTED,
     WorkflowState.CHANGES_REQUESTED: LegacyWorkflowState.BB2_NEEDS_CHANGES,
     WorkflowState.APPROVED: LegacyWorkflowState.READY_TO_MERGE,
+    WorkflowState.COMPLETED: LegacyWorkflowState.COMPLETED,
     WorkflowState.MERGED: LegacyWorkflowState.MERGED,
     WorkflowState.CLOSED_UNMERGED: LegacyWorkflowState.CLOSED_UNMERGED,
     WorkflowState.ABANDONED: LegacyWorkflowState.ABANDONED,

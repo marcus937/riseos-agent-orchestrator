@@ -6,7 +6,7 @@ from collections import deque
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -15,10 +15,14 @@ from pydantic import BaseModel, Field
 class AgentTaskStatus(StrEnum):
     CREATED = "created"
     QUEUED = "queued"
-    IN_PROGRESS = "in_progress"
-    READY_FOR_REVIEW = "ready_for_review"
+    ASSIGNED = "assigned"
+    CLAIMED = "claimed"
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    IN_PROGRESS = "in_progress"
+    READY_FOR_REVIEW = "ready_for_review"
 
 
 class AgentTaskPriority(StrEnum):
@@ -32,7 +36,7 @@ class AgentTaskLifecycleEvent(BaseModel):
     event: str
     occurred_at: datetime
     actor: str = "orchestrator"
-    metadata: dict[str, object] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentTaskCreateRequest(BaseModel):
@@ -53,6 +57,15 @@ class AgentTaskCreateResponse(BaseModel):
     target_agent: str
 
 
+class AgentTaskExecutionResult(BaseModel):
+    agent_id: str = Field(min_length=1)
+    status: AgentTaskStatus
+    commit_sha: str | None = None
+    branch: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentTask(BaseModel):
     task_id: str
     repo_full_name: str
@@ -66,9 +79,21 @@ class AgentTask(BaseModel):
     status: AgentTaskStatus = AgentTaskStatus.CREATED
     source: str = "direct_api"
     issue_number: int | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
     created_at: datetime
     updated_at: datetime
     queued_at: datetime | None = None
+    assigned_at: datetime | None = None
+    claimed_at: datetime | None = None
+    running_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    branch: str | None = None
+    commit_sha: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    execution_evidence: dict[str, Any] = Field(default_factory=dict)
     lifecycle_events: list[AgentTaskLifecycleEvent] = Field(default_factory=list)
 
 
@@ -132,13 +157,27 @@ class SQLiteAgentTaskStore:
                     status TEXT NOT NULL,
                     source TEXT NOT NULL,
                     issue_number INTEGER,
+                    agent_bus_work_item_id TEXT,
+                    agent_bus_dispatch_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     queued_at TEXT,
+                    assigned_at TEXT,
+                    claimed_at TEXT,
+                    running_at TEXT,
+                    completed_at TEXT,
+                    failed_at TEXT,
+                    cancelled_at TEXT,
+                    branch TEXT,
+                    commit_sha TEXT,
+                    changed_files TEXT NOT NULL DEFAULT '[]',
+                    execution_evidence TEXT NOT NULL DEFAULT '{}',
                     lifecycle_events TEXT NOT NULL
                 )
                 """
             )
+            for column_name, column_type in _AGENT_TASK_EXTRA_COLUMNS:
+                _ensure_column(conn, "agent_tasks", column_name, column_type)
 
     def save_agent_task(self, task: AgentTask) -> None:
         with self._connect() as conn:
@@ -157,11 +196,23 @@ class SQLiteAgentTaskStore:
                     status,
                     source,
                     issue_number,
+                    agent_bus_work_item_id,
+                    agent_bus_dispatch_error,
                     created_at,
                     updated_at,
                     queued_at,
+                    assigned_at,
+                    claimed_at,
+                    running_at,
+                    completed_at,
+                    failed_at,
+                    cancelled_at,
+                    branch,
+                    commit_sha,
+                    changed_files,
+                    execution_evidence,
                     lifecycle_events
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -176,9 +227,21 @@ class SQLiteAgentTaskStore:
                     task.status.value,
                     task.source,
                     task.issue_number,
+                    task.agent_bus_work_item_id,
+                    task.agent_bus_dispatch_error,
                     task.created_at.isoformat(),
                     task.updated_at.isoformat(),
-                    task.queued_at.isoformat() if task.queued_at else None,
+                    _dt(task.queued_at),
+                    _dt(task.assigned_at),
+                    _dt(task.claimed_at),
+                    _dt(task.running_at),
+                    _dt(task.completed_at),
+                    _dt(task.failed_at),
+                    _dt(task.cancelled_at),
+                    task.branch,
+                    task.commit_sha,
+                    json.dumps(task.changed_files),
+                    json.dumps(task.execution_evidence),
                     json.dumps([event.model_dump(mode="json") for event in task.lifecycle_events]),
                 ),
             )
@@ -230,6 +293,85 @@ def create_agent_task(request: AgentTaskCreateRequest) -> AgentTask:
     )
 
 
+def mark_agent_task_assigned(task: AgentTask, *, work_item_id: str) -> AgentTask:
+    append_lifecycle_event(
+        task,
+        "assigned",
+        status=AgentTaskStatus.ASSIGNED,
+        metadata={"agent_bus_work_item_id": work_item_id, "target_agent": task.target_agent},
+    )
+    task.agent_bus_work_item_id = work_item_id
+    task.agent_bus_dispatch_error = None
+    task.assigned_at = task.updated_at
+    return task
+
+
+def mark_agent_task_dispatch_failed(task: AgentTask, error: str) -> AgentTask:
+    append_lifecycle_event(
+        task,
+        "agent_bus_dispatch_failed",
+        status=AgentTaskStatus.FAILED,
+        metadata={"error": error},
+    )
+    task.agent_bus_dispatch_error = error
+    task.failed_at = task.updated_at
+    return task
+
+
+def apply_execution_result(task: AgentTask, result: AgentTaskExecutionResult) -> AgentTask:
+    now_status = result.status
+    append_lifecycle_event(
+        task,
+        now_status.value,
+        actor=result.agent_id,
+        status=now_status,
+        metadata={
+            "commit_sha": result.commit_sha,
+            "branch": result.branch,
+            "changed_files": result.changed_files,
+            "evidence": result.evidence,
+        },
+    )
+    task.branch = result.branch
+    task.commit_sha = result.commit_sha
+    task.changed_files = result.changed_files
+    task.execution_evidence = result.evidence
+    if now_status == AgentTaskStatus.CLAIMED:
+        task.claimed_at = task.updated_at
+    elif now_status in {AgentTaskStatus.RUNNING, AgentTaskStatus.IN_PROGRESS}:
+        task.running_at = task.updated_at
+    elif now_status == AgentTaskStatus.COMPLETED:
+        task.completed_at = task.updated_at
+    elif now_status == AgentTaskStatus.FAILED:
+        task.failed_at = task.updated_at
+    elif now_status == AgentTaskStatus.CANCELLED:
+        task.cancelled_at = task.updated_at
+    return task
+
+
+def append_lifecycle_event(
+    task: AgentTask,
+    event: str,
+    *,
+    actor: str = "orchestrator",
+    status: AgentTaskStatus | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> AgentTask:
+    now = datetime.now(UTC)
+    task.updated_at = now
+    if status is not None:
+        task.status = status
+    task.lifecycle_events.append(
+        AgentTaskLifecycleEvent(
+            event=event,
+            occurred_at=now,
+            actor=actor,
+            metadata={key: value for key, value in (metadata or {}).items() if value is not None},
+        )
+    )
+    return task
+
+
 def build_agent_task_store(db_path: str | None) -> AgentTaskStore:
     if not db_path:
         return agent_task_store
@@ -243,5 +385,38 @@ def _task_from_row(row: sqlite3.Row) -> AgentTask:
     data = dict(row)
     data["instructions"] = json.loads(data["instructions"] or "[]")
     data["acceptance_criteria"] = json.loads(data["acceptance_criteria"] or "[]")
+    data["changed_files"] = json.loads(data.get("changed_files") or "[]")
+    data["execution_evidence"] = json.loads(data.get("execution_evidence") or "{}")
     data["lifecycle_events"] = json.loads(data["lifecycle_events"] or "[]")
     return AgentTask.model_validate(data)
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name in columns:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _dt(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+_AGENT_TASK_EXTRA_COLUMNS = [
+    ("agent_bus_work_item_id", "TEXT"),
+    ("agent_bus_dispatch_error", "TEXT"),
+    ("assigned_at", "TEXT"),
+    ("claimed_at", "TEXT"),
+    ("running_at", "TEXT"),
+    ("completed_at", "TEXT"),
+    ("failed_at", "TEXT"),
+    ("cancelled_at", "TEXT"),
+    ("branch", "TEXT"),
+    ("commit_sha", "TEXT"),
+    ("changed_files", "TEXT NOT NULL DEFAULT '[]'"),
+    ("execution_evidence", "TEXT NOT NULL DEFAULT '{}'"),
+]
