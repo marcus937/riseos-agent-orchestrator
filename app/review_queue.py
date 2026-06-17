@@ -29,6 +29,8 @@ class ReviewLifecycleStage(StrEnum):
     REVIEW_FAILED = "review_failed"
     GITHUB_WRITEBACK_STARTED = "github_writeback_started"
     GITHUB_WRITEBACK_COMPLETED = "github_writeback_completed"
+    AGENT_BUS_DISPATCH_STARTED = "agent_bus_dispatch_started"
+    AGENT_BUS_DISPATCH_COMPLETED = "agent_bus_dispatch_completed"
 
 
 class ReviewWorkItem(BaseModel):
@@ -52,6 +54,11 @@ class ReviewWorkItem(BaseModel):
     github_writeback_started_at: datetime | None = None
     github_writeback_completed_at: datetime | None = None
     github_writeback_success: bool | None = None
+    agent_bus_dispatch_started_at: datetime | None = None
+    agent_bus_dispatch_completed_at: datetime | None = None
+    agent_bus_dispatch_success: bool | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
     failure_count: int = 0
     last_failure_at: datetime | None = None
     last_error: str | None = None
@@ -77,6 +84,11 @@ class ReviewProcessResponse(BaseModel):
     task_dispatch_success: bool = False
     task_dispatch_issue_number: int | None = None
     task_dispatch_error: str | None = None
+    agent_bus_dispatch_attempted: bool = False
+    agent_bus_dispatch_success: bool = False
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
+    agent_bus_payload: dict[str, object] | None = None
     openai_review_attempted: bool = False
     openai_review_success: bool = False
     openai_review_error: str | None = None
@@ -94,15 +106,6 @@ class ReviewQueueCounters(BaseModel):
     blocked_count: int
 
 
-class ReviewQueueStats(BaseModel):
-    counters: ReviewQueueCounters
-    oldest_pending_age_seconds: float | None = None
-    newest_item_age_seconds: float | None = None
-    failure_count: int
-    recent_failure_count: int
-    last_failure_at: datetime | None = None
-
-
 class WorkerStats(BaseModel):
     auto_processing_enabled: bool
     claimed_count: int
@@ -111,6 +114,15 @@ class WorkerStats(BaseModel):
     failed_count: int
     last_claimed_at: datetime | None = None
     last_review_completed_at: datetime | None = None
+    last_failure_at: datetime | None = None
+
+
+class ReviewQueueStats(BaseModel):
+    counters: ReviewQueueCounters
+    oldest_pending_age_seconds: float | None = None
+    newest_item_age_seconds: float | None = None
+    failure_count: int
+    recent_failure_count: int
     last_failure_at: datetime | None = None
 
 
@@ -129,6 +141,11 @@ class ReviewLifecycleVisibility(BaseModel):
     github_writeback_started_at: datetime | None = None
     github_writeback_completed_at: datetime | None = None
     github_writeback_success: bool | None = None
+    agent_bus_dispatch_started_at: datetime | None = None
+    agent_bus_dispatch_completed_at: datetime | None = None
+    agent_bus_dispatch_success: bool | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
     failure_count: int
     last_failure_at: datetime | None = None
     last_error: str | None = None
@@ -281,9 +298,15 @@ def record_lifecycle_stage(
     elif stage == ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED:
         item.github_writeback_completed_at = now
         item.github_writeback_success = success
+    elif stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED:
+        item.agent_bus_dispatch_started_at = now
+    elif stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED:
+        item.agent_bus_dispatch_completed_at = now
+        item.agent_bus_dispatch_success = success
     if error:
         item.last_error = error
         item.last_failure_at = now
+        item.agent_bus_dispatch_error = error if stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED else item.agent_bus_dispatch_error
         if stage != ReviewLifecycleStage.REVIEW_FAILED:
             item.failure_count += 1
     return item
@@ -346,6 +369,11 @@ def build_lifecycle_visibility(items: list[ReviewWorkItem]) -> list[ReviewLifecy
             github_writeback_started_at=item.github_writeback_started_at,
             github_writeback_completed_at=item.github_writeback_completed_at,
             github_writeback_success=item.github_writeback_success,
+            agent_bus_dispatch_started_at=item.agent_bus_dispatch_started_at,
+            agent_bus_dispatch_completed_at=item.agent_bus_dispatch_completed_at,
+            agent_bus_dispatch_success=item.agent_bus_dispatch_success,
+            agent_bus_work_item_id=item.agent_bus_work_item_id,
+            agent_bus_dispatch_error=item.agent_bus_dispatch_error,
             failure_count=item.failure_count,
             last_failure_at=item.last_failure_at,
             last_error=item.last_error,
