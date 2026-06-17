@@ -168,10 +168,15 @@ class SQLiteStateStore:
                     github_writeback_started_at,
                     github_writeback_completed_at,
                     github_writeback_success,
+                    agent_bus_dispatch_started_at,
+                    agent_bus_dispatch_completed_at,
+                    agent_bus_dispatch_success,
+                    agent_bus_work_item_id,
+                    agent_bus_dispatch_error,
                     failure_count,
                     last_failure_at,
                     last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
@@ -193,6 +198,11 @@ class SQLiteStateStore:
                     _dt(item.github_writeback_started_at),
                     _dt(item.github_writeback_completed_at),
                     _bool(item.github_writeback_success),
+                    _dt(item.agent_bus_dispatch_started_at),
+                    _dt(item.agent_bus_dispatch_completed_at),
+                    _bool(item.agent_bus_dispatch_success),
+                    item.agent_bus_work_item_id,
+                    item.agent_bus_dispatch_error,
                     item.failure_count,
                     _dt(item.last_failure_at),
                     item.last_error,
@@ -387,6 +397,8 @@ class SQLiteStateStore:
         data = dict(row)
         if data.get("github_writeback_success") is not None:
             data["github_writeback_success"] = bool(data["github_writeback_success"])
+        if data.get("agent_bus_dispatch_success") is not None:
+            data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
         return ReviewWorkItem.model_validate(data)
 
 
@@ -433,6 +445,11 @@ _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("github_writeback_started_at", "TEXT"),
     ("github_writeback_completed_at", "TEXT"),
     ("github_writeback_success", "INTEGER"),
+    ("agent_bus_dispatch_started_at", "TEXT"),
+    ("agent_bus_dispatch_completed_at", "TEXT"),
+    ("agent_bus_dispatch_success", "INTEGER"),
+    ("agent_bus_work_item_id", "TEXT"),
+    ("agent_bus_dispatch_error", "TEXT"),
     ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
     ("last_failure_at", "TEXT"),
     ("last_error", "TEXT"),
