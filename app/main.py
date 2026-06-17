@@ -6,6 +6,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 
 from app.config import Settings, get_settings
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
+from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
 from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, event_store, webhook_delivery_key
 from app.github_context import hydrate_github_context
@@ -402,6 +403,11 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     log_github_writeback_attempted()
     record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED)
     github_client = GitHubClient(token=settings.github_token)
+    agent_bus_client = (
+        AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token)
+        if settings.enable_agent_bus_dispatch
+        else None
+    )
     try:
         writeback = await writeback_review_decision(response, github_client)
         response.github_writeback_attempted = writeback.attempted
@@ -414,17 +420,40 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
             error=writeback.error,
         )
         if writeback.success and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
+            if settings.enable_agent_bus_dispatch:
+                record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED)
             task_dispatch = await dispatch_next_agent_task(
                 response.work_item.repo_full_name,
                 github_client,
                 enabled=settings.enable_task_dispatch,
+                agent_bus_client=agent_bus_client,
+                agent_bus_enabled=settings.enable_agent_bus_dispatch,
+                owner_agent=settings.agent_bus_owner_agent,
+                review_agent=settings.agent_bus_review_agent,
+                work_branch=settings.work_branch,
             )
             response.task_dispatch_attempted = task_dispatch.attempted
             response.task_dispatch_success = task_dispatch.success
             response.task_dispatch_issue_number = task_dispatch.issue_number
             response.task_dispatch_error = task_dispatch.error
+            response.agent_bus_dispatch_attempted = task_dispatch.agent_bus_attempted
+            response.agent_bus_dispatch_success = task_dispatch.agent_bus_success
+            response.agent_bus_work_item_id = task_dispatch.agent_bus_work_item_id
+            response.agent_bus_dispatch_error = task_dispatch.agent_bus_error
+            response.agent_bus_payload = task_dispatch.agent_bus_payload
+            response.work_item.agent_bus_work_item_id = task_dispatch.agent_bus_work_item_id
+            response.work_item.agent_bus_dispatch_error = task_dispatch.agent_bus_error
+            if task_dispatch.agent_bus_attempted:
+                record_lifecycle_stage(
+                    response.work_item,
+                    ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED,
+                    success=task_dispatch.agent_bus_success,
+                    error=task_dispatch.agent_bus_error,
+                )
     finally:
         await github_client.aclose()
+        if agent_bus_client is not None:
+            await agent_bus_client.aclose()
 
     log_github_writeback_result(
         attempted=response.github_writeback_attempted,
