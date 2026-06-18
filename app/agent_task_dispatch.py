@@ -51,7 +51,7 @@ async def dispatch_agent_task_to_agent_bus(
     review_agent: str = "bb2",
 ) -> str:
     response = await client.create_work_item(build_agent_bus_work_item_payload(task, review_agent=review_agent))
-    raw_work_item_id = response.get("work_item_id") or response.get("id")
+    raw_work_item_id = response.get("work_item_id")
     if not raw_work_item_id:
         raise AgentTaskDispatchError("Agent Bus work item response did not include work_item_id.")
     return str(raw_work_item_id)

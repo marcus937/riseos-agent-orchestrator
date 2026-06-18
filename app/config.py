@@ -28,7 +28,7 @@ class Settings:
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
-    enable_runtime_validation_review_bridge: bool = True
+    enable_runtime_validation_review_bridge: bool = False
     enable_agent_bus_dispatch: bool = False
     agent_bus_base_url: str | None = None
     agent_bus_token: str | None = None
@@ -90,7 +90,7 @@ def get_settings() -> Settings:
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
-        enable_runtime_validation_review_bridge=os.getenv("ENABLE_RUNTIME_VALIDATION_REVIEW_BRIDGE", "true").lower() != "false",
+        enable_runtime_validation_review_bridge=_bool_env("ENABLE_RUNTIME_VALIDATION_REVIEW_BRIDGE"),
         enable_agent_bus_dispatch=_bool_env("ENABLE_AGENT_BUS_DISPATCH"),
         agent_bus_base_url=os.getenv("AGENT_BUS_BASE_URL"),
         agent_bus_token=os.getenv("AGENT_BUS_TOKEN"),

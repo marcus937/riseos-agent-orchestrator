@@ -4,10 +4,9 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from app.circuit_runtime_validation import RuntimeValidationRequest, RuntimeValidationResult, stable_validation_digest
+from app.circuit_runtime_validation import RuntimeValidationResult, stable_validation_digest
 from app.config import Settings
 from app.github_events import GitHubEventType, ParsedGitHubEvent
-from app.hermes_dispatch_impl import _preview_url_from_payload, _route_reason
 from app.review_queue import (
     ReviewLifecycleStage,
     ReviewWorkItem,
@@ -22,32 +21,6 @@ TERMINAL_RUNTIME_VALIDATION_STATUSES = {"blocked", "completed", "failed"}
 RUNTIME_REVIEW_SOURCE = "runtime_validation_bb2_packet"
 
 
-def runtime_validation_required_for_parsed(
-    parsed: ParsedGitHubEvent,
-    settings: Settings,
-    *,
-    has_review_context: bool,
-) -> bool:
-    if not settings.enable_runtime_validation_review_bridge or not has_review_context:
-        return False
-    if parsed.event_type != GitHubEventType.PULL_REQUEST:
-        return False
-    return _route_reason(parsed) is not None
-
-
-def runtime_validation_request_from_parsed(parsed: ParsedGitHubEvent, settings: Settings) -> RuntimeValidationRequest:
-    return RuntimeValidationRequest(
-        repo=parsed.repository or "unknown",
-        issue_number=parsed.issue_number,
-        pr_number=parsed.pull_request_number,
-        branch=parsed.head_ref or settings.work_branch,
-        target_url=_preview_url_from_payload(parsed.raw) or settings.hermes_default_target,
-        validation_type="playwright",
-        requested_by="orchestrator_webhook",
-        correlation_id=None,
-    )
-
-
 def create_runtime_validation_pending_item(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
     item = review_work_item_from_parsed(parsed)
     item.status = ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING
@@ -55,12 +28,7 @@ def create_runtime_validation_pending_item(parsed: ParsedGitHubEvent) -> ReviewW
     return item
 
 
-def enqueue_runtime_pending_item(
-    item: ReviewWorkItem,
-    *,
-    storage: Any | None = None,
-    max_review_items: int = 500,
-) -> ReviewWorkItem:
+def enqueue_runtime_pending_item(item: ReviewWorkItem, *, storage: Any | None = None, max_review_items: int = 500) -> ReviewWorkItem:
     duplicate = _find_existing_runtime_item(item, storage=storage)
     if duplicate is not None:
         return duplicate
@@ -85,19 +53,16 @@ def enqueue_review_from_runtime_validation(
         return None
 
     digest = stable_validation_digest(result)
-    duplicate = _find_existing_runtime_result(result, digest=digest, storage=storage)
-    if duplicate is not None and duplicate.lifecycle_stage == ReviewLifecycleStage.BB2_REVIEW_REQUESTED_FROM_RUNTIME_VALIDATION:
+    duplicate = _find_exact_runtime_result(result, digest=digest, storage=storage)
+    if duplicate is not None:
+        result.bb2.packet_created = True
         result.bb2.review_requested = True
         return duplicate
 
-    item = duplicate or existing_item or _review_work_item_from_runtime_validation(result)
+    item = existing_item or _find_pending_runtime_result(result, storage=storage) or _review_work_item_from_runtime_validation(result)
     _attach_runtime_validation_context(item, result, digest=digest)
 
-    terminal_stage = (
-        ReviewLifecycleStage.RUNTIME_VALIDATION_COMPLETED
-        if result.status == "completed"
-        else ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED
-    )
+    terminal_stage = ReviewLifecycleStage.RUNTIME_VALIDATION_COMPLETED if result.status == "completed" else ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED
     record_lifecycle_stage(item, terminal_stage, error=result.error)
     item.status = ReviewWorkItemStatus.PENDING_REVIEW
     record_lifecycle_stage(item, ReviewLifecycleStage.BB2_REVIEW_REQUESTED_FROM_RUNTIME_VALIDATION)
@@ -107,7 +72,6 @@ def enqueue_review_from_runtime_validation(
     if storage is not None:
         storage.save_review_work_item(item)
         return item
-
     queued = review_queue.add_if_absent(item)
     return queued
 
@@ -186,23 +150,23 @@ def _find_existing_runtime_item(item: ReviewWorkItem, *, storage: Any | None = N
     return None
 
 
-def _find_existing_runtime_result(
-    result: RuntimeValidationResult,
-    *,
-    digest: str,
-    storage: Any | None = None,
-) -> ReviewWorkItem | None:
+def _find_exact_runtime_result(result: RuntimeValidationResult, *, digest: str, storage: Any | None = None) -> ReviewWorkItem | None:
     items = storage.list_review_work_items() if storage is not None else review_queue.list_items()
     for item in items:
         if item.runtime_validation_id == result.validation_id or item.runtime_validation_digest == digest:
             return item
+    return None
+
+
+def _find_pending_runtime_result(result: RuntimeValidationResult, *, storage: Any | None = None) -> ReviewWorkItem | None:
+    items = storage.list_review_work_items() if storage is not None else review_queue.list_items()
     for item in items:
         if (
             item.repo_full_name == result.repo
             and item.pr_number == result.pr_number
             and item.issue_number == result.issue_number
             and item.branch == result.branch
-            and item.status in {ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING, ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}
+            and item.status == ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING
         ):
             return item
     return None

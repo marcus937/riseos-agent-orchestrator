@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import socket
 import uuid
 from datetime import UTC, datetime
@@ -445,5 +446,9 @@ def _is_vercel_preview_host(host: str) -> bool:
 
 
 def stable_validation_digest(result: RuntimeValidationResult) -> str:
-    payload = result.model_dump_json(exclude={"created_at", "completed_at"}, sort_keys=True)
+    payload = json.dumps(
+        result.model_dump(mode="json", exclude={"created_at", "completed_at"}),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
