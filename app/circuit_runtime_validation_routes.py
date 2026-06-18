@@ -17,12 +17,7 @@ from app.config import Settings, get_settings
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
-_RUNTIME_VALIDATION_ROUTE_PATHS = {
-    "/api/v1/runtime-validations",
-    "/api/v1/runtime-validations/{validation_id}",
-    "/api/v1/runtime-validations/{validation_id}/evidence",
-    "/api/v1/runtime-validations/{validation_id}/bb2-packet",
-}
+_RUNTIME_VALIDATION_ROUTE_PREFIX = "/api/v1/runtime-validations"
 
 
 def _require_runtime_admin_token(
@@ -92,8 +87,10 @@ async def get_runtime_validation_bb2_packet(
 
 def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
     existing_paths = {getattr(route, "path", None) for route in app.routes}
-    if _RUNTIME_VALIDATION_ROUTE_PATHS.issubset(existing_paths):
-        app.state.circuit_runtime_validation_routes_registered = True
+    if getattr(app.state, "circuit_runtime_validation_routes_registered", False) and any(
+        str(path).startswith(_RUNTIME_VALIDATION_ROUTE_PREFIX) for path in existing_paths if path is not None
+    ):
         return
     app.include_router(router)
+    app.router.routes = [route for route in app.router.routes if hasattr(route, "path")]
     app.state.circuit_runtime_validation_routes_registered = True
