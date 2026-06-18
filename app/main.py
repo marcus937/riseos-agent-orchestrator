@@ -64,7 +64,7 @@ from app.runtime_validation_review_bridge import (
     enqueue_runtime_pending_item,
 )
 from app.security import verify_github_signature
-from app.slack_issue_dispatch import dispatch_ready_issue_to_slack
+from app.slack_issue_dispatch import SlackIssueDispatchResult, dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
 from app.task_dispatch import dispatch_next_agent_task
 from app.workflow_routes import register_workflow_routes
@@ -381,19 +381,24 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
                 review_agent=settings.agent_bus_review_agent,
                 work_branch=settings.work_branch,
             )
-            response.task_dispatch_attempted = task_dispatch.attempted
-            response.task_dispatch_success = task_dispatch.success
-            response.task_dispatch_issue_number = task_dispatch.issue_number
-            response.task_dispatch_error = task_dispatch.error
-            response.agent_bus_dispatch_attempted = task_dispatch.agent_bus_attempted
-            response.agent_bus_dispatch_success = task_dispatch.agent_bus_success
-            response.agent_bus_work_item_id = task_dispatch.agent_bus_work_item_id
-            response.agent_bus_dispatch_error = task_dispatch.agent_bus_error
-            response.agent_bus_payload = task_dispatch.agent_bus_payload
-            response.work_item.agent_bus_work_item_id = task_dispatch.agent_bus_work_item_id
-            response.work_item.agent_bus_dispatch_error = task_dispatch.agent_bus_error
-            if task_dispatch.agent_bus_attempted:
-                record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED, success=task_dispatch.agent_bus_success, error=task_dispatch.agent_bus_error)
+            agent_bus_attempted = bool(getattr(task_dispatch, "agent_bus_attempted", False))
+            agent_bus_success = bool(getattr(task_dispatch, "agent_bus_success", False))
+            agent_bus_work_item_id = getattr(task_dispatch, "agent_bus_work_item_id", None)
+            agent_bus_error = getattr(task_dispatch, "agent_bus_error", None)
+            agent_bus_payload = getattr(task_dispatch, "agent_bus_payload", None)
+            response.task_dispatch_attempted = bool(getattr(task_dispatch, "attempted", False))
+            response.task_dispatch_success = bool(getattr(task_dispatch, "success", False))
+            response.task_dispatch_issue_number = getattr(task_dispatch, "issue_number", None)
+            response.task_dispatch_error = getattr(task_dispatch, "error", None)
+            response.agent_bus_dispatch_attempted = agent_bus_attempted
+            response.agent_bus_dispatch_success = agent_bus_success
+            response.agent_bus_work_item_id = agent_bus_work_item_id
+            response.agent_bus_dispatch_error = agent_bus_error
+            response.agent_bus_payload = agent_bus_payload
+            response.work_item.agent_bus_work_item_id = agent_bus_work_item_id
+            response.work_item.agent_bus_dispatch_error = agent_bus_error
+            if agent_bus_attempted:
+                record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED, success=agent_bus_success, error=agent_bus_error)
     finally:
         await github_client.aclose()
         if agent_bus_client is not None:
@@ -475,10 +480,19 @@ async def github_webhook(
 
     approved_repositories = _approved_repository_names()
     if storage is not None:
-        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings, registry=storage, approved_repositories=approved_repositories)
+        slack_dispatch = await _dispatch_ready_issue_to_slack(
+            parsed,
+            settings,
+            registry=storage,
+            approved_repositories=approved_repositories,
+        )
         storage.prune_processed_review_items(settings.orchestrator_max_review_items)
     else:
-        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings, approved_repositories=approved_repositories)
+        slack_dispatch = await _dispatch_ready_issue_to_slack(
+            parsed,
+            settings,
+            approved_repositories=approved_repositories,
+        )
     log_slack_issue_dispatch_result(parsed, slack_dispatch)
 
     if runtime_gated:
@@ -501,6 +515,28 @@ async def github_webhook(
 
     _schedule_auto_process_work_item(work_item, settings, storage, background_tasks)
     return _webhook_response(parsed, workflow)
+
+
+async def _dispatch_ready_issue_to_slack(
+    parsed: ParsedGitHubEvent,
+    settings: Settings,
+    *,
+    registry: Any | None = None,
+    approved_repositories: set[str] | None = None,
+) -> SlackIssueDispatchResult:
+    try:
+        return await dispatch_ready_issue_to_slack(
+            parsed,
+            settings,
+            registry=registry,
+            approved_repositories=approved_repositories,
+        )
+    except TypeError as exc:
+        if "approved_repositories" not in str(exc):
+            raise
+        if registry is not None:
+            return await dispatch_ready_issue_to_slack(parsed, settings, registry=registry)
+        return await dispatch_ready_issue_to_slack(parsed, settings)
 
 
 def _webhook_response(parsed: ParsedGitHubEvent, workflow: Any) -> WebhookAcceptedResponse:
