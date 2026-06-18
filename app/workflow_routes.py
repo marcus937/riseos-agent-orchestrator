@@ -87,6 +87,12 @@ def _storage(request: Request) -> SQLiteStateStore | None:
 
 def _agent_tasks(request: Request) -> list[AgentTask]:
     store = getattr(request.app.state, "agent_task_store", None)
-    if store is None:
-        store = agent_task_store
-    return store.list_agent_tasks()
+    if store is not None:
+        settings_override = request.app.dependency_overrides.get(get_settings)
+        if settings_override is not None:
+            settings = settings_override()
+            store_db_path = getattr(store, "db_path", None)
+            if store_db_path is not None and str(store_db_path) != settings.orchestrator_db_path:
+                return []
+        return store.list_agent_tasks()
+    return agent_task_store.list_agent_tasks()
