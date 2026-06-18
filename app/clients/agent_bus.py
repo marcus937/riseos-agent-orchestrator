@@ -23,7 +23,7 @@ class AgentBusAPIError(AgentBusClientError):
 
 
 class AgentBusClient:
-    """Small Agent Bus API wrapper for work-item creation."""
+    """Small Agent Bus API wrapper for documented WorkItem creation."""
 
     def __init__(
         self,
@@ -53,7 +53,10 @@ class AgentBusClient:
         )
         if response.status_code < 200 or response.status_code >= 300:
             raise AgentBusAPIError("POST", "/work-items", response.status_code, _response_detail(response))
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise AgentBusAPIError("POST", "/work-items", response.status_code, "Malformed JSON response.") from exc
         if not isinstance(data, dict):
             raise AgentBusAPIError("POST", "/work-items", response.status_code, "Expected object response.")
         return data
