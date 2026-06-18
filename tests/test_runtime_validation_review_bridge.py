@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.circuit_runtime_validation import (
@@ -9,13 +10,61 @@ from app.circuit_runtime_validation import (
     RuntimeValidationEvidenceSummary,
     RuntimeValidationHermesSummary,
     RuntimeValidationResult,
+    runtime_validation_store,
 )
 from app.config import get_settings
 from app.event_store import event_store
+from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
 from app.main import app
 from app.review_queue import ReviewLifecycleStage, ReviewWorkItemStatus, review_queue
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
 from app.security import build_signature
+
+
+@pytest.fixture(autouse=True)
+def reset_state() -> None:
+    get_settings.cache_clear()
+    event_store.reset()
+    review_queue.reset()
+    app.dependency_overrides.clear()
+
+
+class SuccessfulRuntimeHermesClient:
+    async def post_runtime_validation(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "PASSED", "jobId": "job-111"}
+
+    async def collect_evidence(
+        self,
+        base_url: str,
+        token: str,
+        job_id: str,
+        settings: Any,
+    ) -> HermesEvidenceSnapshot:
+        return HermesEvidenceSnapshot(
+            job_id=job_id,
+            manifest_fetched=True,
+            bundle_fetched=True,
+            page_title="Mission Control",
+            final_url="https://jarvis-mission-control-gules.vercel.app",
+            http_status=200,
+            screenshot_present=True,
+            console_warning_count=0,
+            console_error_count=0,
+            network_failure_count=0,
+            network_non_2xx_count=0,
+            artifacts=[
+                HermesEvidenceArtifact(
+                    file_name="summary.json",
+                    content_type="application/json",
+                    size=123,
+                    sha256="abc123",
+                    retrieval_note="GET /api/v1/evidence/job-111/files/summary.json",
+                )
+            ],
+        )
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _client(
@@ -126,8 +175,13 @@ def _result(status: str = "completed", *, validation_id: str = "validation-1") -
     )
 
 
-def test_successful_hermes_result_enqueues_bb2_review_with_evidence() -> None:
+def test_successful_hermes_result_enqueues_bb2_review_with_evidence(monkeypatch) -> None:
     client = _client()
+    monkeypatch.setattr(runtime_validation_store, "_hermes_client_factory", lambda: SuccessfulRuntimeHermesClient())
+    monkeypatch.setattr(
+        "app.circuit_runtime_validation.socket.getaddrinfo",
+        lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 443))],
+    )
 
     response = client.post(
         "/api/v1/runtime-validations",
@@ -136,7 +190,7 @@ def test_successful_hermes_result_enqueues_bb2_review_with_evidence() -> None:
             "repo": "riseos/example",
             "pr_number": 111,
             "branch": "agent-integration",
-            "target_url": "http://127.0.0.1:3000",
+            "target_url": "https://jarvis-mission-control-gules.vercel.app",
         },
     )
 
@@ -144,7 +198,9 @@ def test_successful_hermes_result_enqueues_bb2_review_with_evidence() -> None:
     item = review_queue.list_items()[0]
     assert item.status == ReviewWorkItemStatus.PENDING_REVIEW
     assert item.lifecycle_stage == ReviewLifecycleStage.BB2_REVIEW_REQUESTED_FROM_RUNTIME_VALIDATION
-    assert item.runtime_validation_context["validation_status"] == "blocked"
+    assert item.runtime_validation_context["validation_status"] == "completed"
+    assert item.runtime_validation_context["screenshot_available"] is True
+    assert item.runtime_validation_context["evidence_artifacts"][0]["sha256"] == "abc123"
     assert response.json()["bb2"]["review_requested"] is True
 
 
