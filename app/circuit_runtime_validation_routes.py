@@ -92,5 +92,7 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
     ):
         return
     app.include_router(router)
-    app.router.routes = [route for route in app.router.routes if hasattr(route, "path")]
+    for route in app.router.routes:
+        if not hasattr(route, "path"):
+            setattr(route, "path", "")
     app.state.circuit_runtime_validation_routes_registered = True
