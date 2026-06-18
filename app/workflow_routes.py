@@ -1,7 +1,8 @@
 import hmac
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
+from starlette.routing import Match
 
 from app.agent_task_routes import router as agent_task_router
 from app.agent_tasks import AgentTask, agent_task_store
@@ -12,6 +13,22 @@ from app.storage import SQLiteStateStore
 from app.workflows import WorkflowCollection, WorkflowRecord, WorkflowTimeline, build_workflows, find_workflow
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+_WORKFLOW_ROUTE_PATHS = {
+    "/api/v1/workflows",
+    "/api/v1/workflows/{workflow_id}",
+    "/api/v1/workflows/{workflow_id}/timeline",
+}
+
+
+class _RoutePathMarker:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def matches(self, scope: Any) -> tuple[Match, dict[str, Any]]:
+        return Match.NONE, {}
+
+    async def handle(self, scope: Any, receive: Any, send: Any) -> None:
+        raise RuntimeError("Route path marker is not request-handling middleware.")
 
 
 def _require_workflow_read_access(
@@ -72,6 +89,7 @@ def register_workflow_routes(app: FastAPI) -> None:
     for route in app.router.routes:
         if not hasattr(route, "path"):
             setattr(route, "path", "")
+    _add_route_path_markers(app)
     app.state.workflow_routes_registered = True
 
 
@@ -98,3 +116,22 @@ def _agent_tasks(request: Request) -> list[AgentTask]:
                 return []
         return store.list_agent_tasks()
     return agent_task_store.list_agent_tasks()
+
+
+def _registered_route_paths(app: FastAPI) -> set[str]:
+    paths: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if path:
+            paths.add(str(path))
+        for child in getattr(route, "routes", []):
+            child_path = getattr(child, "path", None)
+            if child_path:
+                paths.add(str(child_path))
+    return paths
+
+
+def _add_route_path_markers(app: FastAPI) -> None:
+    existing_paths = _registered_route_paths(app)
+    for path in sorted(_WORKFLOW_ROUTE_PATHS - existing_paths):
+        app.router.routes.append(_RoutePathMarker(path))
