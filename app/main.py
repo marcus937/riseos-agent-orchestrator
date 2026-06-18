@@ -203,7 +203,11 @@ async def create_agent_task(
     _require_admin_token(settings, x_orchestrator_admin_token)
     registry = _repository_registry()
     existed_before = registry.get_repository_registry_record(task.repo_full_name) is not None
-    record = ensure_orchestration_enabled_repository(registry, task.repo_full_name)
+    record = ensure_orchestration_enabled_repository(
+        registry,
+        task.repo_full_name,
+        trusted_owner=settings.trusted_repository_owner,
+    )
     if record is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
     if record.archived:
