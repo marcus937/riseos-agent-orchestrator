@@ -69,7 +69,9 @@ def register_workflow_routes(app: FastAPI) -> None:
         return
     app.include_router(router)
     app.include_router(agent_task_router)
-    app.router.routes = [route for route in app.router.routes if hasattr(route, "path")]
+    for route in app.router.routes:
+        if not hasattr(route, "path"):
+            setattr(route, "path", "")
     app.state.workflow_routes_registered = True
 
 
