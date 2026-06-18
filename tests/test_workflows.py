@@ -76,17 +76,30 @@ def _post_pull_request_event(client: TestClient, action: str, *, merged: bool, s
     assert response.status_code == 200
 
 
+def _route_paths(test_app: FastAPI) -> set[str]:
+    paths: set[str] = set()
+    for route in test_app.routes:
+        path = getattr(route, "path", None)
+        if path:
+            paths.add(str(path))
+        for child in getattr(route, "routes", []):
+            child_path = getattr(child, "path", None)
+            if child_path:
+                paths.add(str(child_path))
+    return paths
+
+
 def test_workflow_routes_are_registered_from_application_composition() -> None:
     runtime_only_app = FastAPI()
     register_circuit_runtime_validation_routes(runtime_only_app)
-    assert any(route.path.startswith("/api/v1/runtime-validations") for route in runtime_only_app.routes)
-    assert not any(route.path.startswith("/api/v1/workflows") for route in runtime_only_app.routes)
+    assert any(path.startswith("/api/v1/runtime-validations") for path in _route_paths(runtime_only_app))
+    assert not any(path.startswith("/api/v1/workflows") for path in _route_paths(runtime_only_app))
 
     composed_app = FastAPI()
     register_workflow_routes(composed_app)
     register_circuit_runtime_validation_routes(composed_app)
-    assert any(route.path == "/api/v1/workflows" for route in composed_app.routes)
-    assert any(route.path.startswith("/api/v1/runtime-validations") for route in composed_app.routes)
+    assert "/api/v1/workflows" in _route_paths(composed_app)
+    assert any(path.startswith("/api/v1/runtime-validations") for path in _route_paths(composed_app))
 
 
 def test_workflow_endpoints_return_canonical_record_and_timeline() -> None:
