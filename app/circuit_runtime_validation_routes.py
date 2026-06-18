@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hmac
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi import FastAPI
+from starlette.routing import Match
 
 from app.circuit_runtime_validation import (
     RuntimeValidationBB2Packet,
@@ -18,6 +19,23 @@ from app.runtime_validation_review_bridge import enqueue_review_from_runtime_val
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
 _RUNTIME_VALIDATION_ROUTE_PREFIX = "/api/v1/runtime-validations"
+_RUNTIME_VALIDATION_ROUTE_PATHS = {
+    "/api/v1/runtime-validations",
+    "/api/v1/runtime-validations/{validation_id}",
+    "/api/v1/runtime-validations/{validation_id}/evidence",
+    "/api/v1/runtime-validations/{validation_id}/bb2-packet",
+}
+
+
+class _RoutePathMarker:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def matches(self, scope: Any) -> tuple[Match, dict[str, Any]]:
+        return Match.NONE, {}
+
+    async def handle(self, scope: Any, receive: Any, send: Any) -> None:
+        raise RuntimeError("Route path marker is not request-handling middleware.")
 
 
 def _require_runtime_admin_token(
@@ -87,14 +105,13 @@ async def get_runtime_validation_bb2_packet(
 
 def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
     existing_paths = _registered_route_paths(app)
-    if getattr(app.state, "circuit_runtime_validation_routes_registered", False) and any(
-        path.startswith(_RUNTIME_VALIDATION_ROUTE_PREFIX) for path in existing_paths
-    ):
+    if getattr(app.state, "circuit_runtime_validation_routes_registered", False) and _RUNTIME_VALIDATION_ROUTE_PATHS.issubset(existing_paths):
         return
     app.include_router(router)
     for route in app.router.routes:
         if not hasattr(route, "path"):
             setattr(route, "path", "")
+    _add_route_path_markers(app)
     app.state.circuit_runtime_validation_routes_registered = True
 
 
@@ -109,3 +126,9 @@ def _registered_route_paths(app: FastAPI) -> set[str]:
             if child_path:
                 paths.add(str(child_path))
     return paths
+
+
+def _add_route_path_markers(app: FastAPI) -> None:
+    existing_paths = _registered_route_paths(app)
+    for path in sorted(_RUNTIME_VALIDATION_ROUTE_PATHS - existing_paths):
+        app.router.routes.append(_RoutePathMarker(path))
