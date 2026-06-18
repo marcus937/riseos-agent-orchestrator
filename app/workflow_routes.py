@@ -4,7 +4,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
 
 from app.agent_task_routes import router as agent_task_router
-from app.agent_tasks import AgentTask, build_agent_task_store
+from app.agent_tasks import AgentTask, agent_task_store
 from app.config import Settings, get_settings
 from app.event_store import event_store
 from app.review_queue import review_queue
@@ -87,6 +87,5 @@ def _storage(request: Request) -> SQLiteStateStore | None:
 def _agent_tasks(request: Request) -> list[AgentTask]:
     store = getattr(request.app.state, "agent_task_store", None)
     if store is None:
-        store = build_agent_task_store(get_settings().orchestrator_db_path)
-        request.app.state.agent_task_store = store
+        store = agent_task_store
     return store.list_agent_tasks()
