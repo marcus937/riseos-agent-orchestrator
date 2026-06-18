@@ -13,6 +13,7 @@ from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, 
 from app.github_context import hydrate_github_context
 from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
+from app.hermes_contract import runtime_validation_request_from_parsed, runtime_validation_required_for_parsed
 from app.hermes_dispatch import dispatch_hermes_runtime_validation
 from app.operational_logging import (
     log_github_writeback_result,
@@ -44,6 +45,7 @@ from app.review_queue import (
     ReviewProcessResponse,
     ReviewQueueStats,
     ReviewWorkItem,
+    ReviewWorkItemStatus,
     WorkerStats,
     build_lifecycle_visibility,
     build_queue_stats,
@@ -60,8 +62,6 @@ from app.runtime_validation_review_bridge import (
     create_runtime_validation_pending_item,
     enqueue_review_from_runtime_validation,
     enqueue_runtime_pending_item,
-    runtime_validation_request_from_parsed,
-    runtime_validation_required_for_parsed,
 )
 from app.security import verify_github_signature
 from app.slack_issue_dispatch import dispatch_ready_issue_to_slack
@@ -90,12 +90,7 @@ async def startup() -> None:
     if settings.enable_repository_discovery and settings.github_repository_owner:
         github_client = GitHubClient(token=settings.github_token)
         try:
-            await discover_repositories(
-                settings.github_repository_owner,
-                settings,
-                github_client,
-                _repository_registry(),
-            )
+            await discover_repositories(settings.github_repository_owner, settings, github_client, _repository_registry())
         except Exception as exc:
             app.state.last_repository_discovery_error = str(exc)
         finally:
@@ -200,13 +195,8 @@ async def orchestrator_snapshot(
 
 
 @app.get("/debug/repositories")
-async def debug_repositories(
-    _: None = Depends(_require_debug_read_access),
-) -> dict[str, object]:
-    return {
-        "repositories": repository_diagnostics(_repository_registry()),
-        "last_discovery_error": getattr(app.state, "last_repository_discovery_error", None),
-    }
+async def debug_repositories(_: None = Depends(_require_debug_read_access)) -> dict[str, object]:
+    return {"repositories": repository_diagnostics(_repository_registry()), "last_discovery_error": getattr(app.state, "last_repository_discovery_error", None)}
 
 
 @app.post("/debug/repositories/discover", response_model=RepositoryDiscoveryResult)
@@ -219,12 +209,7 @@ async def debug_discover_repositories(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GITHUB_REPOSITORY_OWNER is required.")
     github_client = GitHubClient(token=settings.github_token)
     try:
-        result = await discover_repositories(
-            settings.github_repository_owner,
-            settings,
-            github_client,
-            _repository_registry(),
-        )
+        result = await discover_repositories(settings.github_repository_owner, settings, github_client, _repository_registry())
     finally:
         await github_client.aclose()
     app.state.last_repository_discovery_error = None
@@ -232,60 +217,42 @@ async def debug_discover_repositories(
 
 
 @app.get("/debug/recent-events", response_model=list[EventRecord])
-async def recent_events(
-    _: None = Depends(_require_debug_read_access),
-) -> list[EventRecord]:
+async def recent_events(_: None = Depends(_require_debug_read_access)) -> list[EventRecord]:
     return _recent_events()
 
 
 @app.get("/debug/health", response_model=DebugHealth)
-async def debug_health(
-    _: None = Depends(_require_debug_read_access),
-) -> DebugHealth:
+async def debug_health(_: None = Depends(_require_debug_read_access)) -> DebugHealth:
     return _debug_health()
 
 
 @app.get("/debug/review-queue", response_model=list[ReviewWorkItem])
-async def debug_review_queue(
-    _: None = Depends(_require_debug_read_access),
-) -> list[ReviewWorkItem]:
+async def debug_review_queue(_: None = Depends(_require_debug_read_access)) -> list[ReviewWorkItem]:
     return _review_items()
 
 
 @app.get("/debug/review-queue/stats", response_model=ReviewQueueStats)
-async def debug_review_queue_stats(
-    _: None = Depends(_require_debug_read_access),
-) -> ReviewQueueStats:
+async def debug_review_queue_stats(_: None = Depends(_require_debug_read_access)) -> ReviewQueueStats:
     return _review_queue_stats(_review_items())
 
 
 @app.get("/debug/workers/stats", response_model=WorkerStats)
-async def debug_worker_stats(
-    _: None = Depends(_require_debug_read_access),
-    settings: Settings = Depends(get_settings),
-) -> WorkerStats:
+async def debug_worker_stats(_: None = Depends(_require_debug_read_access), settings: Settings = Depends(get_settings)) -> WorkerStats:
     return build_worker_stats(_review_items(), auto_processing_enabled=settings.enable_auto_review_processing)
 
 
 @app.get("/debug/review-lifecycle", response_model=list[ReviewLifecycleVisibility])
-async def debug_review_lifecycle(
-    _: None = Depends(_require_debug_read_access),
-) -> list[ReviewLifecycleVisibility]:
+async def debug_review_lifecycle(_: None = Depends(_require_debug_read_access)) -> list[ReviewLifecycleVisibility]:
     return build_lifecycle_visibility(_review_items())
 
 
 @app.get("/debug/recent-failures", response_model=list[RecentFailure])
-async def debug_recent_failures(
-    _: None = Depends(_require_debug_read_access),
-) -> list[RecentFailure]:
+async def debug_recent_failures(_: None = Depends(_require_debug_read_access)) -> list[RecentFailure]:
     return build_recent_failures(_review_items())
 
 
 @app.get("/debug/review-queue/{item_id}", response_model=ReviewWorkItem)
-async def debug_review_queue_item(
-    item_id: str,
-    _: None = Depends(_require_debug_read_access),
-) -> ReviewWorkItem:
+async def debug_review_queue_item(item_id: str, _: None = Depends(_require_debug_read_access)) -> ReviewWorkItem:
     storage = _storage()
     item = storage.get_review_work_item(item_id) if storage is not None else review_queue.get_item(item_id)
     if item is None:
@@ -308,12 +275,10 @@ async def process_debug_review_queue_item(
         result = await _process_work_item(item, settings)
         storage.save_review_work_item(result.work_item)
         return result
-
     item = review_queue.get_item(item_id)
     if item is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review work item not found")
-    result = await _process_work_item(item, settings)
-    return result
+    return await _process_work_item(item, settings)
 
 
 async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
@@ -329,16 +294,10 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     runtime_evidence_error: str | None = None
     runtime_evidence_truncated = False
 
-    if not settings.enable_github_context_hydration:
-        pass
-    else:
+    if settings.enable_github_context_hydration:
         github_client = GitHubClient(token=settings.github_token)
         try:
-            github_context = await hydrate_github_context(
-                item,
-                github_client,
-                base_branch=settings.base_branch,
-            )
+            github_context = await hydrate_github_context(item, github_client, base_branch=settings.base_branch)
         except Exception as exc:
             github_context_error = str(exc)
             record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_FAILED, error=github_context_error)
@@ -372,18 +331,9 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         runtime_evidence_error=runtime_evidence_error,
         runtime_evidence_truncated=runtime_evidence_truncated,
     )
-    log_openai_review_result(
-        attempted=openai_review.attempted,
-        success=openai_review.success,
-        error=openai_review.error,
-        reviewer_model=openai_review.reviewer_model,
-    )
+    log_openai_review_result(attempted=openai_review.attempted, success=openai_review.success, error=openai_review.error, reviewer_model=openai_review.reviewer_model)
     if openai_review.attempted:
-        record_lifecycle_stage(
-            item,
-            ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED if openai_review.success else ReviewLifecycleStage.OPENAI_REVIEW_FAILED,
-            error=openai_review.error,
-        )
+        record_lifecycle_stage(item, ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED if openai_review.success else ReviewLifecycleStage.OPENAI_REVIEW_FAILED, error=openai_review.error)
 
     response = process_review_work_item(
         item,
@@ -411,22 +361,13 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     log_github_writeback_attempted()
     record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED)
     github_client = GitHubClient(token=settings.github_token)
-    agent_bus_client = (
-        AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token)
-        if settings.enable_agent_bus_dispatch
-        else None
-    )
+    agent_bus_client = AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token) if settings.enable_agent_bus_dispatch else None
     try:
         writeback = await writeback_review_decision(response, github_client)
         response.github_writeback_attempted = writeback.attempted
         response.github_writeback_success = writeback.success
         response.github_writeback_error = writeback.error
-        record_lifecycle_stage(
-            response.work_item,
-            ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED,
-            success=writeback.success,
-            error=writeback.error,
-        )
+        record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED, success=writeback.success, error=writeback.error)
         if writeback.success and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
             if settings.enable_agent_bus_dispatch:
                 record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED)
@@ -452,22 +393,13 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
             response.work_item.agent_bus_work_item_id = task_dispatch.agent_bus_work_item_id
             response.work_item.agent_bus_dispatch_error = task_dispatch.agent_bus_error
             if task_dispatch.agent_bus_attempted:
-                record_lifecycle_stage(
-                    response.work_item,
-                    ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED,
-                    success=task_dispatch.agent_bus_success,
-                    error=task_dispatch.agent_bus_error,
-                )
+                record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED, success=task_dispatch.agent_bus_success, error=task_dispatch.agent_bus_error)
     finally:
         await github_client.aclose()
         if agent_bus_client is not None:
             await agent_bus_client.aclose()
 
-    log_github_writeback_result(
-        attempted=response.github_writeback_attempted,
-        success=response.github_writeback_success,
-        error=response.github_writeback_error,
-    )
+    log_github_writeback_result(attempted=response.github_writeback_attempted, success=response.github_writeback_success, error=response.github_writeback_error)
     log_review_completed(response.work_item, decision=response.decision.decision.value)
     record_lifecycle_stage(response.work_item, ReviewLifecycleStage.REVIEW_COMPLETED)
     return response
@@ -479,17 +411,11 @@ def _runtime_evidence_context_from_item(item: ReviewWorkItem) -> list[dict[str, 
     return []
 
 
-def _schedule_auto_process_work_item(
-    item: ReviewWorkItem | None,
-    settings: Settings,
-    storage: SQLiteStateStore | None,
-    background_tasks: BackgroundTasks,
-) -> bool:
+def _schedule_auto_process_work_item(item: ReviewWorkItem | None, settings: Settings, storage: SQLiteStateStore | None, background_tasks: BackgroundTasks) -> bool:
     if item is None or not settings.enable_auto_review_processing:
         return False
-    if item.status != item.status.PENDING_REVIEW:
+    if item.status != ReviewWorkItemStatus.PENDING_REVIEW:
         return False
-
     background_tasks.add_task(process_queued_review_item, item.id, settings, storage, _process_work_item)
     return True
 
@@ -507,17 +433,14 @@ async def github_webhook(
     if not verify_github_signature(settings.github_webhook_secret, body, x_hub_signature_256):
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid GitHub webhook signature")
-
     if not x_github_event:
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing GitHub event header")
-
     try:
         payload: dict[str, Any] = await request.json()
     except Exception as exc:
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
-
     try:
         parsed = parse_github_event(x_github_event, payload)
     except UnsupportedGitHubEventError as exc:
@@ -544,40 +467,29 @@ async def github_webhook(
     has_review_context = workflow.review_context is not None
     runtime_gated = runtime_validation_required_for_parsed(parsed, settings, has_review_context=has_review_context)
     if runtime_gated:
-        work_item = enqueue_runtime_pending_item(
-            create_runtime_validation_pending_item(parsed),
-            storage=storage,
-            max_review_items=settings.orchestrator_max_review_items,
-        )
+        work_item = enqueue_runtime_pending_item(create_runtime_validation_pending_item(parsed), storage=storage, max_review_items=settings.orchestrator_max_review_items)
         log_queue_item_created(work_item)
     else:
         work_item = _create_review_work_item(parsed, has_review_context, settings)
     _record_repository_event(parsed, work_item_created=work_item is not None)
+
     approved_repositories = _approved_repository_names()
     if storage is not None:
-        slack_dispatch = await dispatch_ready_issue_to_slack(
-            parsed,
-            settings,
-            registry=storage,
-            approved_repositories=approved_repositories,
-        )
+        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings, registry=storage, approved_repositories=approved_repositories)
         storage.prune_processed_review_items(settings.orchestrator_max_review_items)
     else:
-        slack_dispatch = await dispatch_ready_issue_to_slack(
-            parsed,
-            settings,
-            approved_repositories=approved_repositories,
-        )
+        slack_dispatch = await dispatch_ready_issue_to_slack(parsed, settings, approved_repositories=approved_repositories)
     log_slack_issue_dispatch_result(parsed, slack_dispatch)
 
     if runtime_gated:
-        validation = await runtime_validation_store.trigger(runtime_validation_request_from_parsed(parsed, settings), settings)
-        work_item = enqueue_review_from_runtime_validation(
-            validation,
-            settings,
-            storage=storage,
-            existing_item=work_item,
-        )
+        github_client = GitHubClient(token=settings.github_token) if settings.github_token else None
+        try:
+            validation_request = await runtime_validation_request_from_parsed(parsed, settings, github_client=github_client)
+            validation = await runtime_validation_store.trigger(validation_request, settings)
+        finally:
+            if github_client is not None:
+                await github_client.aclose()
+        work_item = enqueue_review_from_runtime_validation(validation, settings, storage=storage, existing_item=work_item)
     else:
         github_client = GitHubClient(token=settings.github_token) if settings.enable_github_writeback else None
         try:
@@ -588,7 +500,6 @@ async def github_webhook(
         log_hermes_dispatch_result(parsed, hermes_dispatch)
 
     _schedule_auto_process_work_item(work_item, settings, storage, background_tasks)
-
     return _webhook_response(parsed, workflow)
 
 
@@ -610,22 +521,14 @@ def _webhook_response(parsed: ParsedGitHubEvent, workflow: Any) -> WebhookAccept
 
 def _require_admin_token(settings: Settings, provided_token: str | None) -> None:
     if not settings.orchestrator_admin_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="ORCHESTRATOR_ADMIN_TOKEN is required before processing review queue items.",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="ORCHESTRATOR_ADMIN_TOKEN is required before processing review queue items.")
     if not provided_token or not hmac.compare_digest(provided_token, settings.orchestrator_admin_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid orchestrator admin token")
 
 
-def _create_review_work_item(
-    parsed: ParsedGitHubEvent,
-    has_review_context: bool,
-    settings: Settings,
-) -> ReviewWorkItem | None:
+def _create_review_work_item(parsed: ParsedGitHubEvent, has_review_context: bool, settings: Settings) -> ReviewWorkItem | None:
     if not has_review_context:
         return None
-
     item = review_work_item_from_parsed(parsed)
     storage = _storage()
     if storage is not None:
@@ -635,7 +538,6 @@ def _create_review_work_item(
         storage.save_review_work_item(item)
         log_queue_item_created(item)
         return item
-
     duplicate = review_queue.find_pending_duplicate(item)
     if duplicate is not None:
         return duplicate
