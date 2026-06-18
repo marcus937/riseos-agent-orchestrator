@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from app.admin_auth import require_orchestrator_admin_token
 from app.agent_task_dispatch import dispatch_agent_task_to_agent_bus
 from app.agent_tasks import (
     AgentTask,
@@ -26,6 +27,7 @@ router = APIRouter(prefix="/api/v1/agent-tasks", tags=["agent-tasks"])
 async def create_agent_task_endpoint(
     payload: AgentTaskCreateRequest,
     request: Request,
+    _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> AgentTaskCreateResponse:
     _require_orchestration_enabled_repository(payload.repo_full_name, request, settings)
@@ -65,6 +67,7 @@ async def create_agent_task_endpoint(
 @router.get("", response_model=list[AgentTask])
 async def list_agent_tasks(
     request: Request,
+    _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> list[AgentTask]:
     return _agent_task_store(request, settings).list_agent_tasks()
@@ -74,6 +77,7 @@ async def list_agent_tasks(
 async def get_agent_task(
     task_id: str,
     request: Request,
+    _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> AgentTask:
     task = _agent_task_store(request, settings).get_agent_task(task_id)
@@ -87,6 +91,7 @@ async def record_agent_task_execution_result(
     task_id: str,
     payload: AgentTaskExecutionResult,
     request: Request,
+    _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> AgentTask:
     store = _agent_task_store(request, settings)
