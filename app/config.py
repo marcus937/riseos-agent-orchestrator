@@ -10,6 +10,7 @@ class Settings:
     github_webhook_secret: str = ""
     github_webhook_callback_url: str | None = None
     github_repository_owner: str | None = None
+    trusted_repository_owner: str = "marcus937"
     github_token: str | None = None
     github_app_id: str | None = None
     github_app_private_key_path: str | None = None
@@ -72,6 +73,7 @@ def get_settings() -> Settings:
         github_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
         github_webhook_callback_url=os.getenv("GITHUB_WEBHOOK_CALLBACK_URL"),
         github_repository_owner=os.getenv("GITHUB_REPOSITORY_OWNER"),
+        trusted_repository_owner=os.getenv("TRUSTED_REPOSITORY_OWNER", "marcus937"),
         github_token=os.getenv("GITHUB_TOKEN"),
         github_app_id=os.getenv("GITHUB_APP_ID"),
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
