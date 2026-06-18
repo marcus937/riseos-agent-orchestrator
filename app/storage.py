@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -173,10 +174,15 @@ class SQLiteStateStore:
                     agent_bus_dispatch_success,
                     agent_bus_work_item_id,
                     agent_bus_dispatch_error,
+                    runtime_validation_id,
+                    runtime_validation_status,
+                    runtime_validation_digest,
+                    runtime_validation_completed_at,
+                    runtime_validation_context,
                     failure_count,
                     last_failure_at,
                     last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
@@ -203,6 +209,11 @@ class SQLiteStateStore:
                     _bool(item.agent_bus_dispatch_success),
                     item.agent_bus_work_item_id,
                     item.agent_bus_dispatch_error,
+                    item.runtime_validation_id,
+                    item.runtime_validation_status,
+                    item.runtime_validation_digest,
+                    _dt(item.runtime_validation_completed_at),
+                    _json(item.runtime_validation_context),
                     item.failure_count,
                     _dt(item.last_failure_at),
                     item.last_error,
@@ -216,7 +227,7 @@ class SQLiteStateStore:
             row = conn.execute(
                 """
                 SELECT * FROM review_work_items
-                WHERE status IN (?, ?)
+                WHERE status IN (?, ?, ?)
                   AND (repo_full_name IS ? OR repo_full_name = ?)
                   AND event_type = ?
                   AND (commit_sha IS ? OR commit_sha = ?)
@@ -226,6 +237,7 @@ class SQLiteStateStore:
                 LIMIT 1
                 """,
                 (
+                    ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING.value,
                     ReviewWorkItemStatus.PENDING_REVIEW.value,
                     ReviewWorkItemStatus.REVIEWING.value,
                     repo_full_name,
@@ -371,11 +383,12 @@ class SQLiteStateStore:
             rows = conn.execute(
                 """
                 SELECT id FROM review_work_items
-                WHERE status NOT IN (?, ?)
+                WHERE status NOT IN (?, ?, ?)
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
                 (
+                    ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING.value,
                     ReviewWorkItemStatus.PENDING_REVIEW.value,
                     ReviewWorkItemStatus.REVIEWING.value,
                     overage,
@@ -399,6 +412,7 @@ class SQLiteStateStore:
             data["github_writeback_success"] = bool(data["github_writeback_success"])
         if data.get("agent_bus_dispatch_success") is not None:
             data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
+        data["runtime_validation_context"] = _load_json(data.get("runtime_validation_context"))
         return ReviewWorkItem.model_validate(data)
 
 
@@ -434,6 +448,22 @@ def _bool(value: bool | None) -> int | None:
     return 1 if value else 0
 
 
+def _json(value: object | None) -> str:
+    return json.dumps(value or {}, sort_keys=True, default=str)
+
+
+def _load_json(value: object | None) -> dict[str, object]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        loaded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("updated_at", "TEXT"),
     ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'review_queued'"),
@@ -450,6 +480,11 @@ _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("agent_bus_dispatch_success", "INTEGER"),
     ("agent_bus_work_item_id", "TEXT"),
     ("agent_bus_dispatch_error", "TEXT"),
+    ("runtime_validation_id", "TEXT"),
+    ("runtime_validation_status", "TEXT"),
+    ("runtime_validation_digest", "TEXT"),
+    ("runtime_validation_completed_at", "TEXT"),
+    ("runtime_validation_context", "TEXT"),
     ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
     ("last_failure_at", "TEXT"),
     ("last_error", "TEXT"),
