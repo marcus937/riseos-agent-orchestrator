@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
+from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
 from app.circuit_runtime_validation import runtime_validation_store
@@ -71,6 +72,22 @@ from app.task_dispatch import dispatch_next_agent_task
 from app.workflow_routes import register_workflow_routes
 
 
+class AgentTaskSubmission(BaseModel):
+    repo_full_name: str
+    title: str
+    issue_number: int | None = None
+    body: str | None = None
+    labels: list[str] = Field(default_factory=list)
+
+
+class AgentTaskSubmissionResponse(BaseModel):
+    accepted: bool
+    repo_full_name: str
+    orchestration_enabled: bool
+    auto_registered: bool = False
+    issue_number: int | None = None
+
+
 app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
 register_workflow_routes(app)
 register_circuit_runtime_validation_routes(app)
@@ -122,7 +139,7 @@ def _record_repository_event(parsed: ParsedGitHubEvent, *, work_item_created: bo
     if not parsed.repository:
         return
     registry = _repository_registry()
-    record = ensure_orchestration_enabled_repository(registry, parsed.repository)
+    record = registry.get_repository_registry_record(parsed.repository)
     if record is None:
         return
     registry.save_repository_registry_record(
@@ -175,6 +192,31 @@ def _debug_health() -> DebugHealth:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/v1/agent-tasks", response_model=AgentTaskSubmissionResponse)
+async def create_agent_task(
+    task: AgentTaskSubmission,
+    x_orchestrator_admin_token: Annotated[str | None, Header(alias="X-Orchestrator-Admin-Token")] = None,
+    settings: Settings = Depends(get_settings),
+) -> AgentTaskSubmissionResponse:
+    _require_admin_token(settings, x_orchestrator_admin_token)
+    registry = _repository_registry()
+    existed_before = registry.get_repository_registry_record(task.repo_full_name) is not None
+    record = ensure_orchestration_enabled_repository(registry, task.repo_full_name)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
+    if record.archived:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is archived.")
+    if not record.orchestration_enabled:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
+    return AgentTaskSubmissionResponse(
+        accepted=True,
+        repo_full_name=record.repo_full_name,
+        orchestration_enabled=True,
+        auto_registered=not existed_before,
+        issue_number=task.issue_number,
+    )
 
 
 @app.get("/api/v1/orchestrator/snapshot", response_model=OrchestratorSnapshot)
