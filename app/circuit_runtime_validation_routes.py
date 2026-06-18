@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi import FastAPI
 
 from app.circuit_runtime_validation import (
@@ -14,6 +14,7 @@ from app.circuit_runtime_validation import (
     runtime_validation_store,
 )
 from app.config import Settings, get_settings
+from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
 
@@ -37,10 +38,17 @@ def _require_runtime_admin_token(
 @router.post("", response_model=RuntimeValidationResult)
 async def create_runtime_validation(
     request: RuntimeValidationRequest,
+    http_request: Request,
     _: None = Depends(_require_runtime_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> RuntimeValidationResult:
-    return await runtime_validation_store.trigger(request, settings)
+    result = await runtime_validation_store.trigger(request, settings)
+    enqueue_review_from_runtime_validation(
+        result,
+        settings,
+        storage=getattr(http_request.app.state, "storage", None),
+    )
+    return result
 
 
 @router.get("/{validation_id}", response_model=RuntimeValidationResult)
