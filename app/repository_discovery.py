@@ -19,6 +19,7 @@ REQUIRED_WEBHOOK_EVENTS = {
     "pull_request_review",
     "push",
 }
+TRUSTED_REPOSITORY_OWNER = "marcus937"
 
 
 class RepositoryStatus(StrEnum):
@@ -211,6 +212,37 @@ def build_repository_registry(settings: Settings) -> RepositoryRegistryStore:
         return repository_registry
 
 
+def ensure_orchestration_enabled_repository(
+    registry: RepositoryRegistryStore,
+    repo_full_name: str | None,
+    *,
+    trusted_owner: str = TRUSTED_REPOSITORY_OWNER,
+) -> RepositoryRegistryRecord | None:
+    if not repo_full_name:
+        return None
+
+    record = registry.get_repository_registry_record(repo_full_name)
+    if record is not None:
+        return record
+
+    owner, separator, _ = repo_full_name.partition("/")
+    if separator != "/" or owner != trusted_owner:
+        return None
+
+    now = datetime.now(UTC)
+    record = RepositoryRegistryRecord(
+        repo_full_name=repo_full_name,
+        status=RepositoryStatus.ACTIVE,
+        archived=False,
+        orchestration_enabled=True,
+        webhook_status=WebhookStatus.SKIPPED,
+        last_discovered_at=now,
+        onboarding_audit_log=[f"{now.isoformat()} auto-registered trusted owner repository"],
+    )
+    registry.save_repository_registry_record(record)
+    return record
+
+
 async def discover_repositories(
     owner: str,
     settings: Settings,
@@ -290,6 +322,8 @@ def repository_diagnostics(registry: RepositoryRegistryStore = repository_regist
     return [
         {
             "repo": record.repo_full_name,
+            "status": record.status.value,
+            "archived": record.archived,
             "webhook_status": record.webhook_status.value,
             "last_event": record.last_event,
             "last_work_item_generated": record.last_work_item_generated_at.isoformat()
