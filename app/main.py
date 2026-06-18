@@ -34,6 +34,7 @@ from app.repository_discovery import (
     RepositoryRegistryStore,
     build_repository_registry,
     discover_repositories,
+    ensure_orchestration_enabled_repository,
     repository_diagnostics,
 )
 from app.reviewer.decision import ReviewDecisionType
@@ -121,7 +122,7 @@ def _record_repository_event(parsed: ParsedGitHubEvent, *, work_item_created: bo
     if not parsed.repository:
         return
     registry = _repository_registry()
-    record = registry.get_repository_registry_record(parsed.repository)
+    record = ensure_orchestration_enabled_repository(registry, parsed.repository)
     if record is None:
         return
     registry.save_repository_registry_record(
