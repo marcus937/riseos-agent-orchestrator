@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
+from app.circuit_runtime_validation import runtime_validation_store
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
@@ -55,6 +56,13 @@ from app.review_queue import (
 )
 from app.review_worker import process_queued_review_item
 from app.review_workflow import build_review_workflow
+from app.runtime_validation_review_bridge import (
+    create_runtime_validation_pending_item,
+    enqueue_review_from_runtime_validation,
+    enqueue_runtime_pending_item,
+    runtime_validation_request_from_parsed,
+    runtime_validation_required_for_parsed,
+)
 from app.security import verify_github_signature
 from app.slack_issue_dispatch import dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
@@ -317,7 +325,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     patch_truncated = False
     github_context_available = False
     github_context_error: str | None = None
-    runtime_evidence_context: list[dict[str, object]] = []
+    runtime_evidence_context: list[dict[str, object]] = _runtime_evidence_context_from_item(item)
     runtime_evidence_error: str | None = None
     runtime_evidence_truncated = False
 
@@ -344,7 +352,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         patch_truncated = github_context.patch_truncated
         github_context_available = github_context.github_context_available
         github_context_error = github_context.github_context_error
-        runtime_evidence_context = github_context.runtime_evidence_context
+        runtime_evidence_context.extend(github_context.runtime_evidence_context)
         runtime_evidence_error = github_context.runtime_evidence_error
         runtime_evidence_truncated = github_context.runtime_evidence_truncated
 
@@ -465,6 +473,12 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     return response
 
 
+def _runtime_evidence_context_from_item(item: ReviewWorkItem) -> list[dict[str, object]]:
+    if item.runtime_validation_context:
+        return [item.runtime_validation_context]
+    return []
+
+
 def _schedule_auto_process_work_item(
     item: ReviewWorkItem | None,
     settings: Settings,
@@ -472,6 +486,8 @@ def _schedule_auto_process_work_item(
     background_tasks: BackgroundTasks,
 ) -> bool:
     if item is None or not settings.enable_auto_review_processing:
+        return False
+    if item.status != item.status.PENDING_REVIEW:
         return False
 
     background_tasks.add_task(process_queued_review_item, item.id, settings, storage, _process_work_item)
@@ -525,7 +541,17 @@ async def github_webhook(
         event_store.record_accepted(parsed, event_id=event_id)
 
     log_webhook_accepted(parsed)
-    work_item = _create_review_work_item(parsed, workflow.review_context is not None, settings)
+    has_review_context = workflow.review_context is not None
+    runtime_gated = runtime_validation_required_for_parsed(parsed, settings, has_review_context=has_review_context)
+    if runtime_gated:
+        work_item = enqueue_runtime_pending_item(
+            create_runtime_validation_pending_item(parsed),
+            storage=storage,
+            max_review_items=settings.orchestrator_max_review_items,
+        )
+        log_queue_item_created(work_item)
+    else:
+        work_item = _create_review_work_item(parsed, has_review_context, settings)
     _record_repository_event(parsed, work_item_created=work_item is not None)
     approved_repositories = _approved_repository_names()
     if storage is not None:
@@ -544,13 +570,22 @@ async def github_webhook(
         )
     log_slack_issue_dispatch_result(parsed, slack_dispatch)
 
-    github_client = GitHubClient(token=settings.github_token) if settings.enable_github_writeback else None
-    try:
-        hermes_dispatch = await dispatch_hermes_runtime_validation(parsed, settings, github_client=github_client)
-    finally:
-        if github_client is not None:
-            await github_client.aclose()
-    log_hermes_dispatch_result(parsed, hermes_dispatch)
+    if runtime_gated:
+        validation = await runtime_validation_store.trigger(runtime_validation_request_from_parsed(parsed, settings), settings)
+        work_item = enqueue_review_from_runtime_validation(
+            validation,
+            settings,
+            storage=storage,
+            existing_item=work_item,
+        )
+    else:
+        github_client = GitHubClient(token=settings.github_token) if settings.enable_github_writeback else None
+        try:
+            hermes_dispatch = await dispatch_hermes_runtime_validation(parsed, settings, github_client=github_client)
+        finally:
+            if github_client is not None:
+                await github_client.aclose()
+        log_hermes_dispatch_result(parsed, hermes_dispatch)
 
     _schedule_auto_process_work_item(work_item, settings, storage, background_tasks)
 

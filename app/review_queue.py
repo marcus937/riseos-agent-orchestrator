@@ -11,6 +11,7 @@ from app.review_workflow import ReviewWorkflowResult
 
 
 class ReviewWorkItemStatus(StrEnum):
+    RUNTIME_VALIDATION_PENDING = "runtime_validation_pending"
     PENDING_REVIEW = "pending_review"
     REVIEWING = "reviewing"
     NEEDS_CHANGES = "needs_changes"
@@ -20,6 +21,10 @@ class ReviewWorkItemStatus(StrEnum):
 
 class ReviewLifecycleStage(StrEnum):
     REVIEW_QUEUED = "review_queued"
+    RUNTIME_VALIDATION_PENDING = "runtime_validation_pending"
+    RUNTIME_VALIDATION_COMPLETED = "runtime_validation_completed"
+    RUNTIME_VALIDATION_FAILED = "runtime_validation_failed"
+    BB2_REVIEW_REQUESTED_FROM_RUNTIME_VALIDATION = "bb2_review_requested_from_runtime_validation"
     WORKER_CLAIMED = "worker_claimed"
     REVIEW_STARTED = "review_started"
     OPENAI_REVIEW_ATTEMPTED = "openai_review_attempted"
@@ -59,6 +64,11 @@ class ReviewWorkItem(BaseModel):
     agent_bus_dispatch_success: bool | None = None
     agent_bus_work_item_id: str | None = None
     agent_bus_dispatch_error: str | None = None
+    runtime_validation_id: str | None = None
+    runtime_validation_status: str | None = None
+    runtime_validation_digest: str | None = None
+    runtime_validation_completed_at: datetime | None = None
+    runtime_validation_context: dict[str, object] = Field(default_factory=dict)
     failure_count: int = 0
     last_failure_at: datetime | None = None
     last_error: str | None = None
@@ -146,6 +156,9 @@ class ReviewLifecycleVisibility(BaseModel):
     agent_bus_dispatch_success: bool | None = None
     agent_bus_work_item_id: str | None = None
     agent_bus_dispatch_error: str | None = None
+    runtime_validation_id: str | None = None
+    runtime_validation_status: str | None = None
+    runtime_validation_completed_at: datetime | None = None
     failure_count: int
     last_failure_at: datetime | None = None
     last_error: str | None = None
@@ -307,7 +320,7 @@ def record_lifecycle_stage(
         item.last_error = error
         item.last_failure_at = now
         item.agent_bus_dispatch_error = error if stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED else item.agent_bus_dispatch_error
-        if stage != ReviewLifecycleStage.REVIEW_FAILED:
+        if stage not in {ReviewLifecycleStage.REVIEW_FAILED, ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED}:
             item.failure_count += 1
     return item
 
@@ -374,6 +387,9 @@ def build_lifecycle_visibility(items: list[ReviewWorkItem]) -> list[ReviewLifecy
             agent_bus_dispatch_success=item.agent_bus_dispatch_success,
             agent_bus_work_item_id=item.agent_bus_work_item_id,
             agent_bus_dispatch_error=item.agent_bus_dispatch_error,
+            runtime_validation_id=item.runtime_validation_id,
+            runtime_validation_status=item.runtime_validation_status,
+            runtime_validation_completed_at=item.runtime_validation_completed_at,
             failure_count=item.failure_count,
             last_failure_at=item.last_failure_at,
             last_error=item.last_error,
@@ -494,6 +510,8 @@ def _blocked_reason(item: ReviewWorkItem) -> str | None:
         return "Review work item is missing both commit_sha and pr_number."
     if item.event_type not in set(GitHubEventType):
         return f"Review work item event_type is unsupported: {item.event_type}."
+    if item.status == ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING:
+        return "Hermes runtime validation has not reached a terminal state yet."
     return None
 
 
@@ -519,12 +537,20 @@ def _oldest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | N
     return round((now - min(item.created_at for item in items)).total_seconds(), 3)
 
 
-def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
+def _newest_item_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
     if not items:
         return None
     return round((now - max(item.created_at for item in items)).total_seconds(), 3)
 
 
-_UNFINISHED_STATUSES = {ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}
+def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
+    return _newest_item_age_seconds(items, now)
+
+
+_UNFINISHED_STATUSES = {
+    ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING,
+    ReviewWorkItemStatus.PENDING_REVIEW,
+    ReviewWorkItemStatus.REVIEWING,
+}
 
 review_queue = InMemoryReviewQueue()
