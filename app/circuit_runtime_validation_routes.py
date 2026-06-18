@@ -86,9 +86,9 @@ async def get_runtime_validation_bb2_packet(
 
 
 def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
-    existing_paths = {getattr(route, "path", None) for route in app.routes}
+    existing_paths = _registered_route_paths(app)
     if getattr(app.state, "circuit_runtime_validation_routes_registered", False) and any(
-        str(path).startswith(_RUNTIME_VALIDATION_ROUTE_PREFIX) for path in existing_paths if path is not None
+        path.startswith(_RUNTIME_VALIDATION_ROUTE_PREFIX) for path in existing_paths
     ):
         return
     app.include_router(router)
@@ -96,3 +96,16 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
         if not hasattr(route, "path"):
             setattr(route, "path", "")
     app.state.circuit_runtime_validation_routes_registered = True
+
+
+def _registered_route_paths(app: FastAPI) -> set[str]:
+    paths: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if path:
+            paths.add(str(path))
+        for child in getattr(route, "routes", []):
+            child_path = getattr(child, "path", None)
+            if child_path:
+                paths.add(str(child_path))
+    return paths
