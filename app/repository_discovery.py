@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -20,6 +21,8 @@ REQUIRED_WEBHOOK_EVENTS = {
     "push",
 }
 TRUSTED_REPOSITORY_OWNER = "marcus937"
+
+logger = logging.getLogger(__name__)
 
 
 class RepositoryStatus(StrEnum):
@@ -250,6 +253,14 @@ async def discover_repositories(
     registry: RepositoryRegistryStore = repository_registry,
 ) -> RepositoryDiscoveryResult:
     repos = await github_client.list_owner_repositories(owner)
+    discovered_repo_names = [
+        str(repo.get("full_name"))
+        for repo in repos
+        if isinstance(repo, dict) and repo.get("full_name")
+    ]
+    logger.info("Repository discovery scanned %d repositories", len(repos))
+    logger.info("Repository discovery found:\n%s", "\n".join(discovered_repo_names))
+
     now = datetime.now(UTC)
     result = RepositoryDiscoveryResult(scanned_count=len(repos))
     seen_repo_names: set[str] = set()
