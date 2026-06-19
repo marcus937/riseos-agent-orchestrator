@@ -18,7 +18,11 @@ from app.agent_tasks import (
 )
 from app.clients.agent_bus import AgentBusClient
 from app.config import Settings, get_settings
-from app.repository_discovery import RepositoryRegistryStore, build_repository_registry
+from app.repository_discovery import (
+    RepositoryRegistryStore,
+    build_repository_registry,
+    ensure_orchestration_enabled_repository,
+)
 
 router = APIRouter(prefix="/api/v1/agent-tasks", tags=["agent-tasks"])
 
@@ -139,13 +143,22 @@ def _repository_registry(request: Request, settings: Settings) -> RepositoryRegi
 
 
 def _require_orchestration_enabled_repository(repo_full_name: str, request: Request, settings: Settings) -> None:
-    record = _repository_registry(request, settings).get_repository_registry_record(repo_full_name)
+    record = ensure_orchestration_enabled_repository(
+        _repository_registry(request, settings),
+        repo_full_name,
+        trusted_owner=settings.trusted_repository_owner,
+    )
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Repository is not orchestration-enabled.",
         )
-    if record.archived or not record.orchestration_enabled:
+    if record.archived:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository is archived.",
+        )
+    if not record.orchestration_enabled:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Repository is not orchestration-enabled.",
