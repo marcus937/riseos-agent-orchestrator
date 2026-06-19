@@ -60,22 +60,14 @@ async def create_agent_task_endpoint(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Agent Bus dispatch failed: {exc}",
             ) from exc
+        else:
+            mark_agent_task_assigned(task, work_item_id=work_item_id)
+            store.save_agent_task(task)
         finally:
             if github_client is not None:
                 await github_client.aclose()
             if should_close:
                 await client.aclose()
-        if task.agent_bus_work_item_id is None and not task.agent_bus_dispatch_error:
-            mark_agent_task_assigned(task, work_item_id=work_item_id)
-            store.save_agent_task(task)
-        elif task.agent_bus_work_item_id is None and task.agent_bus_dispatch_error and "dependencies are not satisfied" not in task.agent_bus_dispatch_error:
-            store.save_agent_task(task)
-        elif task.agent_bus_work_item_id is None and not task.agent_bus_dispatch_error:
-            store.save_agent_task(task)
-        elif task.agent_bus_work_item_id is None:
-            store.save_agent_task(task)
-        else:
-            store.save_agent_task(task)
 
     return AgentTaskCreateResponse(
         task_id=task.task_id,
