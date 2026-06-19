@@ -51,8 +51,10 @@ def build_agent_bus_work_item_payload(
             "instructions": task.instructions,
             "acceptance_criteria": task.acceptance_criteria,
             "target_agent": task.target_agent,
+            "dependency_task_ids": task.dependency_task_ids,
             "dependency_count": dependency_state.dependency_count,
             "dependencies_satisfied": dependency_state.dependencies_satisfied,
+            "blocked": not dependency_state.dependencies_satisfied,
             "blocked_by": dependency_state.blocked_by,
             "source": "riseos-agent-orchestrator.agent_task",
             "callback": {
@@ -86,6 +88,12 @@ async def evaluate_agent_task_dependencies(
     task: AgentTask,
     dependency_client: AgentTaskDependencyClient | None,
 ) -> DependencyState:
+    if task.dependency_task_ids:
+        return DependencyState(
+            dependency_count=len(task.dependency_task_ids),
+            dependencies_satisfied=not task.blocked,
+            blocked_by=task.blocked_by,
+        )
     dependencies = parse_issue_dependencies(task.objective)
     if not dependencies.predecessor_issue_ids:
         return DependencyState()

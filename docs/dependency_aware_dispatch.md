@@ -8,9 +8,35 @@ The orchestrator treats dependency metadata as scheduler input. Slack is informa
 - Agent Bus: execution layer for Codex-M2, Circuit, Hermes, and future agents.
 - Slack: optional notification layer after scheduler decisions.
 
-## Supported Metadata
+## Public AgentTask API
 
-Issue bodies and direct AgentTask objectives may declare predecessors with either format:
+`POST /api/v1/agent-tasks` accepts task-id dependencies with `dependency_task_ids`:
+
+```json
+{
+  "repo_full_name": "marcus937/jarvis-codex-worker",
+  "title": "Task B",
+  "body": "Runs after Task A",
+  "dependency_task_ids": ["agtask-123"]
+}
+```
+
+Task responses expose dependency state:
+
+```json
+{
+  "task_id": "agtask-456",
+  "dependency_task_ids": ["agtask-123"],
+  "blocked": true,
+  "blocked_by": ["agtask-123"]
+}
+```
+
+Invalid dependency task IDs are rejected with `422` and a `dependency_task_ids` detail payload.
+
+## Supported Issue Metadata
+
+Issue bodies and direct AgentTask objectives may also declare GitHub issue predecessors with either format:
 
 ```yaml
 depends_on:
@@ -28,9 +54,11 @@ When both formats are present, `depends_on` takes precedence.
 
 A task with no dependencies is eligible immediately.
 
-A task with dependencies is eligible only when every predecessor is complete. Missing predecessors, malformed dependency metadata, incomplete predecessors, and dependency cycles keep the task queued.
+A task with task-id dependencies is eligible only when every dependency task has `status == completed`. Created, queued, assigned, running, failed, cancelled, and any other non-completed states keep the dependent task blocked.
 
-A predecessor is complete when either condition is true:
+A task with issue metadata dependencies is eligible only when every predecessor is complete. Missing predecessors, malformed dependency metadata, incomplete predecessors, and dependency cycles keep the task queued.
+
+An issue predecessor is complete when either condition is true:
 
 - The predecessor issue has both `bb2-approved` and `ready-to-merge`.
 - A linked PR exposed to the scheduler has `ready-to-merge`.
@@ -47,3 +75,18 @@ Dependency-blocked direct AgentTasks remain queued. They are not marked failed u
 ## Sequential Chains
 
 For a chain like #72 -> #73 -> #74 -> #75 -> #76, only #72 is initially eligible. Each dependent issue becomes eligible only after its predecessor reaches the existing BB2/ready-to-merge completion state.
+
+For AgentTasks, Task B with `dependency_task_ids: [Task A]` remains blocked until Task A reaches `completed`. Multiple dependencies require all predecessor tasks to be completed.
+
+## Example Curl
+
+```bash
+curl -X POST https://orchestrator.riseconnect.us/api/v1/agent-tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_full_name":"marcus937/jarvis-codex-worker",
+    "title":"Task B",
+    "body":"Runs after Task A",
+    "dependency_task_ids":["agtask-123"]
+  }'
+```
