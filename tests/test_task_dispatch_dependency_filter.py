@@ -64,7 +64,7 @@ def test_list_agent_ready_issues_skips_dependency_blocked_tasks() -> None:
 def test_list_agent_ready_issues_includes_dependency_satisfied_tasks() -> None:
     client = FakeTaskDispatchClient(
         [issue(1, created_at="2026-06-01T00:00:00Z", labels=["agent-task", "agent-ready"], body="predecessor_issue: 72")],
-        {72: {"state": "open", "labels": [{"name": "ready-to-merge"}]}},
+        {72: {"state": "open", "labels": [{"name": "bb2-approved"}, {"name": "ready-to-merge"}]}},
     )
 
     ready = run(list_agent_ready_issues("riseos/example", client))
@@ -78,7 +78,7 @@ def test_list_agent_ready_issues_includes_dependency_satisfied_tasks() -> None:
 def test_dispatch_reports_dependency_state_for_selected_task() -> None:
     client = FakeTaskDispatchClient(
         [issue(1, created_at="2026-06-01T00:00:00Z", labels=["agent-task", "agent-ready"], body="predecessor_issue: 72")],
-        {72: {"state": "closed", "labels": []}},
+        {72: {"state": "open", "labels": [{"name": "bb2-approved"}, {"name": "ready-to-merge"}]}},
     )
 
     result = run(dispatch_next_agent_task("riseos/example", client, enabled=True))
