@@ -15,6 +15,9 @@ from app.agent_tasks import (
     create_agent_task,
     mark_agent_task_assigned,
     mark_agent_task_dispatch_failed,
+    missing_dependency_task_ids,
+    refresh_agent_task_dependency_state,
+    refresh_agent_task_dependency_states,
 )
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
@@ -37,10 +40,19 @@ async def create_agent_task_endpoint(
 ) -> AgentTaskCreateResponse:
     _require_orchestration_enabled_repository(payload.repo_full_name, request, settings)
     store = _agent_task_store(request, settings)
+    missing_dependencies = missing_dependency_task_ids(payload.dependency_task_ids, store)
+    if missing_dependencies:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"dependency_task_ids": missing_dependencies},
+        )
+
+    existing_tasks = store.list_agent_tasks()
     task = create_agent_task(payload)
+    refresh_agent_task_dependency_state(task, {existing.task_id: existing for existing in existing_tasks})
     store.save_agent_task(task)
 
-    if settings.enable_agent_bus_dispatch:
+    if settings.enable_agent_bus_dispatch and not task.blocked:
         client, should_close = _agent_bus_client(request, settings)
         github_client = _github_dependency_client(settings)
         try:
@@ -69,12 +81,7 @@ async def create_agent_task_endpoint(
             if should_close:
                 await client.aclose()
 
-    return AgentTaskCreateResponse(
-        task_id=task.task_id,
-        status=task.status,
-        created_at=task.created_at,
-        target_agent=task.target_agent,
-    )
+    return _agent_task_create_response(task)
 
 
 @router.get("", response_model=list[AgentTask])
@@ -83,7 +90,8 @@ async def list_agent_tasks(
     _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> list[AgentTask]:
-    return _agent_task_store(request, settings).list_agent_tasks()
+    store = _agent_task_store(request, settings)
+    return _refresh_all_agent_tasks(store)
 
 
 @router.get("/{task_id}", response_model=AgentTask)
@@ -93,7 +101,9 @@ async def get_agent_task(
     _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> AgentTask:
-    task = _agent_task_store(request, settings).get_agent_task(task_id)
+    store = _agent_task_store(request, settings)
+    _refresh_all_agent_tasks(store)
+    task = store.get_agent_task(task_id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent task not found")
     return task
@@ -118,7 +128,28 @@ async def record_agent_task_execution_result(
         )
     apply_execution_result(task, payload)
     store.save_agent_task(task)
-    return task
+    _refresh_all_agent_tasks(store)
+    refreshed = store.get_agent_task(task_id)
+    return refreshed or task
+
+
+def _agent_task_create_response(task: AgentTask) -> AgentTaskCreateResponse:
+    return AgentTaskCreateResponse(
+        task_id=task.task_id,
+        status=task.status,
+        created_at=task.created_at,
+        target_agent=task.target_agent,
+        dependency_task_ids=task.dependency_task_ids,
+        blocked=task.blocked,
+        blocked_by=task.blocked_by,
+    )
+
+
+def _refresh_all_agent_tasks(store: AgentTaskStore) -> list[AgentTask]:
+    tasks = refresh_agent_task_dependency_states(store.list_agent_tasks())
+    for task in tasks:
+        store.save_agent_task(task)
+    return tasks
 
 
 def _agent_task_store(request: Request, settings: Settings) -> AgentTaskStore:
