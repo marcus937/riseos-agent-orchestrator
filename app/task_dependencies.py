@@ -37,10 +37,10 @@ def parse_issue_dependencies(body: str | None) -> IssueDependencies:
 
 
 def dependency_complete(issue: dict[str, Any]) -> bool:
-    if str(issue.get("state") or "").lower() == "closed":
-        return True
     labels = _label_names(issue.get("labels"))
-    return bool({LABEL_BB2_APPROVED, LABEL_READY_TO_MERGE} & labels)
+    if {LABEL_BB2_APPROVED, LABEL_READY_TO_MERGE}.issubset(labels):
+        return True
+    return _linked_pr_ready_to_merge(issue)
 
 
 async def dependency_state_for_issue(
@@ -49,21 +49,50 @@ async def dependency_state_for_issue(
     body: str | None,
     client: DependencyIssueClient,
 ) -> DependencyState:
-    dependencies = parse_issue_dependencies(body)
-    predecessor_ids = dependencies.predecessor_issue_ids
+    return await _dependency_state_for_issue(
+        repo_full_name,
+        issue_number,
+        body,
+        client,
+        visiting={issue_number},
+    )
+
+
+async def _dependency_state_for_issue(
+    repo_full_name: str,
+    issue_number: int,
+    body: str | None,
+    client: DependencyIssueClient,
+    *,
+    visiting: set[int],
+) -> DependencyState:
+    predecessor_ids = parse_issue_dependencies(body).predecessor_issue_ids
     if not predecessor_ids:
         return DependencyState()
 
     blocked_by: list[int] = []
     for predecessor_id in predecessor_ids:
+        if predecessor_id in visiting:
+            blocked_by.append(predecessor_id)
+            continue
         try:
             predecessor = await client.fetch_issue(repo_full_name, predecessor_id)
         except Exception:
             blocked_by.append(predecessor_id)
             continue
-        if not dependency_complete(predecessor):
+        predecessor_state = await _dependency_state_for_issue(
+            repo_full_name,
+            predecessor_id,
+            predecessor.get("body") if isinstance(predecessor.get("body"), str) else None,
+            client,
+            visiting={*visiting, predecessor_id},
+        )
+        if predecessor_state.blocked_by:
+            blocked_by.extend(predecessor_state.blocked_by)
+        if not predecessor_state.dependencies_satisfied or not dependency_complete(predecessor):
             blocked_by.append(predecessor_id)
 
+    blocked_by = _unique_issue_ids(blocked_by)
     return DependencyState(
         dependency_count=len(predecessor_ids),
         dependencies_satisfied=not blocked_by,
@@ -128,3 +157,13 @@ def _label_names(raw_labels: Any) -> set[str]:
         elif isinstance(label, dict) and isinstance(label.get("name"), str):
             names.add(label["name"])
     return names
+
+
+def _linked_pr_ready_to_merge(issue: dict[str, Any]) -> bool:
+    linked_prs = issue.get("linked_pull_requests") or issue.get("linked_prs") or issue.get("pull_requests")
+    if not isinstance(linked_prs, list):
+        return False
+    for linked_pr in linked_prs:
+        if isinstance(linked_pr, dict) and LABEL_READY_TO_MERGE in _label_names(linked_pr.get("labels")):
+            return True
+    return False
