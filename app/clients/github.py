@@ -62,6 +62,14 @@ class GitHubClient:
         self._require_value(head, "head")
         return await self._request("GET", f"/repos/{repo_full_name}/compare/{base}...{head}")
 
+    async def fetch_issue(self, repo_full_name: str, issue_number: int) -> dict[str, Any]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(issue_number)
+        payload = await self._request("GET", f"/repos/{repo_full_name}/issues/{issue_number}")
+        if not isinstance(payload, dict):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/issues/{issue_number}", 200, "Expected object response.")
+        return payload
+
     async def list_commit_statuses(self, repo_full_name: str, ref: str) -> list[dict[str, Any]]:
         self._require_value(repo_full_name, "repo_full_name")
         self._require_value(ref, "ref")
