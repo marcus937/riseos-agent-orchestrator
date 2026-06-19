@@ -137,12 +137,17 @@ class GitHubClient:
         self._require_value(owner, "owner")
         payload = await self._request(
             "GET",
-            f"/users/{owner}/repos",
-            params={"type": "all", "per_page": 100},
+            "/user/repos",
+            params={"affiliation": "owner", "per_page": 100},
         )
         if not isinstance(payload, list):
-            raise GitHubAPIError("GET", f"/users/{owner}/repos", 200, "Expected list response.")
-        return payload
+            raise GitHubAPIError("GET", "/user/repos", 200, "Expected list response.")
+        return [
+            repo
+            for repo in payload
+            if isinstance(repo, dict)
+            and str(repo.get("owner", {}).get("login", "")).lower() == owner.lower()
+        ]
 
     async def list_repository_webhooks(self, repo_full_name: str) -> list[dict[str, Any]]:
         self._require_value(repo_full_name, "repo_full_name")
