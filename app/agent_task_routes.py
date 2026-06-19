@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.admin_auth import require_orchestrator_admin_token
-from app.agent_task_dispatch import dispatch_agent_task_to_agent_bus
+from app.agent_task_dispatch import AgentTaskDependencyBlocked, dispatch_agent_task_to_agent_bus
 from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
@@ -17,6 +17,7 @@ from app.agent_tasks import (
     mark_agent_task_dispatch_failed,
 )
 from app.clients.agent_bus import AgentBusClient
+from app.clients.github import GitHubClient
 from app.config import Settings, get_settings
 from app.repository_discovery import (
     RepositoryRegistryStore,
@@ -41,12 +42,17 @@ async def create_agent_task_endpoint(
 
     if settings.enable_agent_bus_dispatch:
         client, should_close = _agent_bus_client(request, settings)
+        github_client = _github_dependency_client(settings)
         try:
             work_item_id = await dispatch_agent_task_to_agent_bus(
                 task,
                 client,
                 review_agent=settings.agent_bus_review_agent,
+                dependency_client=github_client,
             )
+        except AgentTaskDependencyBlocked as exc:
+            task.agent_bus_dispatch_error = str(exc)
+            store.save_agent_task(task)
         except Exception as exc:
             mark_agent_task_dispatch_failed(task, str(exc))
             store.save_agent_task(task)
@@ -54,11 +60,14 @@ async def create_agent_task_endpoint(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Agent Bus dispatch failed: {exc}",
             ) from exc
+        else:
+            mark_agent_task_assigned(task, work_item_id=work_item_id)
+            store.save_agent_task(task)
         finally:
+            if github_client is not None:
+                await github_client.aclose()
             if should_close:
                 await client.aclose()
-        mark_agent_task_assigned(task, work_item_id=work_item_id)
-        store.save_agent_task(task)
 
     return AgentTaskCreateResponse(
         task_id=task.task_id,
@@ -132,6 +141,12 @@ def _agent_bus_client(request: Request, settings: Settings) -> tuple[AgentBusCli
         ),
         True,
     )
+
+
+def _github_dependency_client(settings: Settings) -> GitHubClient | None:
+    if not settings.github_token:
+        return None
+    return GitHubClient(token=settings.github_token)
 
 
 def _repository_registry(request: Request, settings: Settings) -> RepositoryRegistryStore:
