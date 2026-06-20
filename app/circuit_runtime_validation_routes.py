@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hmac
+import logging
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -16,6 +18,7 @@ from app.circuit_runtime_validation import (
 from app.config import Settings, get_settings
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
+LOGGER = logging.getLogger("riseos_agent_orchestrator")
 
 
 def _require_runtime_admin_token(
@@ -40,7 +43,38 @@ async def create_runtime_validation(
     _: None = Depends(_require_runtime_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> RuntimeValidationResult:
-    return await runtime_validation_store.trigger(request, settings)
+    started_at = time.monotonic()
+    LOGGER.info(
+        "Runtime validation entering repo=%s issue_number=%s pr_number=%s branch=%s validation_type=%s correlation_id=%s target_url=%s",
+        request.repo,
+        request.issue_number,
+        request.pr_number,
+        request.branch,
+        request.validation_type,
+        request.correlation_id,
+        request.target_url,
+    )
+    try:
+        result = await runtime_validation_store.trigger(request, settings)
+    except Exception:
+        LOGGER.exception(
+            "Runtime validation failed before response repo=%s pr_number=%s correlation_id=%s elapsed_ms=%s",
+            request.repo,
+            request.pr_number,
+            request.correlation_id,
+            round((time.monotonic() - started_at) * 1000, 2),
+        )
+        raise
+    LOGGER.info(
+        "Runtime validation final response validation_id=%s status=%s repo=%s pr_number=%s correlation_id=%s elapsed_ms=%s",
+        result.validation_id,
+        result.status,
+        result.repo,
+        result.pr_number,
+        result.correlation_id,
+        round((time.monotonic() - started_at) * 1000, 2),
+    )
+    return result
 
 
 @router.get("/{validation_id}", response_model=RuntimeValidationResult)
