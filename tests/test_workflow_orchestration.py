@@ -37,16 +37,52 @@ def _linear_workflow_request() -> WorkflowCreateRequest:
     )
 
 
-def test_create_workflow_persists_dependency_graph() -> None:
+def _create_linear_workflow() -> tuple[InMemoryAgentTaskStore, object, object]:
     agent_store = InMemoryAgentTaskStore()
     workflow_store = InMemoryWorkflowStore()
-
     workflow = create_workflow(_linear_workflow_request(), workflow_store=workflow_store, agent_task_store=agent_store)
+    return agent_store, workflow_store, workflow
+
+
+def _complete_task(agent_store: InMemoryAgentTaskStore, task_id: str, *, key: str) -> None:
+    task = agent_store.get_agent_task(task_id)
+    apply_execution_result(
+        task,
+        AgentTaskExecutionResult(
+            agent_id="codex-m2",
+            status=AgentTaskStatus.COMPLETED,
+            commit_sha=f"{key.lower()}bc123",
+            branch=f"codex-m2/{key.lower()}",
+            changed_files=[f"docs/{key.lower()}.md"],
+            evidence={"summary": f"{key} complete"},
+        ),
+    )
+    agent_store.save_agent_task(task)
+
+
+def _fail_task(agent_store: InMemoryAgentTaskStore, task_id: str, *, key: str) -> None:
+    task = agent_store.get_agent_task(task_id)
+    apply_execution_result(
+        task,
+        AgentTaskExecutionResult(
+            agent_id="codex-m2",
+            status=AgentTaskStatus.FAILED,
+            branch=f"codex-m2/{key.lower()}",
+            changed_files=[f"docs/{key.lower()}.md"],
+            evidence={"error": f"{key} failed"},
+        ),
+    )
+    agent_store.save_agent_task(task)
+
+
+def test_create_workflow_persists_dependency_graph_without_workflow_blocking() -> None:
+    agent_store, _, workflow = _create_linear_workflow()
+
     response = build_workflow_response(workflow, agent_store.list_agent_tasks())
 
     task_by_key = {task.task_key: task for task in response.task_statuses}
     assert response.workflow_id == workflow.workflow_id
-    assert response.status == WorkflowStatus.BLOCKED
+    assert response.status == WorkflowStatus.READY
     assert task_by_key["A"].blocked is False
     assert task_by_key["B"].blocked is True
     assert task_by_key["B"].blocked_by == [task_by_key["A"].task_id]
@@ -55,9 +91,7 @@ def test_create_workflow_persists_dependency_graph() -> None:
 
 
 def test_release_runnable_tasks_advances_dependency_chain() -> None:
-    agent_store = InMemoryAgentTaskStore()
-    workflow_store = InMemoryWorkflowStore()
-    workflow = create_workflow(_linear_workflow_request(), workflow_store=workflow_store, agent_task_store=agent_store)
+    agent_store, _, workflow = _create_linear_workflow()
     client = FakeAgentBusClient()
 
     released = run(release_runnable_agent_tasks(agent_store, client, review_agent="bb2"))
@@ -67,19 +101,7 @@ def test_release_runnable_tasks_advances_dependency_chain() -> None:
 
     response = build_workflow_response(workflow, agent_store.list_agent_tasks())
     task_by_key = {task.task_key: task for task in response.task_statuses}
-    step_a = agent_store.get_agent_task(task_by_key["A"].task_id)
-    apply_execution_result(
-        step_a,
-        AgentTaskExecutionResult(
-            agent_id="codex-m2",
-            status=AgentTaskStatus.COMPLETED,
-            commit_sha="abc123",
-            branch="codex-m2/a",
-            changed_files=["docs/a.md"],
-            evidence={"summary": "A complete"},
-        ),
-    )
-    agent_store.save_agent_task(step_a)
+    _complete_task(agent_store, task_by_key["A"].task_id, key="A")
 
     released = run(release_runnable_agent_tasks(agent_store, client, review_agent="bb2"))
 
@@ -90,6 +112,42 @@ def test_release_runnable_tasks_advances_dependency_chain() -> None:
     assert response.current_running_task.task_key == "B"
     assert response.completed_tasks == ["A"]
     assert response.task_results["A"] == {"summary": "A complete"}
+    assert task_by_key["B"].blocked is False
+    assert task_by_key["C"].blocked is True
+
+
+def test_workflow_reports_completed_after_all_tasks_complete() -> None:
+    agent_store, _, workflow = _create_linear_workflow()
+    response = build_workflow_response(workflow, agent_store.list_agent_tasks())
+    task_by_key = {task.task_key: task for task in response.task_statuses}
+
+    _complete_task(agent_store, task_by_key["A"].task_id, key="A")
+    response = build_workflow_response(workflow, agent_store.list_agent_tasks())
+    task_by_key = {task.task_key: task for task in response.task_statuses}
+    _complete_task(agent_store, task_by_key["B"].task_id, key="B")
+    response = build_workflow_response(workflow, agent_store.list_agent_tasks())
+    task_by_key = {task.task_key: task for task in response.task_statuses}
+    _complete_task(agent_store, task_by_key["C"].task_id, key="C")
+
+    response = build_workflow_response(workflow, agent_store.list_agent_tasks())
+
+    assert response.status == WorkflowStatus.COMPLETED
+    assert response.completed_tasks == ["A", "B", "C"]
+
+
+def test_workflow_reports_failed_when_dependency_fails_and_no_runnable_tasks_remain() -> None:
+    agent_store, _, workflow = _create_linear_workflow()
+    response = build_workflow_response(workflow, agent_store.list_agent_tasks())
+    task_by_key = {task.task_key: task for task in response.task_statuses}
+
+    _fail_task(agent_store, task_by_key["A"].task_id, key="A")
+
+    response = build_workflow_response(workflow, agent_store.list_agent_tasks())
+    task_by_key = {task.task_key: task for task in response.task_statuses}
+
+    assert response.status == WorkflowStatus.FAILED
+    assert response.failures == ["A failed"]
+    assert task_by_key["B"].blocked is True
     assert task_by_key["C"].blocked is True
 
 

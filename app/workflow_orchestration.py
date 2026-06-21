@@ -24,6 +24,7 @@ from app.agent_tasks import (
 
 class WorkflowStatus(StrEnum):
     CREATED = "created"
+    READY = "ready"
     RUNNING = "running"
     BLOCKED = "blocked"
     COMPLETED = "completed"
@@ -378,17 +379,49 @@ def _dependency_state(task_key: str, workflow: StoredWorkflow, tasks_by_id: dict
 
 
 def _workflow_status(task_states: list[WorkflowTaskState]) -> WorkflowStatus:
-    if any(task.status == AgentTaskStatus.FAILED for task in task_states):
-        return WorkflowStatus.FAILED
-    if any(task.status == AgentTaskStatus.CANCELLED for task in task_states):
-        return WorkflowStatus.CANCELLED
-    if task_states and all(task.status == AgentTaskStatus.COMPLETED for task in task_states):
+    if not task_states:
+        return WorkflowStatus.CREATED
+    if all(task.status == AgentTaskStatus.COMPLETED for task in task_states):
         return WorkflowStatus.COMPLETED
-    if any(task.status in {AgentTaskStatus.ASSIGNED, AgentTaskStatus.CLAIMED, AgentTaskStatus.RUNNING, AgentTaskStatus.IN_PROGRESS, AgentTaskStatus.READY_FOR_REVIEW} for task in task_states):
+    if any(task.status == AgentTaskStatus.CANCELLED for task in task_states) and not _has_runnable_or_active_task(task_states):
+        return WorkflowStatus.CANCELLED
+    if any(task.status == AgentTaskStatus.FAILED for task in task_states) and not _has_runnable_or_active_task(task_states):
+        return WorkflowStatus.FAILED
+    if _has_active_task(task_states):
         return WorkflowStatus.RUNNING
-    if any(task.blocked for task in task_states):
+    if any(task.status == AgentTaskStatus.COMPLETED for task in task_states) and _has_runnable_task(task_states):
+        return WorkflowStatus.RUNNING
+    if _has_runnable_task(task_states):
+        return WorkflowStatus.READY
+    if any(task.blocked or task.status == AgentTaskStatus.FAILED for task in task_states):
         return WorkflowStatus.BLOCKED
     return WorkflowStatus.CREATED
+
+
+def _has_runnable_or_active_task(task_states: list[WorkflowTaskState]) -> bool:
+    return _has_active_task(task_states) or _has_runnable_task(task_states)
+
+
+def _has_active_task(task_states: list[WorkflowTaskState]) -> bool:
+    return any(
+        task.status in {
+            AgentTaskStatus.ASSIGNED,
+            AgentTaskStatus.CLAIMED,
+            AgentTaskStatus.RUNNING,
+            AgentTaskStatus.IN_PROGRESS,
+            AgentTaskStatus.READY_FOR_REVIEW,
+        }
+        for task in task_states
+    )
+
+
+def _has_runnable_task(task_states: list[WorkflowTaskState]) -> bool:
+    return any(
+        task.status == AgentTaskStatus.QUEUED
+        and not task.blocked
+        and not task.failure
+        for task in task_states
+    )
 
 
 def _workflow_timeline(
