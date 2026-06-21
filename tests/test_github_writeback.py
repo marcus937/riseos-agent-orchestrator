@@ -70,6 +70,7 @@ def test_pr_target_posts_comment_and_label() -> None:
     assert client.comments[0][0] == "riseos/example"
     assert client.comments[0][1] == 7
     assert "## Review Decision" in client.comments[0][2]
+    assert "## Review Source" in client.comments[0][2]
     assert "Dry-run review processor accepted this work item for human review." in client.comments[0][2]
     assert client.labels == [("riseos/example", 7, "bb2-approved")]
 
@@ -167,6 +168,7 @@ def test_comment_body_contains_required_sections() -> None:
 
     for section in [
         "Review Decision",
+        "Review Source",
         "Risk Level",
         "Summary",
         "Required Changes",
@@ -176,3 +178,19 @@ def test_comment_body_contains_required_sections() -> None:
         "Human Review Required",
     ]:
         assert section in body
+
+
+def test_comment_body_includes_reviewer_model_when_present() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "abc123"}},
+        },
+    )
+    response = process_review_work_item(review_work_item_from_parsed(parsed), reviewer_model="hermes-bb2-runtime-validation")
+
+    body = build_writeback_comment(response)
+
+    assert "## Review Source\nhermes-bb2-runtime-validation" in body
