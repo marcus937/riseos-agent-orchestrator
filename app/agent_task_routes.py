@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.admin_auth import require_orchestrator_admin_token
@@ -28,6 +31,7 @@ from app.repository_discovery import (
     ensure_orchestration_enabled_repository,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/agent-tasks", tags=["agent-tasks"])
 
 
@@ -117,6 +121,7 @@ async def record_agent_task_execution_result(
     _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> AgentTask:
+    logger.info("execution-result payload=%s", json.dumps(payload.model_dump(mode="json"), default=str))
     store = _agent_task_store(request, settings)
     task = store.get_agent_task(task_id)
     if task is None:
