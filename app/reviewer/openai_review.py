@@ -89,7 +89,7 @@ async def request_openai_review_decision(
     try:
         decision = await reviewer.request_review_decision(prompt)
     except Exception as exc:
-        error = str(exc)
+        error = str(exc) or exc.__class__.__name__
         return OpenAIReviewResult(
             decision=_blocked_decision(error),
             attempted=True,

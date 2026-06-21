@@ -61,6 +61,7 @@ async def create_runtime_validation(
     _: None = Depends(_require_runtime_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> RuntimeValidationResult:
+    request = _request_with_default_base_branch(request, settings)
     result = await runtime_validation_store.trigger(request, settings)
     enqueue_review_from_runtime_validation(
         result,
@@ -113,6 +114,14 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
             setattr(route, "path", "")
     _add_route_path_markers(app)
     app.state.circuit_runtime_validation_routes_registered = True
+
+
+def _request_with_default_base_branch(request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationRequest:
+    if request.base_branch:
+        return request
+    branch = request.branch or settings.work_branch
+    base_branch = settings.work_branch if request.pr_number is not None and branch != settings.work_branch else settings.base_branch
+    return request.model_copy(update={"base_branch": base_branch})
 
 
 def _registered_route_paths(app: FastAPI) -> set[str]:

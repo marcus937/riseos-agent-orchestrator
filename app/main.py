@@ -17,6 +17,7 @@ from app.github_writeback import writeback_review_decision
 from app.hermes_contract import runtime_validation_request_from_parsed, runtime_validation_required_for_parsed
 from app.hermes_dispatch import dispatch_hermes_runtime_validation
 from app.operational_logging import (
+    log_event,
     log_github_writeback_result,
     log_github_writeback_attempted,
     log_hermes_dispatch_result,
@@ -65,6 +66,8 @@ from app.runtime_validation_review_bridge import (
     enqueue_review_from_runtime_validation,
     enqueue_runtime_pending_item,
 )
+from app.runtime_validation_review_decision import REVIEWER_MODEL as HERMES_BB2_REVIEWER_MODEL
+from app.runtime_validation_review_decision import review_decision_from_runtime_validation_context
 from app.security import verify_github_signature
 from app.slack_issue_dispatch import SlackIssueDispatchResult, dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
@@ -343,8 +346,17 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
 
     if settings.enable_github_context_hydration:
         github_client = GitHubClient(token=settings.github_token)
+        base_branch = item.base_branch or settings.base_branch
+        log_event(
+            "github_context_hydration_started",
+            item_id=item.id,
+            repo_full_name=item.repo_full_name,
+            pr_number=item.pr_number,
+            base_branch=base_branch,
+            branch=item.branch,
+        )
         try:
-            github_context = await hydrate_github_context(item, github_client, base_branch=settings.base_branch)
+            github_context = await hydrate_github_context(item, github_client, base_branch=base_branch)
         except Exception as exc:
             github_context_error = str(exc)
             record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_FAILED, error=github_context_error)
@@ -361,30 +373,65 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         runtime_evidence_context.extend(github_context.runtime_evidence_context)
         runtime_evidence_error = github_context.runtime_evidence_error
         runtime_evidence_truncated = github_context.runtime_evidence_truncated
+        log_event(
+            "github_context_hydration_completed",
+            item_id=item.id,
+            repo_full_name=item.repo_full_name,
+            pr_number=item.pr_number,
+            base_branch=base_branch,
+            branch=item.branch,
+            changed_file_count=len(changed_files),
+            patch_truncated=patch_truncated,
+            error=github_context_error,
+        )
 
-    if settings.enable_openai_review:
-        log_openai_review_attempted(reviewer_model=settings.openai_review_model)
-        record_lifecycle_stage(item, ReviewLifecycleStage.OPENAI_REVIEW_ATTEMPTED)
-    openai_review = await request_openai_review_decision(
-        item,
-        settings,
-        changed_files=changed_files,
-        diff_summary=diff_summary,
-        diff_patches=diff_patches,
-        patch_truncated=patch_truncated,
-        github_context_available=github_context_available,
-        github_context_error=github_context_error,
-        runtime_evidence_context=runtime_evidence_context,
-        runtime_evidence_error=runtime_evidence_error,
-        runtime_evidence_truncated=runtime_evidence_truncated,
-    )
-    log_openai_review_result(attempted=openai_review.attempted, success=openai_review.success, error=openai_review.error, reviewer_model=openai_review.reviewer_model)
-    if openai_review.attempted:
-        record_lifecycle_stage(item, ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED if openai_review.success else ReviewLifecycleStage.OPENAI_REVIEW_FAILED, error=openai_review.error)
+    review_decision = review_decision_from_runtime_validation_context(item.runtime_validation_context)
+    openai_review_attempted = False
+    openai_review_success = False
+    openai_review_error: str | None = None
+    reviewer_model: str | None = None
+
+    if review_decision is not None:
+        reviewer_model = HERMES_BB2_REVIEWER_MODEL
+        log_event(
+            "bb2_runtime_review_decision_selected",
+            item_id=item.id,
+            repo_full_name=item.repo_full_name,
+            pr_number=item.pr_number,
+            validation_id=item.runtime_validation_id,
+            validation_status=item.runtime_validation_status,
+            decision=review_decision.decision.value,
+            reviewer_model=reviewer_model,
+        )
+    else:
+        if settings.enable_openai_review:
+            log_openai_review_attempted(reviewer_model=settings.openai_review_model)
+            record_lifecycle_stage(item, ReviewLifecycleStage.OPENAI_REVIEW_ATTEMPTED)
+        openai_review = await request_openai_review_decision(
+            item,
+            settings,
+            changed_files=changed_files,
+            diff_summary=diff_summary,
+            diff_patches=diff_patches,
+            patch_truncated=patch_truncated,
+            github_context_available=github_context_available,
+            github_context_error=github_context_error,
+            runtime_evidence_context=runtime_evidence_context,
+            runtime_evidence_error=runtime_evidence_error,
+            runtime_evidence_truncated=runtime_evidence_truncated,
+        )
+        log_openai_review_result(attempted=openai_review.attempted, success=openai_review.success, error=openai_review.error, reviewer_model=openai_review.reviewer_model)
+        if openai_review.attempted:
+            record_lifecycle_stage(item, ReviewLifecycleStage.OPENAI_REVIEW_SUCCEEDED if openai_review.success else ReviewLifecycleStage.OPENAI_REVIEW_FAILED, error=openai_review.error)
+        review_decision = openai_review.decision
+        openai_review_attempted = openai_review.attempted
+        openai_review_success = openai_review.success
+        openai_review_error = openai_review.error
+        reviewer_model = openai_review.reviewer_model
 
     response = process_review_work_item(
         item,
-        decision=openai_review.decision,
+        decision=review_decision,
         changed_files=changed_files,
         diff_summary=diff_summary,
         diff_patches=diff_patches,
@@ -394,10 +441,10 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         runtime_evidence_context=runtime_evidence_context,
         runtime_evidence_error=runtime_evidence_error,
         runtime_evidence_truncated=runtime_evidence_truncated,
-        openai_review_attempted=openai_review.attempted,
-        openai_review_success=openai_review.success,
-        openai_review_error=openai_review.error,
-        reviewer_model=openai_review.reviewer_model,
+        openai_review_attempted=openai_review_attempted,
+        openai_review_success=openai_review_success,
+        openai_review_error=openai_review_error,
+        reviewer_model=reviewer_model,
     )
 
     if not settings.enable_github_writeback:

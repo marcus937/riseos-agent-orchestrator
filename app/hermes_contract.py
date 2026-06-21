@@ -66,6 +66,7 @@ async def runtime_validation_request_from_parsed(
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
         branch=parsed.head_ref or settings.work_branch,
+        base_branch=parsed.base_ref,
         target_url=target.target_url,
         validation_type="playwright",
         requested_by="orchestrator_webhook",

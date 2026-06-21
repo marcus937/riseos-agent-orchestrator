@@ -45,6 +45,7 @@ class ReviewWorkItem(BaseModel):
     repo_full_name: str | None = None
     event_type: GitHubEventType
     branch: str | None = None
+    base_branch: str | None = None
     commit_sha: str | None = None
     issue_number: int | None = None
     pr_number: int | None = None
@@ -266,6 +267,7 @@ def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
         repo_full_name=parsed.repository,
         event_type=parsed.event_type,
         branch=_branch_from_parsed(parsed),
+        base_branch=parsed.base_ref,
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,

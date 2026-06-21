@@ -89,6 +89,7 @@ def runtime_validation_context_from_result(result: RuntimeValidationResult) -> d
         "issue_number": result.issue_number,
         "pr_number": result.pr_number,
         "branch": result.branch,
+        "base_branch": result.base_branch,
         "correlation_id": result.correlation_id,
         "created_at": result.created_at.isoformat(),
         "completed_at": result.completed_at.isoformat() if result.completed_at else None,
@@ -117,6 +118,7 @@ def _review_work_item_from_runtime_validation(result: RuntimeValidationResult) -
         repo_full_name=result.repo,
         event_type=GitHubEventType.PULL_REQUEST if result.pr_number is not None else GitHubEventType.ISSUES,
         branch=result.branch,
+        base_branch=result.base_branch,
         issue_number=result.issue_number,
         pr_number=result.pr_number,
         labels=["bb-review-needed", "runtime-agent"],
@@ -126,6 +128,7 @@ def _review_work_item_from_runtime_validation(result: RuntimeValidationResult) -
 def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeValidationResult, *, digest: str) -> None:
     item.repo_full_name = item.repo_full_name or result.repo
     item.branch = item.branch or result.branch
+    item.base_branch = item.base_branch or result.base_branch
     item.issue_number = item.issue_number or result.issue_number
     item.pr_number = item.pr_number or result.pr_number
     if "bb-review-needed" not in item.labels:
