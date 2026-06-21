@@ -71,9 +71,12 @@ def build_writeback_comment(response: ReviewProcessResponse, *, labels: list[str
     changed_files = "\n".join(f"- {path}" for path in response.changed_files) or "- None"
     diff_summary = response.diff_summary or "Not available"
     label_lines = "\n".join(f"- {label}" for label in labels or []) or "- None"
+    review_source = response.reviewer_model or "dry-run-review-processor"
     return (
         "## Review Decision\n"
         f"{decision.decision.value}\n\n"
+        "## Review Source\n"
+        f"{review_source}\n\n"
         "## Risk Level\n"
         f"{decision.risk_level.value}\n\n"
         "## Summary\n"
