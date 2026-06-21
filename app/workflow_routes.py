@@ -4,13 +4,26 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
 from starlette.routing import Match
 
+from app.admin_auth import require_orchestrator_admin_token
+from app.agent_task_release import release_runnable_agent_tasks
 from app.agent_task_routes import router as agent_task_router
-from app.agent_tasks import AgentTask, agent_task_store
+from app.agent_tasks import AgentTask, AgentTaskStore, agent_task_store, build_agent_task_store
+from app.clients.agent_bus import AgentBusClient
+from app.clients.github import GitHubClient
 from app.config import Settings, get_settings
 from app.event_store import event_store
 from app.review_queue import review_queue
 from app.storage import SQLiteStateStore
 from app.workflows import WorkflowCollection, WorkflowRecord, WorkflowTimeline, build_workflows, find_workflow
+from app.workflow_orchestration import (
+    WorkflowCreateRequest,
+    WorkflowResponse,
+    WorkflowStore,
+    build_workflow_response,
+    build_workflow_store,
+    create_workflow,
+    workflow_store,
+)
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 _WORKFLOW_ROUTE_PATHS = {
@@ -49,6 +62,37 @@ def _require_workflow_read_access(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid orchestrator admin token")
 
 
+@router.post("", response_model=WorkflowResponse)
+async def create_workflow_endpoint(
+    payload: WorkflowCreateRequest,
+    request: Request,
+    _: None = Depends(require_orchestrator_admin_token),
+    settings: Settings = Depends(get_settings),
+) -> WorkflowResponse:
+    agent_store = _agent_task_store(request, settings)
+    store = _workflow_store(request, settings)
+    workflow = create_workflow(payload, workflow_store=store, agent_task_store=agent_store)
+
+    if settings.enable_agent_bus_dispatch:
+        client, should_close = _agent_bus_client(request, settings)
+        github_client = _github_dependency_client(settings)
+        try:
+            await release_runnable_agent_tasks(
+                agent_store,
+                client,
+                review_agent=settings.agent_bus_review_agent,
+                dependency_client=github_client,
+                correlation_id=workflow.workflow_id,
+            )
+        finally:
+            if github_client is not None:
+                await github_client.aclose()
+            if should_close:
+                await client.aclose()
+
+    return build_workflow_response(workflow, agent_store.list_agent_tasks())
+
+
 @router.get("", response_model=WorkflowCollection)
 async def list_workflows(
     request: Request,
@@ -57,16 +101,19 @@ async def list_workflows(
     return WorkflowCollection(workflows=_build_request_workflows(request))
 
 
-@router.get("/{workflow_id}", response_model=WorkflowRecord)
+@router.get("/{workflow_id}", response_model=WorkflowResponse)
 async def get_workflow(
     workflow_id: str,
     request: Request,
     _: None = Depends(_require_workflow_read_access),
-) -> WorkflowRecord:
-    workflow = find_workflow(_build_request_workflows(request), workflow_id)
+    settings: Settings = Depends(get_settings),
+) -> WorkflowResponse:
+    store = _workflow_store(request, settings)
+    workflow = store.get_workflow(workflow_id)
     if workflow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
-    return workflow
+    agent_store = _agent_task_store(request, settings)
+    return build_workflow_response(workflow, agent_store.list_agent_tasks())
 
 
 @router.get("/{workflow_id}/timeline", response_model=WorkflowTimeline)
@@ -116,6 +163,42 @@ def _agent_tasks(request: Request) -> list[AgentTask]:
                 return []
         return store.list_agent_tasks()
     return agent_task_store.list_agent_tasks()
+
+
+def _workflow_store(request: Request, settings: Settings) -> WorkflowStore:
+    store = getattr(request.app.state, "workflow_v1_store", None)
+    if store is None:
+        store = build_workflow_store(settings.orchestrator_db_path)
+        request.app.state.workflow_v1_store = store
+    return store
+
+
+def _agent_task_store(request: Request, settings: Settings) -> AgentTaskStore:
+    store = getattr(request.app.state, "agent_task_store", None)
+    if store is None:
+        store = build_agent_task_store(settings.orchestrator_db_path)
+        request.app.state.agent_task_store = store
+    return store
+
+
+def _agent_bus_client(request: Request, settings: Settings) -> tuple[AgentBusClient, bool]:
+    client = getattr(request.app.state, "agent_bus_client", None)
+    if client is not None:
+        return client, False
+    return (
+        AgentBusClient(
+            base_url=settings.agent_bus_base_url,
+            token=settings.agent_bus_token,
+            timeout_seconds=settings.agent_bus_timeout_seconds,
+        ),
+        True,
+    )
+
+
+def _github_dependency_client(settings: Settings) -> GitHubClient | None:
+    if not settings.github_token:
+        return None
+    return GitHubClient(token=settings.github_token)
 
 
 def _registered_route_paths(app: FastAPI) -> set[str]:

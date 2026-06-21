@@ -34,7 +34,7 @@ def build_agent_bus_work_item_payload(
     review_agent: str = "bb2",
     dependency_state: DependencyState | None = None,
 ) -> dict[str, Any]:
-    workflow_id = f"wf-agent-task-{task.task_id}"
+    workflow_id = task.correlation_id or f"wf-agent-task-{task.task_id}"
     dependency_state = dependency_state or DependencyState()
     return {
         "title": task.title,

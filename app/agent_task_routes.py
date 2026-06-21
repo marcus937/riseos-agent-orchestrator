@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.admin_auth import require_orchestrator_admin_token
 from app.agent_task_dispatch import AgentTaskDependencyBlocked, dispatch_agent_task_to_agent_bus
+from app.agent_task_release import release_runnable_agent_tasks
 from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
@@ -134,6 +135,23 @@ async def record_agent_task_execution_result(
     apply_execution_result(task, payload)
     store.save_agent_task(task)
     _refresh_all_agent_tasks(store)
+
+    if settings.enable_agent_bus_dispatch:
+        client, should_close = _agent_bus_client(request, settings)
+        github_client = _github_dependency_client(settings)
+        try:
+            await release_runnable_agent_tasks(
+                store,
+                client,
+                review_agent=settings.agent_bus_review_agent,
+                dependency_client=github_client,
+            )
+        finally:
+            if github_client is not None:
+                await github_client.aclose()
+            if should_close:
+                await client.aclose()
+
     refreshed = store.get_agent_task(task_id)
     return refreshed or task
 
