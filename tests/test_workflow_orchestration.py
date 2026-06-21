@@ -63,7 +63,7 @@ def test_release_runnable_tasks_advances_dependency_chain() -> None:
     released = run(release_runnable_agent_tasks(agent_store, client, review_agent="bb2"))
 
     assert [task.title for task in released] == ["Step A"]
-    assert client.payloads[0]["metadata"]["workflow_id"].startswith("wf-agent-task-")
+    assert client.payloads[0]["metadata"]["workflow_id"] == workflow.workflow_id
 
     response = build_workflow_response(workflow, agent_store.list_agent_tasks())
     task_by_key = {task.task_key: task for task in response.task_statuses}
