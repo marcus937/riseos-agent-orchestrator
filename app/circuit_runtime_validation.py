@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from app.circuit_hermes_adapter import CircuitHermesClient, canonical_job_id, format_optional_bool, redact_runtime_text
 from app.config import Settings
 from app.hermes_dispatch import HermesDispatchResult, HermesEvidenceSnapshot
+from app.operational_logging import log_event
 
 RuntimeValidationStatus = Literal["blocked", "completed", "failed", "pending"]
 
@@ -113,6 +114,18 @@ class RuntimeValidationStore:
         correlation_id = request.correlation_id or f"runtime-validation-{validation_id[:8]}"
         target_url = request.target_url or settings.hermes_default_target
         created_at = datetime.now(UTC)
+        log_event(
+            "runtime_validation_trigger_started",
+            validation_id=validation_id,
+            correlation_id=correlation_id,
+            repo=request.repo,
+            issue_number=request.issue_number,
+            pr_number=request.pr_number,
+            branch=request.branch,
+            base_branch=request.base_branch,
+            validation_type=request.validation_type,
+            requested_by=request.requested_by,
+        )
         blocked = _target_url_blocker(target_url, settings)
         if blocked is None:
             blocked = _hermes_config_blocker(settings)
@@ -136,6 +149,16 @@ class RuntimeValidationStore:
                 error=blocked,
             )
             self._items[validation_id] = result
+            log_event(
+                "runtime_validation_trigger_blocked",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                error=blocked,
+            )
             return result
 
         result = RuntimeValidationResult(
@@ -158,18 +181,52 @@ class RuntimeValidationStore:
 
         hermes_client = self._hermes_client_factory()
         try:
+            payload = _build_runtime_payload(request, target_url, correlation_id, settings)
+            log_event(
+                "hermes_runtime_validation_post_started",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                hermes_base_url=settings.hermes_m2_base_url,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                validation_type=request.validation_type,
+            )
             response = await hermes_client.post_runtime_validation(
                 settings.hermes_m2_base_url or "",
                 settings.hermes_m2_token or "",
-                _build_runtime_payload(request, target_url, correlation_id, settings),
+                payload,
+            )
+            log_event(
+                "hermes_runtime_validation_post_completed",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                status=response.get("status") or response.get("result"),
+                job_id=canonical_job_id(response),
+                response_keys=sorted(str(key) for key in response.keys()),
             )
             dispatch = _dispatch_result_from_response(response, target_url=target_url, correlation_id=correlation_id, settings=settings)
             if dispatch.job_id and dispatch.status in {"PASSED", "FAILED"}:
+                log_event(
+                    "hermes_evidence_collection_started",
+                    validation_id=validation_id,
+                    correlation_id=correlation_id,
+                    job_id=dispatch.job_id,
+                )
                 dispatch.evidence = await hermes_client.collect_evidence(
                     settings.hermes_m2_base_url or "",
                     settings.hermes_m2_token or "",
                     dispatch.job_id,
                     settings,
+                )
+                log_event(
+                    "hermes_evidence_collection_completed",
+                    validation_id=validation_id,
+                    correlation_id=correlation_id,
+                    job_id=dispatch.job_id,
+                    manifest_fetched=bool(dispatch.evidence and dispatch.evidence.manifest_fetched),
+                    bundle_fetched=bool(dispatch.evidence and dispatch.evidence.bundle_fetched),
                 )
             result = _result_from_dispatch(result, dispatch, settings)
         except Exception as exc:
@@ -180,10 +237,32 @@ class RuntimeValidationStore:
             result.hermes.status = "BLOCKED"
             result.hermes.error = error
             result.bb2 = RuntimeValidationBB2Packet(review_status="blocked")
+            log_event(
+                "runtime_validation_trigger_failed",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                error=error,
+            )
         finally:
             await hermes_client.aclose()
 
         self._items[validation_id] = result
+        log_event(
+            "runtime_validation_trigger_completed",
+            validation_id=validation_id,
+            correlation_id=correlation_id,
+            repo=result.repo,
+            pr_number=result.pr_number,
+            branch=result.branch,
+            base_branch=result.base_branch,
+            status=result.status,
+            hermes_status=result.hermes.status,
+            bb2_review_status=result.bb2.review_status,
+        )
         return result
 
 
