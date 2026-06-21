@@ -23,6 +23,7 @@ class RuntimeValidationRequest(BaseModel):
     issue_number: int | None = None
     pr_number: int | None = None
     branch: str | None = None
+    base_branch: str | None = None
     target_url: str | None = None
     validation_type: str = "playwright"
     requested_by: str = "circuit"
@@ -73,6 +74,7 @@ class RuntimeValidationResult(BaseModel):
     issue_number: int | None = None
     pr_number: int | None = None
     branch: str | None = None
+    base_branch: str | None = None
     validation_type: str
     requested_by: str
     created_at: datetime
@@ -122,6 +124,7 @@ class RuntimeValidationStore:
                 issue_number=request.issue_number,
                 pr_number=request.pr_number,
                 branch=request.branch,
+                base_branch=request.base_branch,
                 validation_type=request.validation_type,
                 requested_by=request.requested_by,
                 created_at=created_at,
@@ -142,6 +145,7 @@ class RuntimeValidationStore:
             issue_number=request.issue_number,
             pr_number=request.pr_number,
             branch=request.branch,
+            base_branch=request.base_branch,
             validation_type=request.validation_type,
             requested_by=request.requested_by,
             created_at=created_at,
@@ -264,6 +268,8 @@ def _build_runtime_payload(
         "source": "riseos-agent-orchestrator",
         "repo": request.repo,
         "branch": branch,
+        "baseBranch": request.base_branch,
+        "base_branch": request.base_branch,
         "targetUrl": target_url,
         "previewUrl": target_url if _is_vercel_preview_url(target_url) else None,
         "preview_url": target_url if _is_vercel_preview_url(target_url) else None,
