@@ -156,6 +156,7 @@ class SQLiteStateStore:
                     repo_full_name,
                     event_type,
                     branch,
+                    base_branch,
                     commit_sha,
                     issue_number,
                     pr_number,
@@ -182,7 +183,7 @@ class SQLiteStateStore:
                     failure_count,
                     last_failure_at,
                     last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
@@ -191,6 +192,7 @@ class SQLiteStateStore:
                     item.repo_full_name,
                     str(item.event_type),
                     item.branch,
+                    item.base_branch,
                     item.commit_sha,
                     item.issue_number,
                     item.pr_number,
@@ -465,6 +467,7 @@ def _load_json(value: object | None) -> dict[str, object]:
 
 
 _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
+    ("base_branch", "TEXT"),
     ("updated_at", "TEXT"),
     ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'review_queued'"),
     ("worker_claimed_at", "TEXT"),
