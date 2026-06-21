@@ -17,6 +17,7 @@ async def release_runnable_agent_tasks(
     *,
     review_agent: str = "bb2",
     dependency_client: object | None = None,
+    correlation_id: str | None = None,
 ) -> list[AgentTask]:
     tasks = refresh_agent_task_dependency_states(store.list_agent_tasks())
     tasks_by_id = {task.task_id: task for task in tasks}
@@ -24,6 +25,8 @@ async def release_runnable_agent_tasks(
 
     for task in tasks:
         store.save_agent_task(task)
+        if correlation_id is not None and task.correlation_id != correlation_id:
+            continue
         if not _is_runnable(task):
             continue
         try:
