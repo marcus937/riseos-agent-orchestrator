@@ -84,17 +84,17 @@ async def writeback_review_decision(
     labels_to_remove = _labels_to_remove(current_labels, labels)
     comment_body = build_writeback_comment(response, labels=labels)
     try:
-        comment_updated, updated_comment_id = await _upsert_status_comment(
-            client,
-            item.repo_full_name,
-            target_number,
-            comment_body,
-        )
-        for old_label in labels_to_remove:
-            await client.remove_label(item.repo_full_name, target_number, old_label)
         for next_label in labels:
             await client.apply_label(item.repo_full_name, target_number, next_label)
     except Exception as exc:
+        logger.error(
+            "BB2 review writeback failed before cleanup repo=%s issue=%s outcome=%s labels=%s error=%s",
+            item.repo_full_name,
+            target_number,
+            response.decision.decision.value,
+            labels,
+            exc,
+        )
         return GitHubWritebackResult(
             attempted=True,
             success=False,
@@ -102,15 +102,46 @@ async def writeback_review_decision(
             comment_body=comment_body,
             label=label,
             labels=labels,
-            removed_labels=labels_to_remove,
         )
+
+    comment_updated = False
+    updated_comment_id: int | None = None
+    try:
+        comment_updated, updated_comment_id = await _upsert_status_comment(
+            client,
+            item.repo_full_name,
+            target_number,
+            comment_body,
+        )
+    except Exception as exc:
+        logger.warning(
+            "BB2 status comment writeback failed after labels were applied repo=%s issue=%s outcome=%s error=%s",
+            item.repo_full_name,
+            target_number,
+            response.decision.decision.value,
+            exc,
+        )
+
+    removed_labels: list[str] = []
+    for old_label in labels_to_remove:
+        try:
+            await client.remove_label(item.repo_full_name, target_number, old_label)
+            removed_labels.append(old_label)
+        except Exception as exc:
+            logger.warning(
+                "BB2 stale label cleanup failed after current state was applied repo=%s issue=%s label=%s error=%s",
+                item.repo_full_name,
+                target_number,
+                old_label,
+                exc,
+            )
 
     logger.info(
         "BB2 review writeback updated labels repo=%s issue=%s outcome=%s removed=%s applied=%s comment_updated=%s",
         item.repo_full_name,
         target_number,
         response.decision.decision.value,
-        labels_to_remove,
+        removed_labels,
         labels,
         comment_updated,
     )
@@ -120,7 +151,7 @@ async def writeback_review_decision(
         comment_body=comment_body,
         label=label,
         labels=labels,
-        removed_labels=labels_to_remove,
+        removed_labels=removed_labels,
         comment_updated=comment_updated,
         updated_comment_id=updated_comment_id,
     )
