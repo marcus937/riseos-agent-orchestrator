@@ -187,7 +187,7 @@ def test_later_needs_changes_removes_stale_approval_and_review_request_labels() 
     assert "agent-next" in client.issue_labels
 
 
-def test_later_approval_removes_stale_needs_changes_and_agent_next() -> None:
+def test_later_approval_removes_stale_needs_changes_but_preserves_agent_next_ownership() -> None:
     parsed = parse_github_event(
         "pull_request",
         {
@@ -208,9 +208,9 @@ def test_later_approval_removes_stale_needs_changes_and_agent_next() -> None:
 
     assert result.success is True
     assert result.labels == ["bb2-approved", "ready-to-merge"]
-    assert result.removed_labels == ["agent-next", "bb2-needs-changes"]
+    assert result.removed_labels == ["bb2-needs-changes"]
     assert "bb2-needs-changes" not in client.issue_labels
-    assert "agent-next" not in client.issue_labels
+    assert "agent-next" in client.issue_labels
     assert "bb2-approved" in client.issue_labels
     assert "ready-to-merge" in client.issue_labels
 
