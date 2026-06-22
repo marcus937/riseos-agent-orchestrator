@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -195,6 +196,16 @@ class GitHubClient:
             json={"body": body},
         )
 
+    async def update_issue_comment(self, repo_full_name: str, comment_id: int, body: str) -> GitHubResponse:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(comment_id)
+        self._require_value(body, "body")
+        return await self._request(
+            "PATCH",
+            f"/repos/{repo_full_name}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+
     async def apply_label(self, repo_full_name: str, issue_number: int, label: str) -> GitHubResponse:
         self._require_value(repo_full_name, "repo_full_name")
         self._require_issue_number(issue_number)
@@ -203,6 +214,15 @@ class GitHubClient:
             "POST",
             f"/repos/{repo_full_name}/issues/{issue_number}/labels",
             json={"labels": [label]},
+        )
+
+    async def remove_label(self, repo_full_name: str, issue_number: int, label: str) -> GitHubResponse:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(issue_number)
+        self._require_value(label, "label")
+        return await self._request(
+            "DELETE",
+            f"/repos/{repo_full_name}/issues/{issue_number}/labels/{quote(label, safe='')}",
         )
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> GitHubResponse:
