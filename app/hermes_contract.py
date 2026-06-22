@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -21,6 +22,7 @@ from app.hermes_dispatch_impl import (
     TERMINAL_LABELS,
     URL_PATTERN,
 )
+from app.operational_logging import log_event
 
 
 class HermesPreviewMetadataClient(Protocol):
@@ -29,9 +31,10 @@ class HermesPreviewMetadataClient(Protocol):
 
 
 class HermesRuntimeTarget(BaseModel):
-    target_url: str
+    target_url: str | None = None
     target_source: str
     preview_url: str | None = None
+    pending_reason: str | None = None
 
 
 def runtime_validation_required_for_parsed(parsed: ParsedGitHubEvent, settings: Settings, *, has_review_context: bool) -> bool:
@@ -68,6 +71,8 @@ async def runtime_validation_request_from_parsed(
         branch=parsed.head_ref or settings.work_branch,
         base_branch=parsed.base_ref,
         target_url=target.target_url,
+        target_url_source=target.target_source,
+        target_url_pending_reason=target.pending_reason,
         validation_type="playwright",
         requested_by="orchestrator_webhook",
         correlation_id=None,
@@ -82,33 +87,79 @@ async def resolve_runtime_validation_target(
 ) -> HermesRuntimeTarget:
     payload_preview_url = preview_url_from_payload(parsed.raw)
     if payload_preview_url:
+        _log_target(parsed, payload_preview_url, "webhook_payload_preview_url")
         return HermesRuntimeTarget(target_url=payload_preview_url, target_source="webhook_payload_preview_url", preview_url=payload_preview_url)
+
     github_preview_url = await preview_url_from_github_commit_metadata(parsed, github_client)
     if github_preview_url:
+        _log_target(parsed, github_preview_url, "github_commit_preview_url")
         return HermesRuntimeTarget(target_url=github_preview_url, target_source="github_commit_preview_url", preview_url=github_preview_url)
+
+    if parsed.event_type == GitHubEventType.PULL_REQUEST:
+        reason = "No successful Vercel preview deployment is available for this PR head SHA yet."
+        _log_target(parsed, None, "vercel_preview_pending", fallback_reason=reason)
+        return HermesRuntimeTarget(target_url=None, target_source="vercel_preview_pending", pending_reason=reason)
+
+    _log_target(parsed, settings.hermes_default_target, "hermes_default_target")
     return HermesRuntimeTarget(target_url=settings.hermes_default_target, target_source="hermes_default_target")
 
 
 async def preview_url_from_github_commit_metadata(parsed: ParsedGitHubEvent, github_client: HermesPreviewMetadataClient | None) -> str | None:
     if github_client is None or not parsed.repository or not parsed.head_sha:
         return None
+    candidates: list[tuple[datetime | None, str]] = []
     for method_name in ("list_commit_statuses", "list_check_runs_for_ref"):
         method = getattr(github_client, method_name, None)
         if method is None:
             continue
         try:
-            preview_url = preview_url_from_payload(await method(parsed.repository, parsed.head_sha))
+            payload = await method(parsed.repository, parsed.head_sha)
         except Exception:
             continue
-        if preview_url:
-            return preview_url
-    return None
+        candidates.extend(_successful_preview_candidates(payload))
+    candidates.sort(key=lambda item: item[0] or datetime.min, reverse=True)
+    return candidates[0][1] if candidates else None
 
 
 def preview_url_from_payload(value: Any) -> str | None:
     for url in _candidate_preview_urls(value):
         if _is_vercel_preview_url(url):
             return url
+    return None
+
+
+def _successful_preview_candidates(value: Any) -> list[tuple[datetime | None, str]]:
+    items = value if isinstance(value, list) else [value]
+    candidates: list[tuple[datetime | None, str]] = []
+    for item in items:
+        if not isinstance(item, dict) or not _github_item_successful(item):
+            continue
+        preview_url = preview_url_from_payload(item)
+        if preview_url:
+            candidates.append((_github_item_timestamp(item), preview_url))
+    return candidates
+
+
+def _github_item_successful(item: dict[str, Any]) -> bool:
+    state = str(item.get("state") or "").lower()
+    status = str(item.get("status") or "").lower()
+    conclusion = str(item.get("conclusion") or "").lower()
+    if state:
+        return state == "success"
+    if status or conclusion:
+        return status == "completed" and conclusion == "success"
+    return False
+
+
+def _github_item_timestamp(item: dict[str, Any]) -> datetime | None:
+    for key in ("completed_at", "updated_at", "created_at", "started_at"):
+        value = item.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
     return None
 
 
@@ -158,6 +209,18 @@ def _is_circuit_pr(parsed: ParsedGitHubEvent) -> bool:
         and parsed.base_repo_full_name == parsed.repository
         and parsed.head_ref == CIRCUIT_WORK_BRANCH
         and parsed.base_ref == CIRCUIT_BASE_BRANCH
+    )
+
+
+def _log_target(parsed: ParsedGitHubEvent, deployment_url: str | None, target_url_source: str, *, fallback_reason: str | None = None) -> None:
+    log_event(
+        "runtime_validation_target_resolved",
+        repo=parsed.repository,
+        pr_number=parsed.pull_request_number,
+        branch=parsed.head_ref,
+        deployment_url=deployment_url,
+        target_url_source=target_url_source,
+        fallback_reason=fallback_reason,
     )
 
 
