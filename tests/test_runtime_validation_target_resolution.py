@@ -57,32 +57,27 @@ def _payload() -> dict[str, Any]:
     }
 
 
-def test_runtime_validation_uses_latest_successful_vercel_preview() -> None:
+async def _build_request(client: FakePreviewClient):
     parsed = parse_github_event("pull_request", _payload())
+    return await runtime_validation_request_from_parsed(parsed, _settings(), github_client=client)
+
+
+async def _trigger_validation(request):
+    return await runtime_validation_store.trigger(request, _settings())
+
+
+def test_runtime_validation_uses_latest_successful_vercel_preview() -> None:
     client = FakePreviewClient(
         statuses=[
-            {
-                "state": "success",
-                "target_url": "https://old-preview.vercel.app",
-                "updated_at": "2026-06-20T01:00:00Z",
-            },
-            {
-                "state": "failure",
-                "target_url": "https://failed-preview.vercel.app",
-                "updated_at": "2026-06-20T03:00:00Z",
-            },
+            {"state": "success", "target_url": "https://old-preview.vercel.app", "updated_at": "2026-06-20T01:00:00Z"},
+            {"state": "failure", "target_url": "https://failed-preview.vercel.app", "updated_at": "2026-06-20T03:00:00Z"},
         ],
         checks=[
-            {
-                "status": "completed",
-                "conclusion": "success",
-                "details_url": "https://new-preview.vercel.app",
-                "completed_at": "2026-06-20T04:00:00Z",
-            }
+            {"status": "completed", "conclusion": "success", "details_url": "https://new-preview.vercel.app", "completed_at": "2026-06-20T04:00:00Z"}
         ],
     )
 
-    request = anyio.run(runtime_validation_request_from_parsed, parsed, _settings(), github_client=client)
+    request = anyio.run(_build_request, client)
 
     assert request.target_url == "https://new-preview.vercel.app"
     assert request.target_url_source == "github_commit_preview_url"
@@ -90,15 +85,14 @@ def test_runtime_validation_uses_latest_successful_vercel_preview() -> None:
 
 
 def test_missing_pr_preview_stays_pending_and_does_not_use_default_target(monkeypatch) -> None:
-    parsed = parse_github_event("pull_request", _payload())
-    request = anyio.run(runtime_validation_request_from_parsed, parsed, _settings(), github_client=FakePreviewClient())
+    request = anyio.run(_build_request, FakePreviewClient())
 
     assert request.target_url is None
     assert request.target_url_source == "vercel_preview_pending"
     assert request.target_url_pending_reason
 
     monkeypatch.setattr(runtime_validation_store, "_hermes_client_factory", lambda: FailingHermesClient())
-    result = anyio.run(runtime_validation_store.trigger, request, _settings())
+    result = anyio.run(_trigger_validation, request)
 
     assert result.status == "pending"
     assert result.hermes.target_url is None
