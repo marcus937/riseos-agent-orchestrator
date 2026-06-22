@@ -31,6 +31,11 @@ class RuntimeValidationRequest(BaseModel):
     validation_type: str = "playwright"
     requested_by: str = "circuit"
     correlation_id: str | None = None
+    work_item_id: str | None = None
+    evidence_id: str | None = None
+    review_agent: str | None = None
+    workflow_id: str | None = None
+    review_dispatch: dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeValidationHermesSummary(BaseModel):
@@ -78,6 +83,11 @@ class RuntimeValidationResult(BaseModel):
     pr_number: int | None = None
     branch: str | None = None
     base_branch: str | None = None
+    work_item_id: str | None = None
+    evidence_id: str | None = None
+    review_agent: str | None = None
+    workflow_id: str | None = None
+    review_dispatch: dict[str, Any] = Field(default_factory=dict)
     validation_type: str
     requested_by: str
     created_at: datetime
@@ -117,6 +127,7 @@ class RuntimeValidationStore:
         target_url = request.target_url
         created_at = datetime.now(UTC)
         target_source = request.target_url_source or ("request" if request.target_url else "missing")
+        review_dispatch = _build_review_dispatch_payload(request, correlation_id)
         log_event(
             "runtime_validation_trigger_started",
             validation_id=validation_id,
@@ -126,6 +137,10 @@ class RuntimeValidationStore:
             pr_number=request.pr_number,
             branch=request.branch,
             base_branch=request.base_branch,
+            work_item_id=request.work_item_id,
+            evidence_id=request.evidence_id,
+            review_agent=request.review_agent,
+            workflow_id=request.workflow_id,
             validation_type=request.validation_type,
             requested_by=request.requested_by,
             target_url_source=target_source,
@@ -140,6 +155,11 @@ class RuntimeValidationStore:
                 pr_number=request.pr_number,
                 branch=request.branch,
                 base_branch=request.base_branch,
+                work_item_id=request.work_item_id,
+                evidence_id=request.evidence_id,
+                review_agent=request.review_agent,
+                workflow_id=request.workflow_id,
+                review_dispatch=review_dispatch,
                 validation_type=request.validation_type,
                 requested_by=request.requested_by,
                 created_at=created_at,
@@ -181,6 +201,11 @@ class RuntimeValidationStore:
                 pr_number=request.pr_number,
                 branch=request.branch,
                 base_branch=request.base_branch,
+                work_item_id=request.work_item_id,
+                evidence_id=request.evidence_id,
+                review_agent=request.review_agent,
+                workflow_id=request.workflow_id,
+                review_dispatch=review_dispatch,
                 validation_type=request.validation_type,
                 requested_by=request.requested_by,
                 created_at=created_at,
@@ -213,6 +238,11 @@ class RuntimeValidationStore:
             pr_number=request.pr_number,
             branch=request.branch,
             base_branch=request.base_branch,
+            work_item_id=request.work_item_id,
+            evidence_id=request.evidence_id,
+            review_agent=request.review_agent,
+            workflow_id=request.workflow_id,
+            review_dispatch=review_dispatch,
             validation_type=request.validation_type,
             requested_by=request.requested_by,
             created_at=created_at,
@@ -235,6 +265,10 @@ class RuntimeValidationStore:
                 pr_number=request.pr_number,
                 branch=request.branch,
                 base_branch=request.base_branch,
+                work_item_id=request.work_item_id,
+                evidence_id=request.evidence_id,
+                review_agent=request.review_agent,
+                workflow_id=request.workflow_id,
                 validation_type=request.validation_type,
                 target_url_source=target_source,
             )
@@ -390,6 +424,7 @@ def _build_runtime_payload(
     target_source: str,
 ) -> dict[str, Any]:
     branch = request.branch or settings.work_branch
+    review_dispatch = _build_review_dispatch_payload(request, correlation_id)
     payload: dict[str, Any] = {
         "source": "riseos-agent-orchestrator",
         "repo": request.repo,
@@ -405,6 +440,16 @@ def _build_runtime_payload(
         "target_url_source": target_source,
         "requestedBy": request.requested_by,
         "requested_by": request.requested_by,
+        "workItemId": request.work_item_id,
+        "work_item_id": request.work_item_id,
+        "evidenceId": request.evidence_id,
+        "evidence_id": request.evidence_id,
+        "reviewAgent": request.review_agent,
+        "review_agent": request.review_agent,
+        "workflowId": request.workflow_id,
+        "workflow_id": request.workflow_id,
+        "reviewDispatch": review_dispatch,
+        "review_dispatch": review_dispatch,
         "hermesNode": "M2",
         "trigger": "circuit_runtime_validation_api",
     }
@@ -419,8 +464,52 @@ def _build_runtime_payload(
         "targetUrl": target_url,
         "validation_type": request.validation_type,
         "correlationId": correlation_id,
+        "workItemId": request.work_item_id,
+        "work_item_id": request.work_item_id,
+        "evidenceId": request.evidence_id,
+        "evidence_id": request.evidence_id,
+        "reviewAgent": request.review_agent,
+        "review_agent": request.review_agent,
+        "workflowId": request.workflow_id,
+        "workflow_id": request.workflow_id,
+        "reviewDispatch": review_dispatch,
+        "review_dispatch": review_dispatch,
         "payload": payload,
     }
+
+
+def _build_review_dispatch_payload(request: RuntimeValidationRequest, correlation_id: str) -> dict[str, Any]:
+    review_agent = request.review_agent or request.review_dispatch.get("review_agent") or request.review_dispatch.get("target_agent") or "bb2"
+    pr_number = request.pr_number or request.review_dispatch.get("pr_number")
+    title = request.review_dispatch.get("title") or (
+        f"BB2 review for {request.repo} PR #{pr_number}" if pr_number else f"BB2 review for {request.repo}"
+    )
+    prompt = request.review_dispatch.get("prompt") or "Review Codex worker implementation evidence for this PR."
+    payload = {
+        **request.review_dispatch,
+        "repository": request.review_dispatch.get("repository") or request.repo,
+        "repo": request.review_dispatch.get("repo") or request.repo,
+        "title": title,
+        "prompt": prompt,
+        "issue_number": request.issue_number if request.issue_number is not None else request.review_dispatch.get("issue_number"),
+        "pr_number": pr_number,
+        "branch": request.branch or request.review_dispatch.get("branch"),
+        "base_branch": request.base_branch or request.review_dispatch.get("base_branch"),
+        "work_item_id": request.work_item_id or request.review_dispatch.get("work_item_id"),
+        "evidence_id": request.evidence_id or request.review_dispatch.get("evidence_id"),
+        "evidence_packet_id": request.evidence_id or request.review_dispatch.get("evidence_packet_id"),
+        "owner_agent": request.review_dispatch.get("owner_agent") or review_agent,
+        "reviewer": request.review_dispatch.get("reviewer") or review_agent,
+        "review_agent": review_agent,
+        "target_agent": request.review_dispatch.get("target_agent") or review_agent,
+        "requested_by": request.review_dispatch.get("requested_by") or request.requested_by,
+        "correlation_id": request.review_dispatch.get("correlation_id") or correlation_id,
+        "workflow_id": request.workflow_id or request.review_dispatch.get("workflow_id"),
+        "source": request.review_dispatch.get("source") or "riseos-agent-orchestrator",
+    }
+    if "tool_preference" not in payload:
+        payload["tool_preference"] = ["create_review_packet", "attach_review_to_work_item", "mark_ready_for_review", "dispatch_prompt"]
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _dispatch_result_from_response(
@@ -482,6 +571,11 @@ def _result_from_dispatch(result: RuntimeValidationResult, dispatch: HermesDispa
         review_context={
             "source": "circuit_runtime_validation_api",
             "correlation_id": result.correlation_id,
+            "work_item_id": result.work_item_id,
+            "evidence_id": result.evidence_id,
+            "review_agent": result.review_agent,
+            "workflow_id": result.workflow_id,
+            "review_dispatch": result.review_dispatch,
             "field_propagation_matrix": _field_matrix(evidence),
         },
     )
