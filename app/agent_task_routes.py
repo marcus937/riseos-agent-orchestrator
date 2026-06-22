@@ -31,6 +31,7 @@ from app.repository_discovery import (
     build_repository_registry,
     ensure_orchestration_enabled_repository,
 )
+from app.review_dispatch import dispatch_bb2_review_request_from_execution_result
 from app.workflow_orchestration import build_workflow_store, update_shared_workflow_routing_after_result
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,13 @@ async def record_agent_task_execution_result(
         client, should_close = _agent_bus_client(request, settings)
         github_client = _github_dependency_client(settings)
         try:
+            await dispatch_bb2_review_request_from_execution_result(
+                task,
+                payload,
+                client,
+                review_agent=settings.agent_bus_review_agent,
+                store=store,
+            )
             await release_runnable_agent_tasks(store, client, review_agent=settings.agent_bus_review_agent, dependency_client=github_client)
         finally:
             if github_client is not None:
