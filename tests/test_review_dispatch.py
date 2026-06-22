@@ -87,14 +87,16 @@ def test_execution_result_dispatch_creates_review_owned_work_item() -> None:
     store.save_agent_task(task)
     fake_bus = FakeAgentBusClient()
 
-    review_work_item_id = anyio.run(
-        dispatch_bb2_review_request_from_execution_result,
-        task,
-        result,
-        fake_bus,
-        review_agent="bb2",
-        store=store,
-    )
+    async def run_dispatch() -> str | None:
+        return await dispatch_bb2_review_request_from_execution_result(
+            task,
+            result,
+            fake_bus,
+            review_agent="bb2",
+            store=store,
+        )
+
+    review_work_item_id = anyio.run(run_dispatch)
 
     assert review_work_item_id == "review-work-123"
     assert fake_bus.payloads[0]["owner_agent"] == "bb2"
@@ -114,14 +116,16 @@ def test_execution_result_dispatch_is_idempotent_when_review_work_item_exists() 
     store.save_agent_task(task)
     fake_bus = FakeAgentBusClient()
 
-    review_work_item_id = anyio.run(
-        dispatch_bb2_review_request_from_execution_result,
-        task,
-        result,
-        fake_bus,
-        review_agent="bb2",
-        store=store,
-    )
+    async def run_dispatch() -> str | None:
+        return await dispatch_bb2_review_request_from_execution_result(
+            task,
+            result,
+            fake_bus,
+            review_agent="bb2",
+            store=store,
+        )
+
+    review_work_item_id = anyio.run(run_dispatch)
 
     assert review_work_item_id == "existing-review-work"
     assert fake_bus.payloads == []
