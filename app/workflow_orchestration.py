@@ -32,6 +32,11 @@ class WorkflowStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class WorkflowPRStrategy(StrEnum):
+    PER_TASK = "per_task"
+    SHARED_WORKFLOW_BRANCH = "shared_workflow_branch"
+
+
 class WorkflowTask(BaseModel):
     task_key: str = Field(min_length=1)
     title: str = Field(min_length=1)
@@ -57,6 +62,8 @@ class WorkflowCreateRequest(BaseModel):
     repo_full_name: str = Field(min_length=1)
     title: str = Field(min_length=1)
     correlation_id: str | None = None
+    base_branch: str = "agent-integration"
+    pr_strategy: WorkflowPRStrategy = WorkflowPRStrategy.PER_TASK
     tasks: list[WorkflowTask] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -115,6 +122,10 @@ class StoredWorkflow(BaseModel):
     title: str
     repo_full_name: str
     correlation_id: str | None = None
+    base_branch: str = "agent-integration"
+    pr_strategy: WorkflowPRStrategy = WorkflowPRStrategy.PER_TASK
+    shared_branch: str | None = None
+    shared_pr_number: int | None = None
     task_key_to_task_id: dict[str, str] = Field(default_factory=dict)
     task_dependencies: dict[str, list[str]] = Field(default_factory=dict)
     created_at: datetime
@@ -128,6 +139,10 @@ class WorkflowResponse(BaseModel):
     repo_full_name: str
     correlation_id: str | None = None
     status: WorkflowStatus
+    base_branch: str = "agent-integration"
+    pr_strategy: WorkflowPRStrategy = WorkflowPRStrategy.PER_TASK
+    shared_branch: str | None = None
+    shared_pr_number: int | None = None
     created_at: datetime
     updated_at: datetime
     task_statuses: list[WorkflowTaskState] = Field(default_factory=list)
@@ -140,14 +155,9 @@ class WorkflowResponse(BaseModel):
 
 
 class WorkflowStore(Protocol):
-    def save_workflow(self, workflow: StoredWorkflow) -> None:
-        ...
-
-    def get_workflow(self, workflow_id: str) -> StoredWorkflow | None:
-        ...
-
-    def list_workflows(self) -> list[StoredWorkflow]:
-        ...
+    def save_workflow(self, workflow: StoredWorkflow) -> None: ...
+    def get_workflow(self, workflow_id: str) -> StoredWorkflow | None: ...
+    def list_workflows(self) -> list[StoredWorkflow]: ...
 
 
 class InMemoryWorkflowStore:
@@ -203,12 +213,7 @@ class SQLiteWorkflowStore:
                     updated_at
                 ) VALUES (?, ?, ?, ?)
                 """,
-                (
-                    workflow.workflow_id,
-                    workflow.model_dump_json(),
-                    workflow.created_at.isoformat(),
-                    workflow.updated_at.isoformat(),
-                ),
+                (workflow.workflow_id, workflow.model_dump_json(), workflow.created_at.isoformat(), workflow.updated_at.isoformat()),
             )
 
     def get_workflow(self, workflow_id: str) -> StoredWorkflow | None:
@@ -218,12 +223,7 @@ class SQLiteWorkflowStore:
 
     def list_workflows(self) -> list[StoredWorkflow]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT payload FROM workflows_v1
-                ORDER BY created_at DESC
-                """
-            ).fetchall()
+            rows = conn.execute("SELECT payload FROM workflows_v1 ORDER BY created_at DESC").fetchall()
         return [_workflow_from_payload(row["payload"]) for row in rows]
 
 
@@ -239,22 +239,21 @@ def build_workflow_store(db_path: str | None) -> WorkflowStore:
         return workflow_store
 
 
-def create_workflow(
-    request: WorkflowCreateRequest,
-    *,
-    workflow_store: WorkflowStore,
-    agent_task_store: AgentTaskStore,
-) -> StoredWorkflow:
+def create_workflow(request: WorkflowCreateRequest, *, workflow_store: WorkflowStore, agent_task_store: AgentTaskStore) -> StoredWorkflow:
     now = datetime.now(UTC)
     workflow_id = f"wf-{uuid4()}"
+    shared_branch = _shared_branch_for_workflow(workflow_id) if request.pr_strategy == WorkflowPRStrategy.SHARED_WORKFLOW_BRANCH else None
     workflow = StoredWorkflow(
         workflow_id=workflow_id,
         title=request.title,
         repo_full_name=request.repo_full_name,
         correlation_id=request.correlation_id or workflow_id,
+        base_branch=request.base_branch,
+        pr_strategy=request.pr_strategy,
+        shared_branch=shared_branch,
         created_at=now,
         updated_at=now,
-        timeline=[WorkflowTimelineEvent(event="workflow_created", occurred_at=now, metadata={"task_count": len(request.tasks)})],
+        timeline=[WorkflowTimelineEvent(event="workflow_created", occurred_at=now, metadata={"task_count": len(request.tasks), "pr_strategy": request.pr_strategy.value})],
     )
 
     created_tasks: dict[str, AgentTask] = {}
@@ -276,6 +275,7 @@ def create_workflow(
             )
         )
         agent_task.source = "workflow_api"
+        agent_task.execution_evidence = {"_routing": _workflow_routing(workflow)}
         created_tasks[workflow_task.task_key] = agent_task
         workflow.task_key_to_task_id[workflow_task.task_key] = agent_task.task_id
         workflow.task_dependencies[workflow_task.task_key] = _unique_keys(workflow_task.depends_on)
@@ -313,12 +313,17 @@ def build_workflow_response(workflow: StoredWorkflow, agent_tasks: list[AgentTas
     failures = [task.failure for task in task_states if task.failure]
     results = {task.task_key: task.result for task in task_states if task.result}
     updated_at = max([workflow.updated_at, *(event.occurred_at for event in timeline)], default=workflow.updated_at)
+    shared_pr_number = workflow.shared_pr_number or _shared_pr_number(task_states)
     return WorkflowResponse(
         workflow_id=workflow.workflow_id,
         title=workflow.title,
         repo_full_name=workflow.repo_full_name,
         correlation_id=workflow.correlation_id,
         status=status,
+        base_branch=workflow.base_branch,
+        pr_strategy=workflow.pr_strategy,
+        shared_branch=workflow.shared_branch,
+        shared_pr_number=shared_pr_number,
         created_at=workflow.created_at,
         updated_at=updated_at,
         task_statuses=task_states,
@@ -331,21 +336,30 @@ def build_workflow_response(workflow: StoredWorkflow, agent_tasks: list[AgentTas
     )
 
 
+def update_shared_workflow_routing_after_result(workflow: StoredWorkflow, agent_task_store: AgentTaskStore) -> None:
+    if workflow.pr_strategy != WorkflowPRStrategy.SHARED_WORKFLOW_BRANCH:
+        return
+    tasks = refresh_agent_task_dependency_states(agent_task_store.list_agent_tasks())
+    workflow_tasks = [task for task in tasks if task.correlation_id == workflow.workflow_id]
+    pr_number = _shared_pr_number([_task_state(key, workflow, {task.task_id: task for task in workflow_tasks}) for key in workflow.task_key_to_task_id])
+    if pr_number is None:
+        return
+    workflow.shared_pr_number = pr_number
+    for task in workflow_tasks:
+        if task.status != AgentTaskStatus.QUEUED:
+            continue
+        routing = _workflow_routing(workflow) | {"source_pr_number": pr_number}
+        task.execution_evidence = {**task.execution_evidence, "_routing": routing}
+        agent_task_store.save_agent_task(task)
+
+
 def _task_state(task_key: str, workflow: StoredWorkflow, tasks_by_id: dict[str, AgentTask]) -> WorkflowTaskState:
     task_id = workflow.task_key_to_task_id[task_key]
     task = tasks_by_id.get(task_id)
     depends_on = workflow.task_dependencies.get(task_key, [])
     if task is None:
-        return WorkflowTaskState(
-            task_key=task_key,
-            task_id=task_id,
-            title="missing task",
-            status=AgentTaskStatus.FAILED,
-            target_agent="unknown",
-            depends_on=depends_on,
-            dependency_task_ids=[workflow.task_key_to_task_id[key] for key in depends_on if key in workflow.task_key_to_task_id],
-            failure="Agent task record is missing.",
-        )
+        return WorkflowTaskState(task_key=task_key, task_id=task_id, title="missing task", status=AgentTaskStatus.FAILED, target_agent="unknown", depends_on=depends_on, dependency_task_ids=[workflow.task_key_to_task_id[key] for key in depends_on if key in workflow.task_key_to_task_id], failure="Agent task record is missing.")
+    result = {key: value for key, value in task.execution_evidence.items() if key != "_routing"}
     return WorkflowTaskState(
         task_key=task_key,
         task_id=task.task_id,
@@ -360,7 +374,7 @@ def _task_state(task_key: str, workflow: StoredWorkflow, tasks_by_id: dict[str, 
         branch=task.branch,
         commit_sha=task.commit_sha,
         changed_files=task.changed_files,
-        result=task.execution_evidence,
+        result=result,
         failure=task.agent_bus_dispatch_error or (task.execution_evidence.get("error") if task.status == AgentTaskStatus.FAILED else None),
     )
 
@@ -369,13 +383,7 @@ def _dependency_state(task_key: str, workflow: StoredWorkflow, tasks_by_id: dict
     depends_on = workflow.task_dependencies.get(task_key, [])
     dependency_task_ids = [workflow.task_key_to_task_id[key] for key in depends_on if key in workflow.task_key_to_task_id]
     blocked_by = [task_id for task_id in dependency_task_ids if tasks_by_id.get(task_id) is None or tasks_by_id[task_id].status != AgentTaskStatus.COMPLETED]
-    return WorkflowDependencyState(
-        task_key=task_key,
-        depends_on=depends_on,
-        dependency_task_ids=dependency_task_ids,
-        satisfied=not blocked_by,
-        blocked_by=blocked_by,
-    )
+    return WorkflowDependencyState(task_key=task_key, depends_on=depends_on, dependency_task_ids=dependency_task_ids, satisfied=not blocked_by, blocked_by=blocked_by)
 
 
 def _workflow_status(task_states: list[WorkflowTaskState]) -> WorkflowStatus:
@@ -403,32 +411,14 @@ def _has_runnable_or_active_task(task_states: list[WorkflowTaskState]) -> bool:
 
 
 def _has_active_task(task_states: list[WorkflowTaskState]) -> bool:
-    return any(
-        task.status in {
-            AgentTaskStatus.ASSIGNED,
-            AgentTaskStatus.CLAIMED,
-            AgentTaskStatus.RUNNING,
-            AgentTaskStatus.IN_PROGRESS,
-            AgentTaskStatus.READY_FOR_REVIEW,
-        }
-        for task in task_states
-    )
+    return any(task.status in {AgentTaskStatus.ASSIGNED, AgentTaskStatus.CLAIMED, AgentTaskStatus.RUNNING, AgentTaskStatus.IN_PROGRESS, AgentTaskStatus.READY_FOR_REVIEW} for task in task_states)
 
 
 def _has_runnable_task(task_states: list[WorkflowTaskState]) -> bool:
-    return any(
-        task.status == AgentTaskStatus.QUEUED
-        and not task.blocked
-        and not task.failure
-        for task in task_states
-    )
+    return any(task.status == AgentTaskStatus.QUEUED and not task.blocked and not task.failure for task in task_states)
 
 
-def _workflow_timeline(
-    workflow: StoredWorkflow,
-    task_states: list[WorkflowTaskState],
-    tasks_by_id: dict[str, AgentTask],
-) -> list[WorkflowTimelineEvent]:
+def _workflow_timeline(workflow: StoredWorkflow, task_states: list[WorkflowTaskState], tasks_by_id: dict[str, AgentTask]) -> list[WorkflowTimelineEvent]:
     events = list(workflow.timeline)
     task_key_by_id = {state.task_id: state.task_key for state in task_states}
     for task_id, task in tasks_by_id.items():
@@ -436,21 +426,36 @@ def _workflow_timeline(
         if task_key is None:
             continue
         for lifecycle_event in task.lifecycle_events:
-            events.append(
-                WorkflowTimelineEvent(
-                    event=f"task_{lifecycle_event.event}",
-                    occurred_at=lifecycle_event.occurred_at,
-                    task_key=task_key,
-                    task_id=task.task_id,
-                    actor=lifecycle_event.actor,
-                    metadata=lifecycle_event.metadata,
-                )
-            )
+            events.append(WorkflowTimelineEvent(event=f"task_{lifecycle_event.event}", occurred_at=lifecycle_event.occurred_at, task_key=task_key, task_id=task.task_id, actor=lifecycle_event.actor, metadata=lifecycle_event.metadata))
     return sorted(events, key=lambda event: event.occurred_at)
 
 
 def _workflow_from_payload(payload: str) -> StoredWorkflow:
     return StoredWorkflow.model_validate(json.loads(payload))
+
+
+def _workflow_routing(workflow: StoredWorkflow) -> dict[str, Any]:
+    routing: dict[str, Any] = {"pr_strategy": workflow.pr_strategy.value, "base_branch": workflow.base_branch}
+    if workflow.shared_branch:
+        routing["source_branch"] = workflow.shared_branch
+    if workflow.shared_pr_number:
+        routing["source_pr_number"] = workflow.shared_pr_number
+    return routing
+
+
+def _shared_branch_for_workflow(workflow_id: str) -> str:
+    return f"codex-m2/workflow-{_slugify(workflow_id)[:24]}"
+
+
+def _shared_pr_number(task_states: list[WorkflowTaskState]) -> int | None:
+    for state in task_states:
+        pr = state.result.get("pull_request") if isinstance(state.result.get("pull_request"), dict) else None
+        number = pr.get("number") if pr else None
+        if isinstance(number, int):
+            return number
+        if isinstance(number, str) and number.isdigit():
+            return int(number)
+    return None
 
 
 def _raise_for_cycles(graph: dict[str, list[str]]) -> None:
@@ -482,3 +487,7 @@ def _unique_keys(keys: list[str]) -> list[str]:
         seen.add(normalized)
         unique.append(normalized)
     return unique
+
+
+def _slugify(value: str) -> str:
+    return "-".join(part for part in value.lower().replace("_", "-").split("-") if part) or "workflow"
