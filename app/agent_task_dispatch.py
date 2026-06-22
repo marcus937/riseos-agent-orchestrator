@@ -57,17 +57,20 @@ def build_agent_bus_work_item_payload(
         },
     }
     metadata.update(routing)
-    return {
+    payload: dict[str, Any] = {
         "title": task.title,
         "repository": task.repo_full_name,
         "issue_number": task.issue_number,
-        "pr_number": routing.get("source_pr_number"),
-        "branch": routing.get("source_branch"),
         "priority": task.priority.value,
         "owner_agent": task.target_agent,
         "review_agent": review_agent,
         "metadata": metadata,
     }
+    if routing.get("source_pr_number") is not None:
+        payload["pr_number"] = routing["source_pr_number"]
+    if routing.get("source_branch") is not None:
+        payload["branch"] = routing["source_branch"]
+    return payload
 
 
 async def dispatch_agent_task_to_agent_bus(
@@ -80,52 +83,26 @@ async def dispatch_agent_task_to_agent_bus(
     dependency_state = await evaluate_agent_task_dependencies(task, dependency_client)
     if not dependency_state.dependencies_satisfied:
         raise AgentTaskDependencyBlocked(dependency_state)
-    response = await client.create_work_item(
-        build_agent_bus_work_item_payload(task, review_agent=review_agent, dependency_state=dependency_state)
-    )
+    response = await client.create_work_item(build_agent_bus_work_item_payload(task, review_agent=review_agent, dependency_state=dependency_state))
     raw_work_item_id = response.get("work_item_id")
     if not raw_work_item_id:
         raise AgentTaskDispatchError("Agent Bus work item response did not include work_item_id.")
     return str(raw_work_item_id)
 
 
-async def evaluate_agent_task_dependencies(
-    task: AgentTask,
-    dependency_client: AgentTaskDependencyClient | None,
-) -> DependencyState:
+async def evaluate_agent_task_dependencies(task: AgentTask, dependency_client: AgentTaskDependencyClient | None) -> DependencyState:
     if task.dependency_task_ids:
-        return DependencyState(
-            dependency_count=len(task.dependency_task_ids),
-            dependencies_satisfied=not task.blocked,
-            blocked_by=task.blocked_by,
-        )
+        return DependencyState(dependency_count=len(task.dependency_task_ids), dependencies_satisfied=not task.blocked, blocked_by=task.blocked_by)
     dependencies = parse_issue_dependencies(task.objective)
     if not dependencies.predecessor_issue_ids:
         return DependencyState()
     if dependency_client is None:
-        return DependencyState(
-            dependency_count=len(dependencies.predecessor_issue_ids),
-            dependencies_satisfied=False,
-            blocked_by=dependencies.predecessor_issue_ids,
-        )
-    return await dependency_state_for_issue(
-        task.repo_full_name,
-        task.issue_number or 0,
-        task.objective,
-        dependency_client,
-    )
+        return DependencyState(dependency_count=len(dependencies.predecessor_issue_ids), dependencies_satisfied=False, blocked_by=dependencies.predecessor_issue_ids)
+    return await dependency_state_for_issue(task.repo_full_name, task.issue_number or 0, task.objective, dependency_client)
 
 
 def _routing_metadata(task: AgentTask) -> dict[str, Any]:
     evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
     routing = evidence.get("_routing") if isinstance(evidence.get("_routing"), dict) else {}
-    allowed = {
-        "pr_strategy",
-        "base_branch",
-        "source_branch",
-        "source_pr_number",
-        "rework_of_task_id",
-        "rework_attempt",
-        "review_decision_id",
-    }
+    allowed = {"pr_strategy", "base_branch", "source_branch", "source_pr_number", "rework_of_task_id", "rework_attempt", "review_decision_id"}
     return {key: value for key, value in routing.items() if key in allowed and value is not None}
