@@ -26,6 +26,8 @@ class RuntimeValidationRequest(BaseModel):
     branch: str | None = None
     base_branch: str | None = None
     target_url: str | None = None
+    target_url_source: str | None = None
+    target_url_pending_reason: str | None = None
     validation_type: str = "playwright"
     requested_by: str = "circuit"
     correlation_id: str | None = None
@@ -112,8 +114,9 @@ class RuntimeValidationStore:
     async def trigger(self, request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationResult:
         validation_id = str(uuid.uuid4())
         correlation_id = request.correlation_id or f"runtime-validation-{validation_id[:8]}"
-        target_url = request.target_url or settings.hermes_default_target
+        target_url = request.target_url
         created_at = datetime.now(UTC)
+        target_source = request.target_url_source or ("request" if request.target_url else "missing")
         log_event(
             "runtime_validation_trigger_started",
             validation_id=validation_id,
@@ -125,7 +128,47 @@ class RuntimeValidationStore:
             base_branch=request.base_branch,
             validation_type=request.validation_type,
             requested_by=request.requested_by,
+            target_url_source=target_source,
         )
+
+        if target_url is None and target_source == "vercel_preview_pending":
+            result = RuntimeValidationResult(
+                validation_id=validation_id,
+                status="pending",
+                repo=request.repo,
+                issue_number=request.issue_number,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                validation_type=request.validation_type,
+                requested_by=request.requested_by,
+                created_at=created_at,
+                correlation_id=correlation_id,
+                hermes=RuntimeValidationHermesSummary(
+                    target_url=None,
+                    target_source=target_source,
+                    status="SKIPPED",
+                    error=request.target_url_pending_reason,
+                ),
+                evidence=RuntimeValidationEvidenceSummary(),
+                bb2=RuntimeValidationBB2Packet(review_status="pending"),
+                error=request.target_url_pending_reason,
+            )
+            self._items[validation_id] = result
+            log_event(
+                "runtime_validation_preview_pending",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                target_url_source=target_source,
+                fallback_reason=request.target_url_pending_reason,
+            )
+            return result
+
+        target_url = target_url or settings.hermes_default_target
         blocked = _target_url_blocker(target_url, settings)
         if blocked is None:
             blocked = _hermes_config_blocker(settings)
@@ -143,7 +186,7 @@ class RuntimeValidationStore:
                 created_at=created_at,
                 completed_at=datetime.now(UTC),
                 correlation_id=correlation_id,
-                hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), error=blocked),
+                hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), target_source=target_source, error=blocked),
                 evidence=RuntimeValidationEvidenceSummary(),
                 bb2=RuntimeValidationBB2Packet(review_status="blocked"),
                 error=blocked,
@@ -157,6 +200,7 @@ class RuntimeValidationStore:
                 pr_number=request.pr_number,
                 branch=request.branch,
                 base_branch=request.base_branch,
+                target_url_source=target_source,
                 error=blocked,
             )
             return result
@@ -173,7 +217,7 @@ class RuntimeValidationStore:
             requested_by=request.requested_by,
             created_at=created_at,
             correlation_id=correlation_id,
-            hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), target_source="request" if request.target_url else "hermes_default_target"),
+            hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), target_source=target_source),
             evidence=RuntimeValidationEvidenceSummary(),
             bb2=RuntimeValidationBB2Packet(),
         )
@@ -181,7 +225,7 @@ class RuntimeValidationStore:
 
         hermes_client = self._hermes_client_factory()
         try:
-            payload = _build_runtime_payload(request, target_url, correlation_id, settings)
+            payload = _build_runtime_payload(request, target_url, correlation_id, settings, target_source=target_source)
             log_event(
                 "hermes_runtime_validation_post_started",
                 validation_id=validation_id,
@@ -192,6 +236,7 @@ class RuntimeValidationStore:
                 branch=request.branch,
                 base_branch=request.base_branch,
                 validation_type=request.validation_type,
+                target_url_source=target_source,
             )
             response = await hermes_client.post_runtime_validation(
                 settings.hermes_m2_base_url or "",
@@ -341,6 +386,8 @@ def _build_runtime_payload(
     target_url: str,
     correlation_id: str,
     settings: Settings,
+    *,
+    target_source: str,
 ) -> dict[str, Any]:
     branch = request.branch or settings.work_branch
     payload: dict[str, Any] = {
@@ -354,7 +401,8 @@ def _build_runtime_payload(
         "preview_url": target_url if _is_vercel_preview_url(target_url) else None,
         "validationType": request.validation_type,
         "validation_type": request.validation_type,
-        "targetSource": "request" if request.target_url else "hermes_default_target",
+        "targetSource": target_source,
+        "target_url_source": target_source,
         "requestedBy": request.requested_by,
         "requested_by": request.requested_by,
         "hermesNode": "M2",
@@ -405,11 +453,7 @@ def _dispatch_result_from_response(
     )
 
 
-def _result_from_dispatch(
-    result: RuntimeValidationResult,
-    dispatch: HermesDispatchResult,
-    settings: Settings,
-) -> RuntimeValidationResult:
+def _result_from_dispatch(result: RuntimeValidationResult, dispatch: HermesDispatchResult, settings: Settings) -> RuntimeValidationResult:
     evidence = _evidence_summary(dispatch.evidence, settings)
     review_status: Literal["approved", "needs_changes", "blocked", "pending"] = "pending"
     if dispatch.status == "PASSED":
