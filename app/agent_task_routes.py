@@ -31,6 +31,7 @@ from app.repository_discovery import (
     build_repository_registry,
     ensure_orchestration_enabled_repository,
 )
+from app.workflow_orchestration import build_workflow_store, update_shared_workflow_routing_after_result
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/agent-tasks", tags=["agent-tasks"])
@@ -47,10 +48,7 @@ async def create_agent_task_endpoint(
     store = _agent_task_store(request, settings)
     missing_dependencies = missing_dependency_task_ids(payload.dependency_task_ids, store)
     if missing_dependencies:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"dependency_task_ids": missing_dependencies},
-        )
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"dependency_task_ids": missing_dependencies})
 
     existing_tasks = store.list_agent_tasks()
     task = create_agent_task(payload)
@@ -61,22 +59,14 @@ async def create_agent_task_endpoint(
         client, should_close = _agent_bus_client(request, settings)
         github_client = _github_dependency_client(settings)
         try:
-            work_item_id = await dispatch_agent_task_to_agent_bus(
-                task,
-                client,
-                review_agent=settings.agent_bus_review_agent,
-                dependency_client=github_client,
-            )
+            work_item_id = await dispatch_agent_task_to_agent_bus(task, client, review_agent=settings.agent_bus_review_agent, dependency_client=github_client)
         except AgentTaskDependencyBlocked as exc:
             task.agent_bus_dispatch_error = str(exc)
             store.save_agent_task(task)
         except Exception as exc:
             mark_agent_task_dispatch_failed(task, str(exc))
             store.save_agent_task(task)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Agent Bus dispatch failed: {exc}",
-            ) from exc
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent Bus dispatch failed: {exc}") from exc
         else:
             mark_agent_task_assigned(task, work_item_id=work_item_id)
             store.save_agent_task(task)
@@ -90,22 +80,13 @@ async def create_agent_task_endpoint(
 
 
 @router.get("", response_model=list[AgentTask])
-async def list_agent_tasks(
-    request: Request,
-    _: None = Depends(require_orchestrator_admin_token),
-    settings: Settings = Depends(get_settings),
-) -> list[AgentTask]:
+async def list_agent_tasks(request: Request, _: None = Depends(require_orchestrator_admin_token), settings: Settings = Depends(get_settings)) -> list[AgentTask]:
     store = _agent_task_store(request, settings)
     return _refresh_all_agent_tasks(store)
 
 
 @router.get("/{task_id}", response_model=AgentTask)
-async def get_agent_task(
-    task_id: str,
-    request: Request,
-    _: None = Depends(require_orchestrator_admin_token),
-    settings: Settings = Depends(get_settings),
-) -> AgentTask:
+async def get_agent_task(task_id: str, request: Request, _: None = Depends(require_orchestrator_admin_token), settings: Settings = Depends(get_settings)) -> AgentTask:
     store = _agent_task_store(request, settings)
     _refresh_all_agent_tasks(store)
     task = store.get_agent_task(task_id)
@@ -128,24 +109,17 @@ async def record_agent_task_execution_result(
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent task not found")
     if payload.agent_id != task.target_agent:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Execution result agent_id does not match the task target_agent.",
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Execution result agent_id does not match the task target_agent.")
     apply_execution_result(task, payload)
     store.save_agent_task(task)
     _refresh_all_agent_tasks(store)
+    _propagate_shared_workflow_routing(task, request, settings, store)
 
     if settings.enable_agent_bus_dispatch:
         client, should_close = _agent_bus_client(request, settings)
         github_client = _github_dependency_client(settings)
         try:
-            await release_runnable_agent_tasks(
-                store,
-                client,
-                review_agent=settings.agent_bus_review_agent,
-                dependency_client=github_client,
-            )
+            await release_runnable_agent_tasks(store, client, review_agent=settings.agent_bus_review_agent, dependency_client=github_client)
         finally:
             if github_client is not None:
                 await github_client.aclose()
@@ -157,15 +131,7 @@ async def record_agent_task_execution_result(
 
 
 def _agent_task_create_response(task: AgentTask) -> AgentTaskCreateResponse:
-    return AgentTaskCreateResponse(
-        task_id=task.task_id,
-        status=task.status,
-        created_at=task.created_at,
-        target_agent=task.target_agent,
-        dependency_task_ids=task.dependency_task_ids,
-        blocked=task.blocked,
-        blocked_by=task.blocked_by,
-    )
+    return AgentTaskCreateResponse(task_id=task.task_id, status=task.status, created_at=task.created_at, target_agent=task.target_agent, dependency_task_ids=task.dependency_task_ids, blocked=task.blocked, blocked_by=task.blocked_by)
 
 
 def _refresh_all_agent_tasks(store: AgentTaskStore) -> list[AgentTask]:
@@ -173,6 +139,17 @@ def _refresh_all_agent_tasks(store: AgentTaskStore) -> list[AgentTask]:
     for task in tasks:
         store.save_agent_task(task)
     return tasks
+
+
+def _propagate_shared_workflow_routing(task: AgentTask, request: Request, settings: Settings, store: AgentTaskStore) -> None:
+    if not task.correlation_id or not task.correlation_id.startswith("wf-"):
+        return
+    workflow_store = build_workflow_store(settings.orchestrator_db_path)
+    workflow = workflow_store.get_workflow(task.correlation_id)
+    if workflow is None:
+        return
+    update_shared_workflow_routing_after_result(workflow, store)
+    workflow_store.save_workflow(workflow)
 
 
 def _agent_task_store(request: Request, settings: Settings) -> AgentTaskStore:
@@ -187,14 +164,7 @@ def _agent_bus_client(request: Request, settings: Settings) -> tuple[AgentBusCli
     client = getattr(request.app.state, "agent_bus_client", None)
     if client is not None:
         return client, False
-    return (
-        AgentBusClient(
-            base_url=settings.agent_bus_base_url,
-            token=settings.agent_bus_token,
-            timeout_seconds=settings.agent_bus_timeout_seconds,
-        ),
-        True,
-    )
+    return (AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token, timeout_seconds=settings.agent_bus_timeout_seconds), True)
 
 
 def _github_dependency_client(settings: Settings) -> GitHubClient | None:
@@ -212,23 +182,10 @@ def _repository_registry(request: Request, settings: Settings) -> RepositoryRegi
 
 
 def _require_orchestration_enabled_repository(repo_full_name: str, request: Request, settings: Settings) -> None:
-    record = ensure_orchestration_enabled_repository(
-        _repository_registry(request, settings),
-        repo_full_name,
-        trusted_owner=settings.trusted_repository_owner,
-    )
+    record = ensure_orchestration_enabled_repository(_repository_registry(request, settings), repo_full_name, trusted_owner=settings.trusted_repository_owner)
     if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Repository is not orchestration-enabled.",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
     if record.archived:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Repository is archived.",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is archived.")
     if not record.orchestration_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Repository is not orchestration-enabled.",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
