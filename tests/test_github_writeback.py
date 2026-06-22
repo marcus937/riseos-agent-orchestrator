@@ -21,14 +21,21 @@ class FakeWritebackClient:
         self,
         *,
         error: Exception | None = None,
+        fail_on_apply: Exception | None = None,
+        fail_on_remove: Exception | None = None,
+        fail_on_comment: Exception | None = None,
         initial_labels: list[str] | None = None,
         initial_comments: list[dict[str, Any]] | None = None,
     ) -> None:
         self.error = error
+        self.fail_on_apply = fail_on_apply
+        self.fail_on_remove = fail_on_remove
+        self.fail_on_comment = fail_on_comment
         self.comments: list[tuple[str, int, str]] = []
         self.updated_comments: list[tuple[str, int, str]] = []
         self.applied_labels: list[tuple[str, int, str]] = []
         self.removed_labels: list[tuple[str, int, str]] = []
+        self.operations: list[str] = []
         self.issue_labels = list(initial_labels or [])
         self.issue_comments = list(initial_comments or [])
 
@@ -43,7 +50,10 @@ class FakeWritebackClient:
         return self.issue_comments
 
     async def post_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> dict[str, Any]:
+        self.operations.append("post_comment")
         self.comments.append((repo_full_name, issue_number, body))
+        if self.fail_on_comment:
+            raise self.fail_on_comment
         if self.error:
             raise self.error
         comment = {"id": len(self.issue_comments) + 1, "body": body}
@@ -51,7 +61,10 @@ class FakeWritebackClient:
         return comment
 
     async def update_issue_comment(self, repo_full_name: str, comment_id: int, body: str) -> dict[str, Any]:
+        self.operations.append("update_comment")
         self.updated_comments.append((repo_full_name, comment_id, body))
+        if self.fail_on_comment:
+            raise self.fail_on_comment
         if self.error:
             raise self.error
         for comment in self.issue_comments:
@@ -61,7 +74,10 @@ class FakeWritebackClient:
         return {"id": comment_id, "body": body}
 
     async def apply_label(self, repo_full_name: str, issue_number: int, label: str) -> dict[str, Any]:
+        self.operations.append(f"apply:{label}")
         self.applied_labels.append((repo_full_name, issue_number, label))
+        if self.fail_on_apply:
+            raise self.fail_on_apply
         if self.error:
             raise self.error
         if label not in self.issue_labels:
@@ -69,7 +85,10 @@ class FakeWritebackClient:
         return {"labels": [label]}
 
     async def remove_label(self, repo_full_name: str, issue_number: int, label: str) -> dict[str, Any]:
+        self.operations.append(f"remove:{label}")
         self.removed_labels.append((repo_full_name, issue_number, label))
+        if self.fail_on_remove:
+            raise self.fail_on_remove
         if self.error:
             raise self.error
         if label in self.issue_labels:
@@ -185,6 +204,7 @@ def test_later_needs_changes_removes_stale_approval_and_review_request_labels() 
     assert "ready-to-merge" not in client.issue_labels
     assert "bb2-needs-changes" in client.issue_labels
     assert "agent-next" in client.issue_labels
+    assert client.operations.index("apply:bb2-needs-changes") < client.operations.index("remove:bb2-approved")
 
 
 def test_later_approval_removes_stale_needs_changes_but_preserves_agent_next_ownership() -> None:
@@ -213,6 +233,111 @@ def test_later_approval_removes_stale_needs_changes_but_preserves_agent_next_own
     assert "agent-next" in client.issue_labels
     assert "bb2-approved" in client.issue_labels
     assert "ready-to-merge" in client.issue_labels
+    assert client.operations.index("apply:bb2-approved") < client.operations.index("remove:bb2-needs-changes")
+
+
+def test_apply_failure_aborts_cleanup_and_leaves_existing_state_intact() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "abc123"}},
+            "labels": [{"name": "bb2-approved"}],
+        },
+    )
+    decision = ReviewDecision(
+        decision=ReviewDecisionType.NEEDS_CHANGES,
+        confidence=0.9,
+        risk_level=RiskLevel.MEDIUM,
+        summary="Latest review found a regression.",
+        required_changes=["Fix the regression."],
+        next_task_prompt="Fix the regression and rerun validation.",
+        human_review_required=True,
+    )
+    response = process_review_work_item(review_work_item_from_parsed(parsed), decision=decision)
+    client = FakeWritebackClient(
+        initial_labels=["bb2-approved"],
+        fail_on_apply=RuntimeError("label apply failed"),
+    )
+
+    result = run(writeback_review_decision(response, client))
+
+    assert result.success is False
+    assert "label apply failed" in result.error
+    assert client.issue_labels == ["bb2-approved"]
+    assert client.removed_labels == []
+    assert not any(operation.startswith("remove:") for operation in client.operations)
+    assert "post_comment" not in client.operations
+    assert "update_comment" not in client.operations
+
+
+def test_cleanup_failure_keeps_new_state_and_reports_success() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "abc123"}},
+            "labels": [{"name": "bb2-approved"}],
+        },
+    )
+    decision = ReviewDecision(
+        decision=ReviewDecisionType.NEEDS_CHANGES,
+        confidence=0.9,
+        risk_level=RiskLevel.MEDIUM,
+        summary="Latest review found a regression.",
+        required_changes=["Fix the regression."],
+        next_task_prompt="Fix the regression and rerun validation.",
+        human_review_required=True,
+    )
+    response = process_review_work_item(review_work_item_from_parsed(parsed), decision=decision)
+    client = FakeWritebackClient(
+        initial_labels=["bb2-approved"],
+        fail_on_remove=RuntimeError("label cleanup failed"),
+    )
+
+    result = run(writeback_review_decision(response, client))
+
+    assert result.success is True
+    assert result.removed_labels == []
+    assert "bb2-needs-changes" in client.issue_labels
+    assert "bb2-approved" in client.issue_labels
+    assert client.operations.index("apply:bb2-needs-changes") < client.operations.index("remove:bb2-approved")
+
+
+def test_comment_failure_does_not_block_label_transition() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "abc123"}},
+            "labels": [{"name": "bb2-approved"}],
+        },
+    )
+    decision = ReviewDecision(
+        decision=ReviewDecisionType.NEEDS_CHANGES,
+        confidence=0.9,
+        risk_level=RiskLevel.MEDIUM,
+        summary="Latest review found a regression.",
+        required_changes=["Fix the regression."],
+        next_task_prompt="Fix the regression and rerun validation.",
+        human_review_required=True,
+    )
+    response = process_review_work_item(review_work_item_from_parsed(parsed), decision=decision)
+    client = FakeWritebackClient(
+        initial_labels=["bb2-approved"],
+        fail_on_comment=RuntimeError("comment update failed"),
+    )
+
+    result = run(writeback_review_decision(response, client))
+
+    assert result.success is True
+    assert result.comment_updated is False
+    assert "bb2-needs-changes" in client.issue_labels
+    assert "bb2-approved" not in client.issue_labels
+    assert client.operations.index("apply:bb2-needs-changes") < client.operations.index("remove:bb2-approved")
 
 
 def test_existing_bb2_status_comment_is_updated_instead_of_duplicated() -> None:
@@ -257,7 +382,7 @@ def test_missing_issue_or_pr_skips_cleanly() -> None:
     assert client.labels == []
 
 
-def test_github_error_is_captured() -> None:
+def test_github_label_apply_error_is_captured() -> None:
     parsed = parse_github_event(
         "pull_request",
         {
@@ -267,15 +392,15 @@ def test_github_error_is_captured() -> None:
         },
     )
     response = process_review_work_item(review_work_item_from_parsed(parsed))
-    client = FakeWritebackClient(error=RuntimeError("GitHub write failed"))
+    client = FakeWritebackClient(fail_on_apply=RuntimeError("GitHub write failed"))
 
     result = run(writeback_review_decision(response, client))
 
     assert result.attempted is True
     assert result.success is False
     assert "GitHub write failed" in result.error
-    assert client.comments
-    assert client.labels == []
+    assert client.comments == []
+    assert client.removed_labels == []
 
 
 def test_writeback_protocol_has_no_forbidden_mutation_methods() -> None:
