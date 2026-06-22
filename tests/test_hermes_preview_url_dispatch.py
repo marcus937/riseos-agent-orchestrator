@@ -116,7 +116,7 @@ def test_pr_dispatch_prefers_vercel_preview_url_over_default_target() -> None:
     assert target_url in github.comments[0][2]
 
 
-def test_pr_dispatch_falls_back_to_default_when_preview_url_is_absent() -> None:
+def test_pr_dispatch_stays_pending_when_preview_url_is_absent() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     github = FakeGitHubClient()
     github.statuses = []
@@ -132,9 +132,12 @@ def test_pr_dispatch_falls_back_to_default_when_preview_url_is_absent() -> None:
         )
     )
 
-    assert result.success is True
-    assert result.target_url == "https://apple.com"
+    assert result.status == "SKIPPED"
+    assert result.success is False
+    assert result.attempted is False
+    assert result.target_url is None
     assert result.preview_url is None
-    assert result.target_source == "hermes_default_target"
-    assert hermes.jobs[0][2]["targetUrl"] == "https://apple.com"
-    assert hermes.jobs[0][2]["preview_url"] is None
+    assert result.target_source == "vercel_preview_pending"
+    assert result.skipped_reason == "No successful Vercel preview deployment is available for this PR head SHA yet."
+    assert hermes.jobs == []
+    assert "https://apple.com" not in str(result.model_dump())
