@@ -94,7 +94,6 @@ def get_settings() -> Settings:
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
-<<<<<<< HEAD
         enable_runtime_validation_review_bridge=_bool_env("ENABLE_RUNTIME_VALIDATION_REVIEW_BRIDGE"),
         enable_agent_bus_dispatch=_bool_env("ENABLE_AGENT_BUS_DISPATCH"),
         agent_bus_base_url=os.getenv("AGENT_BUS_BASE_URL"),
@@ -102,10 +101,8 @@ def get_settings() -> Settings:
         agent_bus_timeout_seconds=_int_env("AGENT_BUS_TIMEOUT_SECONDS", 30),
         agent_bus_owner_agent=os.getenv("AGENT_BUS_OWNER_AGENT", "codex-m2"),
         agent_bus_review_agent=os.getenv("AGENT_BUS_REVIEW_AGENT", "bb2"),
-=======
         circuit_agent_trigger_url=os.getenv("CIRCUIT_AGENT_TRIGGER_URL"),
         circuit_agent_access_token=os.getenv("CIRCUIT_AGENT_ACCESS_TOKEN"),
->>>>>>> a2789b5 (Add Circuit agent trigger configuration)
         slack_webhook_url=legacy_slack_webhook_url,
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
         slack_channel=legacy_slack_channel or orchestrator_slack_channel,
