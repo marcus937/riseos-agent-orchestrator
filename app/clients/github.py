@@ -31,9 +31,9 @@ class GitHubAPIError(GitHubClientError):
 class GitHubClient:
     """Safe GitHub API wrapper for read/review operations.
 
-    Write actions are intentionally limited to issue comments, labels, and
-    repository webhook registration. This client does not support merge, branch
-    deletion, branch mutation, or repository file writes.
+    Write actions are intentionally limited to issue comments, labels, statuses,
+    and repository webhook registration. This client does not support merge,
+    branch deletion, branch mutation, or repository file writes.
     """
 
     def __init__(
@@ -223,6 +223,33 @@ class GitHubClient:
         return await self._request(
             "DELETE",
             f"/repos/{repo_full_name}/issues/{issue_number}/labels/{quote(label, safe='')}",
+        )
+
+    async def create_commit_status(
+        self,
+        repo_full_name: str,
+        sha: str,
+        state: str,
+        context: str,
+        description: str,
+        *,
+        target_url: str | None = None,
+    ) -> GitHubResponse:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(sha, "sha")
+        self._require_value(state, "state")
+        self._require_value(context, "context")
+        payload: dict[str, Any] = {
+            "state": state,
+            "context": context,
+            "description": description[:140],
+        }
+        if target_url:
+            payload["target_url"] = target_url
+        return await self._request(
+            "POST",
+            f"/repos/{repo_full_name}/statuses/{sha}",
+            json=payload,
         )
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> GitHubResponse:
