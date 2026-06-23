@@ -28,6 +28,8 @@ class Settings:
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
+    circuit_agent_trigger_url: str | None = None
+    circuit_agent_access_token: str | None = None
     slack_webhook_url: str | None = None
     slack_bot_token: str | None = None
     slack_channel: str = "#jarvis-agent-orchestrator"
@@ -83,6 +85,8 @@ def get_settings() -> Settings:
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
+        circuit_agent_trigger_url=os.getenv("CIRCUIT_AGENT_TRIGGER_URL"),
+        circuit_agent_access_token=os.getenv("CIRCUIT_AGENT_ACCESS_TOKEN"),
         slack_webhook_url=legacy_slack_webhook_url,
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
         slack_channel=legacy_slack_channel or orchestrator_slack_channel,
