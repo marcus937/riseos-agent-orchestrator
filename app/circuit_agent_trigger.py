@@ -84,6 +84,11 @@ async def wake_circuit_agent_for_work(
             skipped_reason="Circuit agent trigger is not configured.",
             message=message,
         )
+    if not _is_trigger_url(trigger_url):
+        return CircuitAgentTriggerResult(
+            skipped_reason="Circuit agent trigger URL must include /trigger.",
+            message=message,
+        )
 
     owns_client = client is None
     client = client or CircuitAgentTriggerHTTPClient()
@@ -164,8 +169,9 @@ def build_circuit_wakeup_message(
     workflow_id: str | None = None,
 ) -> str:
     parts = [
-        "Circuit Forge, wake up and check the Agent Bus MCP inbox/queue for assigned work.",
-        "Use MCP to inspect your queue before starting, then follow the Circuit standing instructions.",
+        "Circuit Forge wake up and check your Agent Bus inbox. Only work on an explicit Agent Bus assigned work item. "
+        "If no assigned work item exists, report idle and stop. Do not search GitHub issues independently unless the "
+        "assigned work item explicitly instructs you to do so.",
     ]
     if repo_full_name:
         parts.append(f"Repository: {repo_full_name}.")
@@ -241,6 +247,10 @@ def _safe_url_target(url: str, settings: Settings) -> str:
     parsed = urlparse(url)
     target = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
     return _redact_sensitive_text(target or "unknown", settings)
+
+
+def _is_trigger_url(url: str) -> bool:
+    return urlparse(url).path.rstrip("/").endswith("/trigger")
 
 
 def _truncate(value: str, *, limit: int) -> str:
