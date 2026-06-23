@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import logging
 import re
+import time
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -12,6 +15,7 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)((?:x-hermes-token|authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret|client[_-]?secret)\s*[:=]\s*['\"]?)([^'\"\s,;}]+)"),
     re.compile(r"(?i)(bearer\s+)([^'\"\s,;}]+)"),
 )
+LOGGER = logging.getLogger("riseos_agent_orchestrator")
 
 
 class CircuitHermesClient:
@@ -21,7 +25,28 @@ class CircuitHermesClient:
         self._client = HermesHTTPClient()
 
     async def post_runtime_validation(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._client.post_job(base_url, token, payload)
+        started_at = time.monotonic()
+        LOGGER.info(
+            "Runtime validation before Hermes POST base_url_configured=%s token_configured=%s payload=%s",
+            bool(base_url),
+            bool(token),
+            json.dumps(payload, default=str),
+        )
+        try:
+            response = await self._client.post_job(base_url, token, payload)
+        except Exception:
+            LOGGER.exception(
+                "Runtime validation Hermes POST failed elapsed_ms=%s payload=%s",
+                round((time.monotonic() - started_at) * 1000, 2),
+                json.dumps(payload, default=str),
+            )
+            raise
+        LOGGER.info(
+            "Runtime validation after Hermes POST elapsed_ms=%s response=%s",
+            round((time.monotonic() - started_at) * 1000, 2),
+            json.dumps(response, default=str),
+        )
+        return response
 
     async def collect_evidence(
         self,
@@ -30,28 +55,63 @@ class CircuitHermesClient:
         job_id: str,
         settings: Settings,
     ) -> HermesEvidenceSnapshot | None:
+        started_at = time.monotonic()
         snapshot = HermesEvidenceSnapshot(job_id=job_id)
         errors: list[str] = []
 
+        manifest_started_at = time.monotonic()
+        LOGGER.info("Runtime validation before evidence fetch kind=manifest job_id=%s", job_id)
         try:
             manifest = await self._client.get_evidence_manifest(base_url, token, job_id)
             snapshot.manifest_fetched = True
             snapshot.manifest = manifest if isinstance(manifest, dict) else {"raw": manifest}
             _populate_snapshot_from_manifest(snapshot)
+            LOGGER.info(
+                "Runtime validation after evidence fetch kind=manifest job_id=%s elapsed_ms=%s artifact_count=%s",
+                job_id,
+                round((time.monotonic() - manifest_started_at) * 1000, 2),
+                len(snapshot.artifacts),
+            )
         except Exception as exc:
+            LOGGER.exception(
+                "Runtime validation evidence manifest fetch failed job_id=%s elapsed_ms=%s",
+                job_id,
+                round((time.monotonic() - manifest_started_at) * 1000, 2),
+            )
             errors.append(f"manifest fetch failed: {redact_runtime_text(str(exc), settings)}")
 
+        bundle_started_at = time.monotonic()
+        LOGGER.info("Runtime validation before evidence fetch kind=bundle job_id=%s", job_id)
         try:
             bundle = await self._client.get_evidence_bundle(base_url, token, job_id)
             snapshot.bundle_fetched = True
             if isinstance(bundle, dict):
                 snapshot.bundle_content_type = _first_string(bundle, "content_type", "contentType", "mimeType")
                 snapshot.bundle_size = _first_int(bundle, "size", "contentLength", "content_length", "bytes")
+            LOGGER.info(
+                "Runtime validation after evidence fetch kind=bundle job_id=%s elapsed_ms=%s bundle_size=%s",
+                job_id,
+                round((time.monotonic() - bundle_started_at) * 1000, 2),
+                snapshot.bundle_size,
+            )
         except Exception as exc:
+            LOGGER.exception(
+                "Runtime validation evidence bundle fetch failed job_id=%s elapsed_ms=%s",
+                job_id,
+                round((time.monotonic() - bundle_started_at) * 1000, 2),
+            )
             errors.append(f"bundle fetch failed: {redact_runtime_text(str(exc), settings)}")
 
         if errors:
             snapshot.error = "; ".join(error for error in errors if error)
+        LOGGER.info(
+            "Runtime validation after evidence fetch job_id=%s manifest_fetched=%s bundle_fetched=%s elapsed_ms=%s error=%s",
+            job_id,
+            snapshot.manifest_fetched,
+            snapshot.bundle_fetched,
+            round((time.monotonic() - started_at) * 1000, 2),
+            snapshot.error,
+        )
         return snapshot
 
     async def aclose(self) -> None:
@@ -125,7 +185,7 @@ def _artifacts_from_manifest(manifest: dict[str, Any], job_id: str) -> list[Herm
                     HermesEvidenceArtifact(
                         file_name=PurePosixPath(file_name).name,
                         content_type=_first_string(item, "contentType", "content_type", "mimeType", "mime"),
-                        size=_first_int(item, "size", "bytes", "contentLength", "content_length"),
+                        size=_first_int(item, "size", "bytes", "contentLength", "content_length", "bytes"),
                         sha256=_first_string(item, "sha256", "sha", "digest"),
                         download_url=_first_string(item, "downloadUrl", "download_url", "url"),
                         retrieval_note=_first_string(item, "retrievalNote", "retrieval_note") or _retrieval_reference(job_id, file_name),
