@@ -8,6 +8,13 @@ from app.circuit_agent_trigger import CircuitAgentTriggerHTTPClient, CircuitAgen
 from app.config import Settings
 
 
+SAFE_WAKEUP_MESSAGE = (
+    "Circuit Forge wake up and check your Agent Bus inbox. Only work on an explicit Agent Bus assigned work item. "
+    "If no assigned work item exists, report idle and stop. Do not search GitHub issues independently unless the "
+    "assigned work item explicitly instructs you to do so."
+)
+
+
 def run(coro: Any) -> Any:
     return asyncio.run(coro)
 
@@ -31,6 +38,7 @@ def test_http_client_uses_input_payload_not_message() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["authorization"] = request.headers.get("authorization")
+        captured["content_type"] = request.headers.get("content-type")
         captured["json"] = request.read().decode("utf-8")
         return httpx.Response(202, text="accepted")
 
@@ -42,8 +50,27 @@ def test_http_client_uses_input_payload_not_message() -> None:
 
     assert response.status_code == 202
     assert captured["authorization"] == "Bearer secret-token"
+    assert captured["content_type"] == "application/json"
     assert captured["json"] == '{"input":"wake up"}'
     assert "message" not in captured["json"]
+
+
+def test_default_message_prevents_independent_github_issue_hunting() -> None:
+    client = FakeCircuitTriggerClient(status_code=202)
+    settings = Settings(
+        circuit_agent_trigger_url="https://api.chatgpt.com/v1/workspace_agents/agent-id/trigger",
+        circuit_agent_access_token="secret-token",
+    )
+
+    result = run(wake_circuit_agent_for_work(settings, target_agent="circuit", client=client))
+
+    assert result.success is True
+    assert result.message is not None
+    assert result.message.startswith(SAFE_WAKEUP_MESSAGE)
+    assert "Only work on an explicit Agent Bus assigned work item" in result.message
+    assert "report idle and stop" in result.message
+    assert "Do not search GitHub issues independently" in result.message
+    assert client.calls[0]["message"] == result.message
 
 
 def test_202_and_200_mark_success(caplog: Any) -> None:
@@ -75,24 +102,28 @@ def test_202_and_200_mark_success(caplog: Any) -> None:
     assert "do-not-log" not in caplog.text
 
 
-def test_400_logs_response_body_and_returns_failure(caplog: Any) -> None:
-    body = '{"detail":[{"loc":["body","input"],"msg":"Field required"}]} secret-token'
-    client = FakeCircuitTriggerClient(status_code=400, text=body)
+def test_400_401_403_log_response_body_and_return_failure(caplog: Any) -> None:
     settings = Settings(
         circuit_agent_trigger_url="https://agent.example/api/trigger",
         circuit_agent_access_token="secret-token",
     )
 
-    with caplog.at_level(logging.INFO, logger="riseos_agent_orchestrator"):
-        result = run(wake_circuit_agent_for_work(settings, owner_agent="circuit", client=client))
+    for status_code in (400, 401, 403):
+        body = f'{{"detail":"Field required or unauthorized {status_code}"}} secret-token'
+        client = FakeCircuitTriggerClient(status_code=status_code, text=body)
 
-    assert result.attempted is True
-    assert result.success is False
-    assert result.status_code == 400
-    assert result.error == "Circuit agent wakeup failed with status 400."
-    assert "circuit_agent_wakeup_attempted" in caplog.text
-    assert "circuit_agent_wakeup_failed" in caplog.text
-    assert "Field required" in caplog.text
+        with caplog.at_level(logging.INFO, logger="riseos_agent_orchestrator"):
+            result = run(wake_circuit_agent_for_work(settings, owner_agent="circuit", client=client))
+
+        assert result.attempted is True
+        assert result.success is False
+        assert result.status_code == status_code
+        assert result.error == f"Circuit agent wakeup failed with status {status_code}."
+        assert "circuit_agent_wakeup_attempted" in caplog.text
+        assert "circuit_agent_wakeup_failed" in caplog.text
+        assert "Field required or unauthorized" in caplog.text
+        assert f'"status_code": {status_code}' in caplog.text
+
     assert "[REDACTED]" in caplog.text
     assert "secret-token" not in caplog.text
 
@@ -105,6 +136,21 @@ def test_missing_trigger_config_skips_without_crashing() -> None:
     assert result.attempted is False
     assert result.success is False
     assert result.skipped_reason == "Circuit agent trigger is not configured."
+    assert client.calls == []
+
+
+def test_base_workspace_agent_url_without_trigger_is_not_called() -> None:
+    client = FakeCircuitTriggerClient()
+    settings = Settings(
+        circuit_agent_trigger_url="https://api.chatgpt.com/v1/workspace_agents/agent-id",
+        circuit_agent_access_token="secret-token",
+    )
+
+    result = run(wake_circuit_agent_for_work(settings, target_agent="circuit", client=client))
+
+    assert result.attempted is False
+    assert result.success is False
+    assert result.skipped_reason == "Circuit agent trigger URL must include /trigger."
     assert client.calls == []
 
 
