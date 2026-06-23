@@ -5,6 +5,8 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
+from app.circuit_agent_trigger import CircuitAgentTriggerClient, wake_circuit_agent_for_work
+from app.config import Settings, get_settings
 from app.reviewer.decision import ReviewDecisionType
 
 
@@ -68,6 +70,9 @@ class TaskDispatchResult(BaseModel):
     issue_number: int | None = None
     error: str | None = None
     assignment_body: str | None = None
+    circuit_wakeup_attempted: bool = False
+    circuit_wakeup_success: bool = False
+    circuit_wakeup_error: str | None = None
 
 
 def should_dispatch_next_task(decision: ReviewDecisionType) -> bool:
@@ -122,6 +127,9 @@ async def dispatch_next_agent_task(
     client: TaskDispatchClient,
     *,
     enabled: bool,
+    settings: Settings | None = None,
+    target_agent: str = "circuit",
+    circuit_trigger_client: CircuitAgentTriggerClient | None = None,
 ) -> TaskDispatchResult:
     if not enabled:
         return TaskDispatchResult()
@@ -138,6 +146,13 @@ async def dispatch_next_agent_task(
             )
         assignment_body = build_circuit_assignment_body(issue)
         await post_circuit_assignment(repo_full_name, issue.number, assignment_body, client)
+        wakeup = await wake_circuit_agent_for_work(
+            settings or get_settings(),
+            target_agent=target_agent,
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+            client=circuit_trigger_client,
+        )
     except Exception as exc:
         return TaskDispatchResult(attempted=True, success=False, error=str(exc))
 
@@ -146,6 +161,9 @@ async def dispatch_next_agent_task(
         success=True,
         issue_number=issue.number,
         assignment_body=assignment_body,
+        circuit_wakeup_attempted=wakeup.attempted,
+        circuit_wakeup_success=wakeup.success,
+        circuit_wakeup_error=wakeup.error,
     )
 
 
