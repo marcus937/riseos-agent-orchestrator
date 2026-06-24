@@ -98,6 +98,30 @@ class GitHubClient:
             raise GitHubAPIError("GET", f"/repos/{repo_full_name}/commits/{ref}/check-runs", 200, "Expected check_runs list.")
         return [item for item in check_runs if isinstance(item, dict)]
 
+    async def list_deployments(self, repo_full_name: str, ref: str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(ref, "ref")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/deployments",
+            params={"sha": ref, "per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/deployments", 200, "Expected list response.")
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def list_deployment_statuses(self, repo_full_name: str, deployment_id: int | str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(str(deployment_id), "deployment_id")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/deployments/{deployment_id}/statuses",
+            params={"per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/deployments/{deployment_id}/statuses", 200, "Expected list response.")
+        return [item for item in payload if isinstance(item, dict)]
+
     async def list_issue_comments(self, repo_full_name: str, issue_number: int) -> list[dict[str, Any]]:
         self._require_value(repo_full_name, "repo_full_name")
         self._require_issue_number(issue_number)
