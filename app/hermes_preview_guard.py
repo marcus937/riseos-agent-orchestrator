@@ -42,12 +42,14 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
         *,
         github_client: Any | None,
     ) -> tuple[str, str]:
+        node = impl._hermes_node(parsed.labels)
         payload_preview_url = impl._preview_url_from_payload(parsed.raw)
         if payload_preview_url:
             impl._log_hermes_decision(
                 parsed,
                 settings,
                 "hermes_target_resolved",
+                node=node,
                 target_url=payload_preview_url,
                 target_url_source="webhook_payload_preview_url",
                 hermes_dispatched=True,
@@ -63,6 +65,7 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
                 parsed,
                 settings,
                 "hermes_target_resolved",
+                node=node,
                 target_url=github_preview_url,
                 target_url_source="github_commit_preview_url",
                 hermes_dispatched=True,
@@ -77,6 +80,7 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
                 parsed,
                 settings,
                 "hermes_preview_pending",
+                node=node,
                 target_url=None,
                 target_url_source=PENDING_TARGET_SOURCE,
                 hermes_dispatched=False,
@@ -92,6 +96,7 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
             parsed,
             settings,
             "hermes_target_resolved",
+            node=node,
             target_url=target_url,
             target_url_source=target_source,
             hermes_dispatched=True,
