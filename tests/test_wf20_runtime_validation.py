@@ -19,6 +19,8 @@ from app.wf20_runtime_validation import (
 )
 from app.wf20_runtime_validation_safe import runtime_validation_request_from_parsed
 
+VERCEL_READY_STATUS = {"context": "Vercel", "state": "success", "target_url": "https://jmc-preview.vercel.app"}
+
 
 class FakeAgentBusClient:
     def __init__(self) -> None:
@@ -43,8 +45,8 @@ class FakeAgentBusClient:
 
 class FakeGitHubClient:
     def __init__(self, *, statuses: list[dict[str, Any]] | None = None, checks: list[dict[str, Any]] | None = None) -> None:
-        self.statuses = statuses or []
-        self.checks = checks or []
+        self.statuses = [VERCEL_READY_STATUS] if statuses is None else statuses
+        self.checks = [] if checks is None else checks
         self.comments: list[tuple[str, int, str]] = []
         self.labels: list[tuple[str, int, str]] = []
         self.commit_statuses: list[tuple[str, str, dict[str, Any]]] = []
@@ -73,18 +75,10 @@ class FakeGitHubClient:
 
 
 class FakeHermesClient:
-    def __init__(self, response: dict[str, Any] | None = None) -> None:
+    def __init__(self, response: dict[str, Any] | None = None, *, evidence: HermesEvidenceSnapshot | None = None) -> None:
         self.response = response or {"status": "PASSED", "jobId": "hermes-job-1"}
-        self.payloads: list[dict[str, Any]] = []
-        self.closed = False
-
-    async def post_runtime_validation(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self.payloads.append(payload)
-        return self.response
-
-    async def collect_evidence(self, base_url: str, token: str, job_id: str, settings: Settings) -> HermesEvidenceSnapshot:
-        return HermesEvidenceSnapshot(
-            job_id=job_id,
+        self.evidence = evidence or HermesEvidenceSnapshot(
+            job_id="hermes-job-1",
             manifest_fetched=True,
             bundle_fetched=True,
             final_url="https://jmc-preview.vercel.app/overview",
@@ -95,6 +89,15 @@ class FakeHermesClient:
             network_non_2xx_count=0,
             artifacts=[HermesEvidenceArtifact(file_name="screenshot.png", sha256="sha256:abc")],
         )
+        self.payloads: list[dict[str, Any]] = []
+        self.closed = False
+
+    async def post_runtime_validation(self, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.payloads.append(payload)
+        return self.response
+
+    async def collect_evidence(self, base_url: str, token: str, job_id: str, settings: Settings) -> HermesEvidenceSnapshot:
+        return self.evidence
 
     async def aclose(self) -> None:
         self.closed = True
@@ -155,14 +158,7 @@ def test_agent_bus_record_runtime_validation_sends_authorization_and_trust_token
         requests.append(request)
         return httpx.Response(201, json={"validation_state_id": "state-1", "metadata": {}})
 
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = AgentBusClient(
-        base_url="https://agent-bus.test",
-        token="agent-token",
-        runtime_validation_token="runtime-token",
-        http_client=http_client,
-    )
-
+    client = AgentBusClient(base_url="https://agent-bus.test", token="agent-token", runtime_validation_token="runtime-token", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     result = run(client.record_runtime_validation({"work_item_id": "work-item-1", "state": "HERMES_VALIDATION_REQUESTED"}))
     run(client.aclose())
 
@@ -180,14 +176,7 @@ def test_agent_bus_get_runtime_validation_sends_authorization_and_trust_token() 
         requests.append(request)
         return httpx.Response(200, json={"current_state": "HERMES_VALIDATION_PASSED", "history": []})
 
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = AgentBusClient(
-        base_url="https://agent-bus.test",
-        token="agent-token",
-        runtime_validation_token="runtime-token",
-        http_client=http_client,
-    )
-
+    client = AgentBusClient(base_url="https://agent-bus.test", token="agent-token", runtime_validation_token="runtime-token", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     result = run(client.get_runtime_validation(work_item_id="work-item-1"))
     run(client.aclose())
 
@@ -218,6 +207,21 @@ def test_frontend_pr_vercel_ready_dispatches_hermes_and_records_agent_bus_sequen
         RuntimeValidationState.PLAYWRIGHT_EXECUTED.value,
         RuntimeValidationState.PASSED.value,
     ]
+
+
+def test_payload_preview_url_without_verified_vercel_status_blocks_hermes_dispatch() -> None:
+    parsed = parse_github_event("pull_request", pr_payload())
+    agent_bus = FakeAgentBusClient()
+    github = FakeGitHubClient(statuses=[])
+    hermes = FakeHermesClient()
+    store = make_store(agent_bus, github, hermes)
+    request = run(runtime_validation_request_from_parsed(parsed, settings(), github_client=github))
+
+    result = run(store.trigger(request, settings()))
+
+    assert result.status == "blocked"
+    assert hermes.payloads == []
+    assert agent_bus.states[-1]["state"] == RuntimeValidationState.BLOCKED.value
 
 
 def test_frontend_pr_vercel_failed_records_blocked_without_hermes_dispatch() -> None:
@@ -284,7 +288,7 @@ def test_documentation_only_work_skips_hermes() -> None:
 
 def test_vercel_timeout_records_blocked() -> None:
     parsed = parse_github_event("pull_request", pr_payload(preview_url=None))
-    github = FakeGitHubClient()
+    github = FakeGitHubClient(statuses=[])
     readiness, target_url, source, reason = run(resolve_vercel_readiness(parsed, github))
 
     assert readiness == VercelReadiness.TIMEOUT
