@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -23,7 +24,7 @@ class AgentBusAPIError(AgentBusClientError):
 
 
 class AgentBusClient:
-    """Small Agent Bus API wrapper for documented WorkItem creation."""
+    """Small Agent Bus API wrapper for documented WorkItem operations."""
 
     def __init__(
         self,
@@ -51,15 +52,17 @@ class AgentBusClient:
             headers=self._headers(),
             json=payload,
         )
-        if response.status_code < 200 or response.status_code >= 300:
-            raise AgentBusAPIError("POST", "/work-items", response.status_code, _response_detail(response))
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise AgentBusAPIError("POST", "/work-items", response.status_code, "Malformed JSON response.") from exc
-        if not isinstance(data, dict):
-            raise AgentBusAPIError("POST", "/work-items", response.status_code, "Expected object response.")
-        return data
+        return _object_response(response, "POST", "/work-items")
+
+    async def get_work_item(self, work_item_id: str) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        path = f"/work-items/{quote(work_item_id, safe='')}"
+        response = await self._client.get(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+        )
+        return _object_response(response, "GET", path)
 
     @property
     def _client(self) -> httpx.AsyncClient:
@@ -72,6 +75,18 @@ class AgentBusClient:
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
+
+
+def _object_response(response: httpx.Response, method: str, path: str) -> dict[str, Any]:
+    if response.status_code < 200 or response.status_code >= 300:
+        raise AgentBusAPIError(method, path, response.status_code, _response_detail(response))
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise AgentBusAPIError(method, path, response.status_code, "Malformed JSON response.") from exc
+    if not isinstance(data, dict):
+        raise AgentBusAPIError(method, path, response.status_code, "Expected object response.")
+    return data
 
 
 def _response_detail(response: httpx.Response) -> str:
