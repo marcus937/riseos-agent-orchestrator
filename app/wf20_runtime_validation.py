@@ -102,7 +102,10 @@ def runtime_validation_required_for_parsed(
         return False
     if parsed.action not in SUPPORTED_PR_ACTIONS:
         return False
-    return frontend_validation_profile_for_repo(parsed.repository, labels=parsed.labels).requires_runtime_validation
+    profile = frontend_validation_profile_for_repo(parsed.repository, labels=parsed.labels)
+    if profile.requires_runtime_validation:
+        return True
+    return has_review_context and _is_legacy_circuit_runtime_bridge_pr(parsed)
 
 
 def runtime_validation_route_reason(parsed: ParsedGitHubEvent) -> str | None:
@@ -111,9 +114,11 @@ def runtime_validation_route_reason(parsed: ParsedGitHubEvent) -> str | None:
     if parsed.action not in SUPPORTED_PR_ACTIONS:
         return None
     profile = frontend_validation_profile_for_repo(parsed.repository, labels=parsed.labels)
-    if not profile.requires_runtime_validation:
-        return None
-    return f"pull_request_{parsed.action}_frontend_runtime_validation"
+    if profile.requires_runtime_validation:
+        return f"pull_request_{parsed.action}_frontend_runtime_validation"
+    if _is_legacy_circuit_runtime_bridge_pr(parsed):
+        return f"pull_request_{parsed.action}_circuit_runtime_validation"
+    return None
 
 
 async def runtime_validation_request_from_parsed(
@@ -504,6 +509,13 @@ def _github_item_failed(item: dict[str, Any]) -> bool:
 def _looks_like_vercel_item(item: dict[str, Any]) -> bool:
     haystack = " ".join(str(item.get(key) or "") for key in ("context", "name", "description", "target_url", "details_url", "html_url")).lower()
     return "vercel" in haystack or "deployment" in haystack or "preview" in haystack
+
+
+def _is_legacy_circuit_runtime_bridge_pr(parsed: ParsedGitHubEvent) -> bool:
+    normalized_labels = {label.lower() for label in parsed.labels or []}
+    if normalized_labels & (DOCUMENTATION_ONLY_LABELS | BACKEND_ONLY_LABELS):
+        return False
+    return parsed.head_ref == "agent-integration" and parsed.base_ref == "main"
 
 
 def _workflow_id(parsed: ParsedGitHubEvent) -> str:
