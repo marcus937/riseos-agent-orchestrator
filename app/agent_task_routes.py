@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
@@ -38,21 +39,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/agent-tasks", tags=["agent-tasks"])
 
 
-@router.post("", response_model=AgentTaskCreateResponse)
+@router.post("")
 async def create_agent_task_endpoint(
-    payload: AgentTaskCreateRequest,
+    payload: dict[str, Any],
     request: Request,
     _: None = Depends(require_orchestrator_admin_token),
     settings: Settings = Depends(get_settings),
-) -> AgentTaskCreateResponse:
-    _require_orchestration_enabled_repository(payload.repo_full_name, request, settings)
+) -> dict[str, Any] | AgentTaskCreateResponse:
+    if _is_registration_only_payload(payload):
+        return _register_agent_task_repository(payload, request, settings)
+
+    task_request = AgentTaskCreateRequest.model_validate(payload)
+    _require_orchestration_enabled_repository(task_request.repo_full_name, request, settings)
     store = _agent_task_store(request, settings)
-    missing_dependencies = missing_dependency_task_ids(payload.dependency_task_ids, store)
+    missing_dependencies = missing_dependency_task_ids(task_request.dependency_task_ids, store)
     if missing_dependencies:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"dependency_task_ids": missing_dependencies})
 
     existing_tasks = store.list_agent_tasks()
-    task = create_agent_task(payload)
+    task = create_agent_task(task_request)
     refresh_agent_task_dependency_state(task, {existing.task_id: existing for existing in existing_tasks})
     store.save_agent_task(task)
 
@@ -205,3 +210,33 @@ def _require_orchestration_enabled_repository(repo_full_name: str, request: Requ
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is archived.")
     if not record.orchestration_enabled:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
+
+
+def _is_registration_only_payload(payload: dict[str, Any]) -> bool:
+    return not any(payload.get(key) for key in ("objective", "body", "instructions", "acceptance_criteria", "target_agent", "priority", "correlation_id", "dependency_task_ids"))
+
+
+def _register_agent_task_repository(payload: dict[str, Any], request: Request, settings: Settings) -> dict[str, Any]:
+    repo_full_name = str(payload.get("repo_full_name") or "")
+    if not repo_full_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="repo_full_name is required.")
+    registry = _repository_registry(request, settings)
+    existed_before = registry.get_repository_registry_record(repo_full_name) is not None
+    record = ensure_orchestration_enabled_repository(
+        registry,
+        repo_full_name,
+        trusted_owner=settings.trusted_repository_owner,
+    )
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
+    if record.archived:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is archived.")
+    if not record.orchestration_enabled:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Repository is not orchestration-enabled.")
+    return {
+        "accepted": True,
+        "repo_full_name": record.repo_full_name,
+        "orchestration_enabled": True,
+        "auto_registered": not existed_before,
+        "issue_number": payload.get("issue_number"),
+    }
