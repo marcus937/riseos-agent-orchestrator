@@ -8,10 +8,13 @@ from app.config import Settings
 from app.github_events import ParsedGitHubEvent
 from app.wf20_runtime_validation import (
     VALIDATION_TYPE,
+    VercelReadiness,
+    _github_item_failed,
+    _github_item_successful,
+    _looks_like_vercel_item,
     _workflow_correlation_id,
     _workflow_id,
     frontend_validation_profile_for_repo,
-    resolve_vercel_readiness,
 )
 
 
@@ -26,7 +29,7 @@ async def runtime_validation_request_from_parsed(
     github_client: Any | None = None,
 ) -> RuntimeValidationRequest:
     profile = frontend_validation_profile_for_repo(parsed.repository, labels=parsed.labels)
-    readiness, target_url, target_source, reason = await resolve_vercel_readiness(parsed, github_client)
+    readiness, target_url, target_source, reason = await resolve_verified_vercel_readiness(parsed, github_client)
     request = RuntimeValidationRequest(
         repo=parsed.repository or "unknown",
         issue_number=parsed.issue_number,
@@ -45,3 +48,46 @@ async def runtime_validation_request_from_parsed(
     object.__setattr__(request, "commit_sha", parsed.head_sha)
     object.__setattr__(request, "vercel_readiness", readiness.value)
     return request
+
+
+async def resolve_verified_vercel_readiness(
+    parsed: ParsedGitHubEvent,
+    github_client: Any | None,
+) -> tuple[VercelReadiness, str | None, str, str | None]:
+    payload_preview_url = contract_module.preview_url_from_payload(parsed.raw)
+    if github_client is None or not parsed.repository or not parsed.head_sha:
+        return (
+            VercelReadiness.TIMEOUT,
+            None,
+            "vercel_timeout",
+            "No Vercel deployment status was available to verify preview readiness.",
+        )
+
+    statuses: list[dict[str, Any]] = []
+    checks: list[dict[str, Any]] = []
+    try:
+        raw_statuses = await github_client.list_commit_statuses(parsed.repository, parsed.head_sha)
+        statuses = raw_statuses if isinstance(raw_statuses, list) else []
+    except Exception:
+        statuses = []
+    try:
+        raw_checks = await github_client.list_check_runs_for_ref(parsed.repository, parsed.head_sha)
+        checks = raw_checks if isinstance(raw_checks, list) else []
+    except Exception:
+        checks = []
+
+    vercel_items = [item for item in [*statuses, *checks] if _looks_like_vercel_item(item)]
+    if any(_github_item_failed(item) for item in vercel_items):
+        return VercelReadiness.FAILED, None, "vercel_failed", "Vercel preview deployment failed."
+
+    for item in vercel_items:
+        preview_url = contract_module.preview_url_from_payload(item) or payload_preview_url
+        if preview_url and _github_item_successful(item):
+            return VercelReadiness.READY, preview_url, "github_verified_vercel_preview_url", None
+
+    return (
+        VercelReadiness.TIMEOUT,
+        None,
+        "vercel_timeout",
+        "Timed out waiting for verified Vercel preview deployment readiness.",
+    )
