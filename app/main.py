@@ -6,6 +6,12 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
+from app.wf20_runtime_validation import install_wf20_runtime_validation
+from app.wf20_runtime_validation_safe import install_safe_wf20_request_builder
+
+install_wf20_runtime_validation()
+install_safe_wf20_request_builder()
+
 from app.circuit_runtime_validation import runtime_validation_store
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.clients.agent_bus import AgentBusClient
