@@ -78,13 +78,12 @@ class AgentBusClient:
         headers = {"Accept": "application/json"}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
-        return headers
-
-    def _runtime_validation_headers(self) -> dict[str, str]:
-        headers = self._headers()
         if self._runtime_validation_token:
             headers[RUNTIME_VALIDATION_TOKEN_HEADER] = self._runtime_validation_token
         return headers
+
+    def _runtime_validation_headers(self) -> dict[str, str]:
+        return self._headers()
 
 
 def _object_response(response: httpx.Response, method: str, path: str) -> dict[str, Any]:
