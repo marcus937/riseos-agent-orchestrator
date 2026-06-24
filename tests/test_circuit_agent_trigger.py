@@ -73,6 +73,32 @@ def test_default_message_prevents_independent_github_issue_hunting() -> None:
     assert client.calls[0]["message"] == result.message
 
 
+def test_wakeup_message_includes_workflow_and_work_item_context() -> None:
+    client = FakeCircuitTriggerClient(status_code=202)
+    settings = Settings(
+        circuit_agent_trigger_url="https://api.chatgpt.com/v1/workspace_agents/agent-id/trigger",
+        circuit_agent_access_token="secret-token",
+    )
+
+    result = run(
+        wake_circuit_agent_for_work(
+            settings,
+            target_agent="circuit-forge",
+            repo_full_name="marcus937/riseos-agent-orchestrator",
+            workflow_id="wf-test-123",
+            work_item_id="work-item-123",
+            client=client,
+        )
+    )
+
+    assert result.success is True
+    assert result.message is not None
+    assert "Repository: marcus937/riseos-agent-orchestrator." in result.message
+    assert "Workflow ID: wf-test-123." in result.message
+    assert "Work item ID: work-item-123." in result.message
+    assert client.calls[0]["message"] == result.message
+
+
 def test_202_and_200_mark_success(caplog: Any) -> None:
     settings = Settings(
         circuit_agent_trigger_url="https://agent.example/api/trigger?token=do-not-log",
