@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 RUNTIME_VALIDATION_TOKEN_HEADER = "X-Runtime-Validation-Token"
+RUNTIME_VALIDATION_TOKEN_ENV = "AGENT_BUS_RUNTIME_VALIDATION_TOKEN"
 
 
 class AgentBusClientError(Exception):
@@ -39,7 +41,7 @@ class AgentBusClient:
     ) -> None:
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._token = token
-        self._runtime_validation_token = runtime_validation_token
+        self._runtime_validation_token = runtime_validation_token or os.getenv(RUNTIME_VALIDATION_TOKEN_ENV)
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client
         self._owns_client = http_client is None
