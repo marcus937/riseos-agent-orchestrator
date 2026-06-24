@@ -102,19 +102,24 @@ async def list_workflows(
     return WorkflowCollection(workflows=_build_request_workflows(request))
 
 
-@router.get("/{workflow_id}", response_model=WorkflowResponse)
+@router.get("/{workflow_id}")
 async def get_workflow(
     workflow_id: str,
     request: Request,
     _: None = Depends(_require_workflow_read_access),
     settings: Settings = Depends(get_settings),
-) -> WorkflowResponse:
+) -> WorkflowResponse | WorkflowRecord:
     store = _workflow_store(request, settings)
     workflow = store.get_workflow(workflow_id)
-    if workflow is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
-    agent_store = _agent_task_store(request, settings)
-    return build_workflow_response(workflow, agent_store.list_agent_tasks())
+    if workflow is not None:
+        agent_store = _agent_task_store(request, settings)
+        return build_workflow_response(workflow, agent_store.list_agent_tasks())
+
+    legacy_workflow = find_workflow(_build_request_workflows(request), workflow_id)
+    if legacy_workflow is not None:
+        return legacy_workflow
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
 
 
 @router.get("/{workflow_id}/timeline", response_model=WorkflowTimeline)
