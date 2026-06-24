@@ -5,6 +5,8 @@ from urllib.parse import quote
 
 import httpx
 
+RUNTIME_VALIDATION_TOKEN_HEADER = "X-Runtime-Validation-Token"
+
 
 class AgentBusClientError(Exception):
     """Base error for Agent Bus client failures."""
@@ -31,11 +33,13 @@ class AgentBusClient:
         *,
         base_url: str | None,
         token: str | None = None,
+        runtime_validation_token: str | None = None,
         timeout_seconds: int = 30,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._token = token
+        self._runtime_validation_token = runtime_validation_token
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client
         self._owns_client = http_client is None
@@ -74,6 +78,12 @@ class AgentBusClient:
         headers = {"Accept": "application/json"}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
+        return headers
+
+    def _runtime_validation_headers(self) -> dict[str, str]:
+        headers = self._headers()
+        if self._runtime_validation_token:
+            headers[RUNTIME_VALIDATION_TOKEN_HEADER] = self._runtime_validation_token
         return headers
 
 
