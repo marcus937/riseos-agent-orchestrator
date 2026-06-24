@@ -71,7 +71,8 @@ async def create_agent_task_endpoint(
         else:
             mark_agent_task_assigned(task, work_item_id=work_item_id)
             store.save_agent_task(task)
-            await dispatch_circuit_wakeup_for_assigned_task(task, settings=settings)
+            await dispatch_circuit_wakeup_for_assigned_task(task, settings=settings, agent_bus_client=client)
+            store.save_agent_task(task)
         finally:
             if github_client is not None:
                 await github_client.aclose()
