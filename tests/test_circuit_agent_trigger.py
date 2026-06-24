@@ -39,6 +39,7 @@ def test_http_client_uses_input_payload_not_message() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         captured["authorization"] = request.headers.get("authorization")
         captured["content_type"] = request.headers.get("content-type")
+        captured["accept"] = request.headers.get("accept")
         captured["json"] = request.read().decode("utf-8")
         return httpx.Response(202, text="accepted")
 
@@ -51,8 +52,34 @@ def test_http_client_uses_input_payload_not_message() -> None:
     assert response.status_code == 202
     assert captured["authorization"] == "Bearer secret-token"
     assert captured["content_type"] == "application/json"
+    assert captured["accept"] == "application/json"
     assert captured["json"] == '{"input":"wake up"}'
     assert "message" not in captured["json"]
+
+
+def test_http_client_normalizes_bearer_token_prefix_and_whitespace() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization")
+        captured["json"] = request.read().decode("utf-8")
+        return httpx.Response(202, text="accepted")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = CircuitAgentTriggerHTTPClient(http_client=http_client)
+
+    response = run(
+        client.post_wakeup(
+            url="https://agent.example/trigger",
+            token="  Bearer secret-token  ",
+            message="wake up",
+        )
+    )
+    run(client.aclose())
+
+    assert response.status_code == 202
+    assert captured["authorization"] == "Bearer secret-token"
+    assert captured["json"] == '{"input":"wake up"}'
 
 
 def test_default_message_prevents_independent_github_issue_hunting() -> None:
@@ -99,6 +126,25 @@ def test_wakeup_message_includes_workflow_and_work_item_context() -> None:
     assert client.calls[0]["message"] == result.message
 
 
+def test_wakeup_normalizes_configured_access_token_before_dispatch() -> None:
+    client = FakeCircuitTriggerClient(status_code=202)
+    settings = Settings(
+        circuit_agent_trigger_url="  https://api.chatgpt.com/v1/workspace_agents/agent-id/trigger  ",
+        circuit_agent_access_token="  Bearer secret-token  ",
+    )
+
+    result = run(wake_circuit_agent_for_work(settings, target_agent="circuit-forge", client=client))
+
+    assert result.success is True
+    assert client.calls == [
+        {
+            "url": "https://api.chatgpt.com/v1/workspace_agents/agent-id/trigger",
+            "token": "secret-token",
+            "message": result.message,
+        }
+    ]
+
+
 def test_202_and_200_mark_success(caplog: Any) -> None:
     settings = Settings(
         circuit_agent_trigger_url="https://agent.example/api/trigger?token=do-not-log",
@@ -131,11 +177,16 @@ def test_202_and_200_mark_success(caplog: Any) -> None:
 def test_400_401_403_log_response_body_and_return_failure(caplog: Any) -> None:
     settings = Settings(
         circuit_agent_trigger_url="https://agent.example/api/trigger",
-        circuit_agent_access_token="secret-token",
+        circuit_agent_access_token="Bearer secret-token",
     )
 
+    expected_classifications = {
+        400: None,
+        401: "token_mismatch_or_stale_token",
+        403: "agent_access_forbidden",
+    }
     for status_code in (400, 401, 403):
-        body = f'{{"detail":"Field required or unauthorized {status_code}"}} secret-token'
+        body = f'{{"detail":"Field required or unauthorized {status_code}"}} secret-token Bearer secret-token'
         client = FakeCircuitTriggerClient(status_code=status_code, text=body)
 
         with caplog.at_level(logging.INFO, logger="riseos_agent_orchestrator"):
@@ -145,11 +196,14 @@ def test_400_401_403_log_response_body_and_return_failure(caplog: Any) -> None:
         assert result.success is False
         assert result.status_code == status_code
         assert result.error == f"Circuit agent wakeup failed with status {status_code}."
+        assert result.failure_classification == expected_classifications[status_code]
         assert "circuit_agent_wakeup_attempted" in caplog.text
         assert "circuit_agent_wakeup_failed" in caplog.text
         assert "Field required or unauthorized" in caplog.text
         assert f'"status_code": {status_code}' in caplog.text
 
+    assert "token_mismatch_or_stale_token" in caplog.text
+    assert "agent_access_forbidden" in caplog.text
     assert "[REDACTED]" in caplog.text
     assert "secret-token" not in caplog.text
 
@@ -158,6 +212,21 @@ def test_missing_trigger_config_skips_without_crashing() -> None:
     client = FakeCircuitTriggerClient()
 
     result = run(wake_circuit_agent_for_work(Settings(), target_agent="circuit", client=client))
+
+    assert result.attempted is False
+    assert result.success is False
+    assert result.skipped_reason == "Circuit agent trigger is not configured."
+    assert client.calls == []
+
+
+def test_blank_trigger_config_skips_without_crashing() -> None:
+    client = FakeCircuitTriggerClient()
+    settings = Settings(
+        circuit_agent_trigger_url="  https://api.chatgpt.com/v1/workspace_agents/agent-id/trigger  ",
+        circuit_agent_access_token="  Bearer   ",
+    )
+
+    result = run(wake_circuit_agent_for_work(settings, target_agent="circuit", client=client))
 
     assert result.attempted is False
     assert result.success is False
@@ -181,10 +250,10 @@ def test_base_workspace_agent_url_without_trigger_is_not_called() -> None:
 
 
 def test_token_is_never_logged_for_exception(caplog: Any) -> None:
-    client = FakeCircuitTriggerClient(error=RuntimeError("boom secret-token"))
+    client = FakeCircuitTriggerClient(error=RuntimeError("boom secret-token Bearer secret-token"))
     settings = Settings(
         circuit_agent_trigger_url="https://agent.example/secret-token/trigger",
-        circuit_agent_access_token="secret-token",
+        circuit_agent_access_token="Bearer secret-token",
     )
 
     with caplog.at_level(logging.INFO, logger="riseos_agent_orchestrator"):
@@ -192,6 +261,6 @@ def test_token_is_never_logged_for_exception(caplog: Any) -> None:
 
     assert result.attempted is True
     assert result.success is False
-    assert result.error == "boom [REDACTED]"
+    assert result.error == "boom [REDACTED] [REDACTED]"
     assert "circuit_agent_wakeup_failed" in caplog.text
     assert "secret-token" not in caplog.text
