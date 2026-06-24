@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.admin_auth import require_orchestrator_admin_token
 from app.agent_task_dispatch import AgentTaskDependencyBlocked, dispatch_agent_task_to_agent_bus
-from app.agent_task_release import release_runnable_agent_tasks
+from app.agent_task_release import dispatch_circuit_wakeup_for_assigned_task, release_runnable_agent_tasks
 from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
@@ -71,6 +71,7 @@ async def create_agent_task_endpoint(
         else:
             mark_agent_task_assigned(task, work_item_id=work_item_id)
             store.save_agent_task(task)
+            await dispatch_circuit_wakeup_for_assigned_task(task, settings=settings)
         finally:
             if github_client is not None:
                 await github_client.aclose()
@@ -127,7 +128,13 @@ async def record_agent_task_execution_result(
                 review_agent=settings.agent_bus_review_agent,
                 store=store,
             )
-            await release_runnable_agent_tasks(store, client, review_agent=settings.agent_bus_review_agent, dependency_client=github_client)
+            await release_runnable_agent_tasks(
+                store,
+                client,
+                review_agent=settings.agent_bus_review_agent,
+                dependency_client=github_client,
+                settings=settings,
+            )
         finally:
             if github_client is not None:
                 await github_client.aclose()
