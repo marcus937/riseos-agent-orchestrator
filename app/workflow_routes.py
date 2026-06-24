@@ -83,6 +83,7 @@ async def create_workflow_endpoint(
                 review_agent=settings.agent_bus_review_agent,
                 dependency_client=github_client,
                 correlation_id=workflow.workflow_id,
+                settings=settings,
             )
         finally:
             if github_client is not None:
