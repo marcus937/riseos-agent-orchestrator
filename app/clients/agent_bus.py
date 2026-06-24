@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+RUNTIME_VALIDATION_TOKEN_HEADER = "X-Runtime-Validation-Token"
+RUNTIME_VALIDATION_TOKEN_ENV = "AGENT_BUS_RUNTIME_VALIDATION_TOKEN"
 
 
 class AgentBusClientError(Exception):
@@ -31,11 +35,13 @@ class AgentBusClient:
         *,
         base_url: str | None,
         token: str | None = None,
+        runtime_validation_token: str | None = None,
         timeout_seconds: int = 30,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/") if base_url else ""
         self._token = token
+        self._runtime_validation_token = runtime_validation_token or os.getenv(RUNTIME_VALIDATION_TOKEN_ENV)
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client
         self._owns_client = http_client is None
@@ -74,7 +80,12 @@ class AgentBusClient:
         headers = {"Accept": "application/json"}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
+        if self._runtime_validation_token:
+            headers[RUNTIME_VALIDATION_TOKEN_HEADER] = self._runtime_validation_token
         return headers
+
+    def _runtime_validation_headers(self) -> dict[str, str]:
+        return self._headers()
 
 
 def _object_response(response: httpx.Response, method: str, path: str) -> dict[str, Any]:
