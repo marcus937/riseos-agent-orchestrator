@@ -1,0 +1,3 @@
+from app.wf20_runtime_validation import install_wf20_runtime_validation
+
+install_wf20_runtime_validation()
