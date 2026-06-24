@@ -67,6 +67,7 @@ async def wake_circuit_agent_for_work(
     repo_full_name: str | None = None,
     issue_number: int | None = None,
     workflow_id: str | None = None,
+    work_item_id: str | None = None,
     client: CircuitAgentTriggerClient | None = None,
 ) -> CircuitAgentTriggerResult:
     if not is_circuit_agent(target_agent) and not is_circuit_agent(owner_agent):
@@ -78,6 +79,7 @@ async def wake_circuit_agent_for_work(
         repo_full_name=repo_full_name,
         issue_number=issue_number,
         workflow_id=workflow_id,
+        work_item_id=work_item_id,
     )
     if not trigger_url or not access_token:
         return CircuitAgentTriggerResult(
@@ -167,6 +169,7 @@ def build_circuit_wakeup_message(
     repo_full_name: str | None = None,
     issue_number: int | None = None,
     workflow_id: str | None = None,
+    work_item_id: str | None = None,
 ) -> str:
     parts = [
         "Circuit Forge wake up and check your Agent Bus inbox. Only work on an explicit Agent Bus assigned work item. "
@@ -179,6 +182,8 @@ def build_circuit_wakeup_message(
         parts.append(f"Assigned GitHub issue: #{issue_number}.")
     if workflow_id:
         parts.append(f"Workflow ID: {workflow_id}.")
+    if work_item_id:
+        parts.append(f"Work item ID: {work_item_id}.")
     return " ".join(parts)
 
 
