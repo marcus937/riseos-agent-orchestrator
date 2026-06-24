@@ -6,7 +6,18 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
-from app.circuit_runtime_validation import runtime_validation_store
+from app.wf20_runtime_validation import (
+    AgentBusRuntimeValidationStore,
+    _install_agent_bus_runtime_methods,
+    _install_github_status_method,
+    runtime_validation_required_for_parsed,
+)
+from app.wf20_runtime_validation_safe import runtime_validation_request_from_parsed
+
+_install_agent_bus_runtime_methods()
+_install_github_status_method()
+runtime_validation_store = AgentBusRuntimeValidationStore()
+
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
@@ -14,7 +25,6 @@ from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, 
 from app.github_context import hydrate_github_context
 from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
 from app.github_writeback import writeback_review_decision
-from app.hermes_contract import runtime_validation_request_from_parsed, runtime_validation_required_for_parsed
 from app.hermes_dispatch import dispatch_hermes_runtime_validation
 from app.operational_logging import (
     log_event,

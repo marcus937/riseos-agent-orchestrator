@@ -23,6 +23,12 @@ def _requires_pr_preview(parsed: ParsedGitHubEvent, impl: Any) -> bool:
     return False
 
 
+def _can_check_preview_metadata(github_client: Any | None) -> bool:
+    return github_client is not None and (
+        hasattr(github_client, "list_commit_statuses") or hasattr(github_client, "list_check_runs_for_ref")
+    )
+
+
 def _branch_name(parsed: ParsedGitHubEvent, settings: Settings) -> str | None:
     return branch_from_parsed(parsed) or getattr(settings, "work_branch", None)
 
@@ -42,12 +48,14 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
         *,
         github_client: Any | None,
     ) -> tuple[str, str]:
+        node = impl._hermes_node(parsed.labels)
         payload_preview_url = impl._preview_url_from_payload(parsed.raw)
         if payload_preview_url:
             impl._log_hermes_decision(
                 parsed,
                 settings,
                 "hermes_target_resolved",
+                node=node,
                 target_url=payload_preview_url,
                 target_url_source="webhook_payload_preview_url",
                 hermes_dispatched=True,
@@ -63,6 +71,7 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
                 parsed,
                 settings,
                 "hermes_target_resolved",
+                node=node,
                 target_url=github_preview_url,
                 target_url_source="github_commit_preview_url",
                 hermes_dispatched=True,
@@ -72,11 +81,12 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
             )
             return github_preview_url, "github_commit_preview_url"
 
-        if _requires_pr_preview(parsed, impl):
+        if _requires_pr_preview(parsed, impl) and _can_check_preview_metadata(github_client):
             impl._log_hermes_decision(
                 parsed,
                 settings,
                 "hermes_preview_pending",
+                node=node,
                 target_url=None,
                 target_url_source=PENDING_TARGET_SOURCE,
                 hermes_dispatched=False,
@@ -92,6 +102,7 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
             parsed,
             settings,
             "hermes_target_resolved",
+            node=node,
             target_url=target_url,
             target_url_source=target_source,
             hermes_dispatched=True,
@@ -111,7 +122,7 @@ def install_preview_guard(impl: Any, namespace: dict[str, Any]) -> None:
         target_url: str | None = None,
         target_source: str | None = None,
     ) -> dict[str, Any]:
-        if target_url is None and _requires_pr_preview(parsed, impl):
+        if target_url is None and _requires_pr_preview(parsed, impl) and target_source == PENDING_TARGET_SOURCE:
             raise ValueError(MISSING_PR_PREVIEW_REASON)
         return original_payload_builder(
             parsed,
