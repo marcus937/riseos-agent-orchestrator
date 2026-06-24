@@ -79,16 +79,12 @@ def test_release_wakes_circuit_after_agent_bus_assignment_is_persisted(monkeypat
     assert assigned.agent_bus_work_item_id == "work-item-123"
     assert bus.payloads[0]["owner_agent"] == "circuit-forge"
     assert bus.visibility_checks == ["work-item-123"]
-    assert wake_calls == [
-        {
-            "settings": wake_calls[0]["settings"],
-            "target_agent": "circuit-forge",
-            "repo_full_name": "marcus937/riseos-agent-orchestrator",
-            "issue_number": None,
-            "workflow_id": "wf-test-123",
-            "work_item_id": "work-item-123",
-        }
-    ]
+    assert len(wake_calls) == 1
+    assert wake_calls[0]["target_agent"] == "circuit-forge"
+    assert wake_calls[0]["repo_full_name"] == "marcus937/riseos-agent-orchestrator"
+    assert wake_calls[0]["issue_number"] is None
+    assert wake_calls[0]["workflow_id"] == "wf-test-123"
+    assert wake_calls[0]["work_item_id"] == "work-item-123"
     assert any(
         event.event == CIRCUIT_WAKEUP_EVENT
         and event.metadata.get("agent_bus_work_item_id") == "work-item-123"
@@ -181,4 +177,3 @@ def test_non_circuit_assignment_does_not_trigger_wakeup(monkeypatch) -> None:
     run(dispatch_circuit_wakeup_for_assigned_task(task, settings=circuit_settings(), agent_bus_client=FakeAgentBusClient()))
 
     assert wake_calls == []
-}
