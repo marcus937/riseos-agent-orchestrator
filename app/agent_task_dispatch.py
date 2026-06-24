@@ -34,12 +34,13 @@ def build_agent_bus_work_item_payload(
     review_agent: str = "bb2",
     dependency_state: DependencyState | None = None,
 ) -> dict[str, Any]:
-    workflow_id = task.correlation_id or f"wf-agent-task-{task.task_id}"
+    workflow_id = f"wf-agent-task-{task.task_id}"
     dependency_state = dependency_state or DependencyState()
     routing = _routing_metadata(task)
     metadata = {
         "task_id": task.task_id,
         "workflow_id": workflow_id,
+        "correlation_id": task.correlation_id,
         "repo_full_name": task.repo_full_name,
         "objective": task.objective,
         "instructions": task.instructions,
