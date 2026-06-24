@@ -1,5 +1,0 @@
-from app.wf20_runtime_validation import install_wf20_runtime_validation
-from app.wf20_runtime_validation_safe import install_safe_wf20_request_builder
-
-install_wf20_runtime_validation()
-install_safe_wf20_request_builder()
