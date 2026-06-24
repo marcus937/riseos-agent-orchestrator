@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class GitHubEventType(StrEnum):
+    DEPLOYMENT_STATUS = "deployment_status"
     ISSUE_COMMENT = "issue_comment"
     ISSUES = "issues"
     PING = "ping"
@@ -94,6 +95,17 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
 
     if event_type == GitHubEventType.PING:
         return ParsedGitHubEvent(**base)
+
+    if event_type == GitHubEventType.DEPLOYMENT_STATUS:
+        deployment = payload.get("deployment") or {}
+        deployment_status = payload.get("deployment_status") or {}
+        return ParsedGitHubEvent(
+            **base,
+            action=str(deployment_status.get("state") or payload.get("action") or ""),
+            ref=deployment.get("ref"),
+            head_ref=deployment.get("ref"),
+            head_sha=deployment.get("sha"),
+        )
 
     if event_type == GitHubEventType.ISSUE_COMMENT:
         issue = payload.get("issue") or {}
