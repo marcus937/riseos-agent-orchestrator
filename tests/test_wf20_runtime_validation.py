@@ -1,7 +1,10 @@
 import asyncio
 from typing import Any
 
+import httpx
+
 from app.circuit_runtime_validation import RuntimeValidationRequest
+from app.clients.agent_bus import AgentBusClient, RUNTIME_VALIDATION_TOKEN_HEADER
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
@@ -9,6 +12,7 @@ from app.wf20_runtime_validation import (
     AgentBusRuntimeValidationStore,
     RuntimeValidationState,
     VercelReadiness,
+    _install_agent_bus_runtime_methods,
     frontend_validation_profile_for_repo,
     resolve_vercel_readiness,
     runtime_validation_required_for_parsed,
@@ -106,6 +110,7 @@ def settings(**overrides: Any) -> Settings:
         "enable_agent_bus_dispatch": True,
         "agent_bus_base_url": "https://agent-bus.test",
         "agent_bus_token": "agent-token",
+        "agent_bus_runtime_validation_token": "runtime-token",
         "enable_github_writeback": True,
         "github_token": "github-token",
         "hermes_m2_enable_dispatch": True,
@@ -140,6 +145,57 @@ def make_store(agent_bus: FakeAgentBusClient, github: FakeGitHubClient, hermes: 
         agent_bus_client_factory=lambda _settings: agent_bus,
         github_client_factory=lambda _settings: github,
     )
+
+
+def test_agent_bus_record_runtime_validation_sends_authorization_and_trust_token() -> None:
+    _install_agent_bus_runtime_methods()
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json={"validation_state_id": "state-1", "metadata": {}})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = AgentBusClient(
+        base_url="https://agent-bus.test",
+        token="agent-token",
+        runtime_validation_token="runtime-token",
+        http_client=http_client,
+    )
+
+    result = run(client.record_runtime_validation({"work_item_id": "work-item-1", "state": "HERMES_VALIDATION_REQUESTED"}))
+    run(client.aclose())
+
+    assert result["validation_state_id"] == "state-1"
+    assert requests[0].url.path == "/runtime-validations"
+    assert requests[0].headers["authorization"] == "Bearer agent-token"
+    assert requests[0].headers[RUNTIME_VALIDATION_TOKEN_HEADER] == "runtime-token"
+
+
+def test_agent_bus_get_runtime_validation_sends_authorization_and_trust_token() -> None:
+    _install_agent_bus_runtime_methods()
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"current_state": "HERMES_VALIDATION_PASSED", "history": []})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = AgentBusClient(
+        base_url="https://agent-bus.test",
+        token="agent-token",
+        runtime_validation_token="runtime-token",
+        http_client=http_client,
+    )
+
+    result = run(client.get_runtime_validation(work_item_id="work-item-1"))
+    run(client.aclose())
+
+    assert result["current_state"] == "HERMES_VALIDATION_PASSED"
+    assert requests[0].url.path == "/runtime-validations/latest"
+    assert requests[0].url.params["work_item_id"] == "work-item-1"
+    assert requests[0].headers["authorization"] == "Bearer agent-token"
+    assert requests[0].headers[RUNTIME_VALIDATION_TOKEN_HEADER] == "runtime-token"
 
 
 def test_frontend_pr_vercel_ready_dispatches_hermes_and_records_agent_bus_sequence() -> None:
