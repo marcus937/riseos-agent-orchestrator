@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+from app import review_queue as review_queue_module
+from app import runtime_validation_review_bridge as bridge_module
 from app.config import Settings
 from app.github_events import GitHubEventType
 from app.runtime_validation_trace import REJECTION_MESSAGE, TRACE_EVENT
@@ -14,8 +16,7 @@ from app.circuit_runtime_validation import (
     RuntimeValidationResult,
     RuntimeValidationStore,
 )
-from app.review_queue import ReviewWorkItem, ReviewWorkItemStatus, _blocked_reason, review_queue
-from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
+from app.review_queue import ReviewWorkItem, ReviewWorkItemStatus, review_queue
 
 
 def _trace_events(caplog) -> list[dict[str, object]]:
@@ -91,7 +92,7 @@ def test_review_bridge_logs_lookup_and_context_attachment(caplog) -> None:
     result = _runtime_result()
     settings = Settings(enable_runtime_validation_review_bridge=True)
 
-    item = enqueue_review_from_runtime_validation(result, settings)
+    item = bridge_module.enqueue_review_from_runtime_validation(result, settings)
 
     assert item is not None
     assert item.runtime_validation_id == "rv-123"
@@ -123,7 +124,7 @@ def test_review_gate_logs_missing_runtime_evidence_without_changing_decision(cap
         status=ReviewWorkItemStatus.PENDING_REVIEW,
     )
 
-    reason = _blocked_reason(item)
+    reason = review_queue_module._blocked_reason(item)
 
     assert reason is None
     events = _trace_events(caplog)
