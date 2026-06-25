@@ -198,11 +198,40 @@ class AgentBusRuntimeValidationStore(RuntimeValidationStore):
     async def trigger(self, request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationResult:
         profile = str(getattr(request, "validation_profile", None) or frontend_validation_profile_for_repo(request.repo).validation_profile or "frontend_playwright")
         commit_sha = getattr(request, "commit_sha", None)
+        original_work_item_id = request.work_item_id
         agent_bus_client = self._agent_bus_client_factory(settings) if settings.enable_agent_bus_dispatch else None
         github_client = self._github_client_factory(settings) if settings.enable_github_writeback else None
+        log_event(
+            "wf20_runtime_validation_handoff_started",
+            workflow_id=request.workflow_id,
+            work_item_id=request.work_item_id,
+            repository=request.repo,
+            pr_number=request.pr_number,
+            branch=request.branch,
+            commit_sha=commit_sha,
+            target_url=request.target_url,
+            target_url_source=request.target_url_source,
+            hermes_base_url_configured=bool(settings.hermes_m2_base_url),
+            hermes_token_configured=bool(settings.hermes_m2_token),
+            hermes_m2_enable_dispatch=settings.hermes_m2_enable_dispatch,
+            gate_lookup_key=_gate_lookup_key(request, commit_sha=commit_sha),
+        )
         try:
             if agent_bus_client is not None:
                 request.work_item_id = await _ensure_agent_bus_work_item(agent_bus_client, request, settings, profile=profile, commit_sha=commit_sha)
+                log_event(
+                    "wf20_runtime_validation_agent_bus_work_item_selected",
+                    workflow_id=request.workflow_id,
+                    original_work_item_id=original_work_item_id,
+                    work_item_id=request.work_item_id,
+                    created_runtime_validation_work_item=original_work_item_id is None and request.work_item_id is not None,
+                    repository=request.repo,
+                    pr_number=request.pr_number,
+                    branch=request.branch,
+                    commit_sha=commit_sha,
+                    target_url=request.target_url,
+                    gate_lookup_key=_gate_lookup_key(request, commit_sha=commit_sha),
+                )
                 await _record_agent_bus_state(agent_bus_client, request, RuntimeValidationState.REQUESTED, profile=profile, commit_sha=commit_sha)
 
             if request.target_url is None and request.target_url_source in {"vercel_failed", "vercel_timeout", "vercel_preview_pending"}:
@@ -218,6 +247,7 @@ class AgentBusRuntimeValidationStore(RuntimeValidationStore):
                         error=result.error,
                     )
                 await _write_github_runtime_outcome(github_client, request, result, commit_sha=commit_sha)
+                _log_terminal_handoff(result, request, commit_sha=commit_sha)
                 return result
 
             if agent_bus_client is not None:
@@ -243,6 +273,7 @@ class AgentBusRuntimeValidationStore(RuntimeValidationStore):
                     result.error = "Agent Bus did not confirm passed Hermes Playwright evidence."
                     result.bb2.review_status = "blocked"
             await _write_github_runtime_outcome(github_client, request, result, commit_sha=commit_sha)
+            _log_terminal_handoff(result, request, commit_sha=commit_sha)
             return result
         finally:
             if agent_bus_client is not None:
@@ -294,7 +325,7 @@ def _install_github_status_method() -> None:
         return await self._request("POST", f"/repos/{repo_full_name}/statuses/{sha}", json=payload)
 
     GitHubClient.create_commit_status = create_commit_status  # type: ignore[attr-defined]
-    GitHubClient._wf20_commit_status_installed = True  # type: ignore[attr-defined]
+    GitHubClient._wf20_commit_status_installed = True
 
 
 def _frontend_profile_config() -> dict[str, str]:
@@ -349,14 +380,32 @@ async def _ensure_agent_bus_work_item(agent_bus_client: AgentBusClient, request:
 
 async def _record_agent_bus_state(agent_bus_client: AgentBusClient, request: RuntimeValidationRequest, state: RuntimeValidationState, *, profile: str, commit_sha: str | None, job_id: str | None = None, result: Literal["passed", "failed", "blocked"] | None = None, runtime_result: RuntimeValidationResult | None = None, error: str | None = None) -> dict[str, Any] | None:
     if not request.work_item_id:
+        log_event(
+            "wf20_runtime_validation_agent_bus_write_skipped",
+            workflow_id=request.workflow_id,
+            work_item_id=request.work_item_id,
+            repository=request.repo,
+            pr_number=request.pr_number,
+            branch=request.branch,
+            commit_sha=commit_sha,
+            target_url=request.target_url,
+            terminal_status=result,
+            skip_reason="missing_work_item_id",
+            gate_lookup_key=_gate_lookup_key(request, commit_sha=commit_sha),
+        )
         return None
     evidence = runtime_result.evidence if runtime_result is not None else None
     hermes = runtime_result.hermes if runtime_result is not None else None
+    hermes_job_id = job_id or (hermes.job_id if hermes else None)
+    runtime_validation_id = runtime_result.validation_id if runtime_result is not None else None
+    gate_lookup_key = _gate_lookup_key(request, commit_sha=commit_sha)
     payload: dict[str, Any] = {
         "work_item_id": request.work_item_id,
         "state": state.value,
         "actor": "hermes" if state not in {RuntimeValidationState.REQUESTED, RuntimeValidationState.BLOCKED} else "orchestrator",
-        "job_id": job_id or (hermes.job_id if hermes else None),
+        "job_id": hermes_job_id,
+        "hermes_job_id": hermes_job_id,
+        "runtime_validation_id": runtime_validation_id,
         "workflow_id": request.workflow_id,
         "repository": request.repo,
         "pr_number": request.pr_number,
@@ -371,12 +420,36 @@ async def _record_agent_bus_state(agent_bus_client: AgentBusClient, request: Run
         "screenshot_artifact": _screenshot_artifact(evidence),
         "artifact_hashes": _artifact_hashes(evidence),
         "result": result,
+        "terminal_status": result,
+        "evidence_packet_id": request.evidence_id,
+        "gate_lookup_key": gate_lookup_key,
         "metadata": {
             "source": "orchestrator_wf20",
+            "status": result,
+            "terminal_status": result,
+            "state": state.value,
+            "runtime_validation_id": runtime_validation_id,
             "workflow_id": request.workflow_id,
+            "work_item_id": request.work_item_id,
+            "evidence_id": request.evidence_id,
+            "evidence_packet_id": request.evidence_id,
+            "repository": request.repo,
+            "pr_number": request.pr_number,
+            "branch": request.branch,
+            "commit_sha": commit_sha,
+            "target_url": request.target_url,
+            "target_url_source": request.target_url_source,
             "validation_profile": profile,
             "vercel_readiness": getattr(request, "vercel_readiness", None),
-            "target_url_source": request.target_url_source,
+            "hermes_job_id": hermes_job_id,
+            "hermes_status": hermes.status if hermes else None,
+            "final_url": evidence.final_url if evidence else None,
+            "http_status": evidence.http_status if evidence else None,
+            "console_summary": _console_summary(evidence),
+            "network_summary": _network_summary(evidence),
+            "screenshot_artifact": _screenshot_artifact(evidence),
+            "artifact_hashes": _artifact_hashes(evidence),
+            "gate_lookup_key": gate_lookup_key,
             "error": error or (runtime_result.error if runtime_result else None),
             "timestamps": {
                 "created_at": runtime_result.created_at.isoformat() if runtime_result else datetime.now(UTC).isoformat(),
@@ -384,7 +457,39 @@ async def _record_agent_bus_state(agent_bus_client: AgentBusClient, request: Run
             },
         },
     }
-    return await agent_bus_client.record_runtime_validation(_compact(payload))  # type: ignore[attr-defined]
+    log_event(
+        "wf20_runtime_validation_agent_bus_write_started",
+        workflow_id=request.workflow_id,
+        work_item_id=request.work_item_id,
+        runtime_validation_id=runtime_validation_id,
+        repository=request.repo,
+        pr_number=request.pr_number,
+        branch=request.branch,
+        commit_sha=commit_sha,
+        target_url=request.target_url,
+        hermes_job_id=hermes_job_id,
+        terminal_status=result,
+        runtime_state=state.value,
+        gate_lookup_key=gate_lookup_key,
+    )
+    response = await agent_bus_client.record_runtime_validation(_compact(payload))  # type: ignore[attr-defined]
+    log_event(
+        "wf20_runtime_validation_agent_bus_write_completed",
+        workflow_id=request.workflow_id,
+        work_item_id=request.work_item_id,
+        runtime_validation_id=runtime_validation_id,
+        repository=request.repo,
+        pr_number=request.pr_number,
+        branch=request.branch,
+        commit_sha=commit_sha,
+        target_url=request.target_url,
+        hermes_job_id=hermes_job_id,
+        terminal_status=result,
+        runtime_state=state.value,
+        gate_lookup_key=gate_lookup_key,
+        agent_bus_response=_compact(response) if isinstance(response, dict) else response,
+    )
+    return response
 
 
 def _blocked_result_from_request(request: RuntimeValidationRequest, settings: Settings, *, profile: str) -> RuntimeValidationResult:
@@ -561,6 +666,38 @@ def _artifact_hashes(evidence: RuntimeValidationEvidenceSummary | None) -> dict[
         if name and digest:
             hashes[str(name)] = str(digest)
     return hashes
+
+
+def _gate_lookup_key(request: RuntimeValidationRequest, *, commit_sha: str | None) -> dict[str, Any]:
+    return _compact(
+        {
+            "work_item_id": request.work_item_id,
+            "workflow_id": request.workflow_id,
+            "repository": request.repo,
+            "pr_number": request.pr_number,
+            "branch": request.branch,
+            "commit_sha": commit_sha,
+        }
+    )
+
+
+def _log_terminal_handoff(result: RuntimeValidationResult, request: RuntimeValidationRequest, *, commit_sha: str | None) -> None:
+    log_event(
+        "wf20_runtime_validation_handoff_terminal",
+        workflow_id=result.workflow_id or request.workflow_id,
+        work_item_id=result.work_item_id or request.work_item_id,
+        runtime_validation_id=result.validation_id,
+        repository=result.repo,
+        pr_number=result.pr_number,
+        branch=result.branch,
+        commit_sha=commit_sha,
+        target_url=result.hermes.target_url or request.target_url,
+        hermes_job_id=result.hermes.job_id,
+        terminal_status=result.status,
+        hermes_status=result.hermes.status,
+        gate_lookup_key=_gate_lookup_key(request, commit_sha=commit_sha),
+        skip_reason=result.error or result.hermes.error,
+    )
 
 
 def _compact(value: dict[str, Any]) -> dict[str, Any]:
