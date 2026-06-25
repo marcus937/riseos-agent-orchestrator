@@ -20,6 +20,7 @@ from app.review_queue import (
 
 TERMINAL_RUNTIME_VALIDATION_STATUSES = {"blocked", "completed", "failed"}
 RUNTIME_REVIEW_SOURCE = "runtime_validation_bb2_packet"
+IMMUTABLE_CORRELATION_KEYS = ("deployment_id", "workflow_id", "correlation_id")
 
 
 def create_runtime_validation_pending_item(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
@@ -206,15 +207,30 @@ def _runtime_items_correlate(existing: ReviewWorkItem, candidate: ReviewWorkItem
         return False
     if existing.event_type != candidate.event_type:
         return False
-    if review_work_item_identity(existing) == review_work_item_identity(candidate):
-        return True
-    if existing.commit_sha and candidate.commit_sha and existing.commit_sha == candidate.commit_sha:
-        return True
-    if existing.pr_number is not None and candidate.pr_number is not None and existing.pr_number == candidate.pr_number:
-        return True
+
+    existing_context = existing.runtime_validation_context if isinstance(existing.runtime_validation_context, dict) else {}
+    candidate_context = candidate.runtime_validation_context if isinstance(candidate.runtime_validation_context, dict) else {}
+    for key in IMMUTABLE_CORRELATION_KEYS:
+        existing_value = _context_value(existing_context, key)
+        candidate_value = _context_value(candidate_context, key)
+        if existing_value and candidate_value:
+            return existing_value == candidate_value
+
+    if existing.commit_sha and candidate.commit_sha:
+        return existing.commit_sha == candidate.commit_sha
+    if existing.pr_number is not None and candidate.pr_number is not None:
+        return existing.pr_number == candidate.pr_number
     if existing.branch and candidate.branch and existing.branch == candidate.branch:
         return existing.pr_number is None or candidate.pr_number is None or existing.pr_number == candidate.pr_number
-    return False
+    return review_work_item_identity(existing) == review_work_item_identity(candidate)
+
+
+def _context_value(context: dict[str, Any], key: str) -> str | None:
+    value = context.get(key)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _gate_lookup_key(result: RuntimeValidationResult) -> dict[str, object]:
