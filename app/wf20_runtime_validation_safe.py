@@ -7,6 +7,14 @@ from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.config import Settings
 from app.github_events import ParsedGitHubEvent
 from app.operational_logging import log_event
+from app.wf20_resume_diagnostic_patch import install_wf20_resume_diagnostic_patch
+from app.wf20_resume_diagnostics import (
+    REJECTION_REASON_NO_RUNTIME_ITEM,
+    deployment_ids,
+    log_correlation_candidates,
+    log_correlation_rejection,
+    log_deployment_status_received,
+)
 from app.wf20_runtime_validation import (
     VALIDATION_TYPE,
     VercelReadiness,
@@ -21,6 +29,8 @@ from app.wf20_runtime_validation import (
 READY_DEPLOYMENT_STATES = {"success", "ready"}
 FAILED_DEPLOYMENT_STATES = {"error", "failure", "failed", "inactive"}
 PENDING_DEPLOYMENT_STATES = {"pending", "queued", "in_progress", "building"}
+
+install_wf20_resume_diagnostic_patch()
 
 
 def install_safe_wf20_request_builder() -> None:
@@ -59,12 +69,33 @@ async def runtime_validation_request_from_parsed(
 async def hydrate_deployment_status_pr_context(parsed: ParsedGitHubEvent, github_client: Any | None) -> ParsedGitHubEvent:
     if not _is_deployment_status_payload(parsed.raw):
         return parsed
+    log_deployment_status_received(parsed)
+    log_correlation_candidates(waiting_workflows=[])
     if parsed.pull_request_number is not None or github_client is None or not parsed.repository or not parsed.head_sha:
+        if parsed.pull_request_number is None:
+            deployment_id, deployment_status_id = deployment_ids(parsed)
+            log_correlation_rejection(
+                REJECTION_REASON_NO_RUNTIME_ITEM,
+                repository=parsed.repository,
+                branch=parsed.head_ref,
+                commit_sha=parsed.head_sha,
+                deployment_id=deployment_id,
+                deployment_status_id=deployment_status_id,
+            )
         return parsed
 
     pulls = await _list_pull_requests_for_commit(github_client, parsed.repository, parsed.head_sha)
     selected = _select_pull_request_for_commit(pulls, parsed.head_sha, parsed.head_ref)
     if selected is None:
+        deployment_id, deployment_status_id = deployment_ids(parsed)
+        log_correlation_rejection(
+            REJECTION_REASON_NO_RUNTIME_ITEM,
+            repository=parsed.repository,
+            branch=parsed.head_ref,
+            commit_sha=parsed.head_sha,
+            deployment_id=deployment_id,
+            deployment_status_id=deployment_status_id,
+        )
         log_event(
             "vercel_preview_pr_correlation_failed",
             **_decision_context(parsed),
