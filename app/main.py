@@ -6,6 +6,17 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
+from app.wf20_deployment_resume import (
+    claim_waiting_workflow_for_request,
+    is_failed_deployment_request,
+    is_ready_deployment_request,
+    is_waiting_for_deployment_request,
+    is_wf20_deployment_status_payload,
+    mark_waiting_workflow_failed_for_request,
+    mark_waiting_workflow_resumed,
+    persist_waiting_for_deployment,
+)
+from app.wf20_resume_diagnostics import log_starting_hermes
 from app.wf20_runtime_validation import (
     AgentBusRuntimeValidationStore,
     _install_agent_bus_runtime_methods,
@@ -576,9 +587,12 @@ async def github_webhook(
     log_webhook_accepted(parsed)
     has_review_context = workflow.review_context is not None
     runtime_gated = runtime_validation_required_for_parsed(parsed, settings, has_review_context=has_review_context)
-    if runtime_gated:
+    deployment_status_payload = is_wf20_deployment_status_payload(parsed)
+    if runtime_gated and not deployment_status_payload:
         work_item = enqueue_runtime_pending_item(create_runtime_validation_pending_item(parsed), storage=storage, max_review_items=settings.orchestrator_max_review_items)
         log_queue_item_created(work_item)
+    elif runtime_gated:
+        work_item = None
     else:
         work_item = _create_review_work_item(parsed, has_review_context, settings)
     _record_repository_event(parsed, work_item_created=work_item is not None)
@@ -604,11 +618,29 @@ async def github_webhook(
         github_client = GitHubClient(token=settings.github_token) if settings.github_token else None
         try:
             validation_request = await runtime_validation_request_from_parsed(parsed, settings, github_client=github_client)
-            validation = await runtime_validation_store.trigger(validation_request, settings)
+            if is_waiting_for_deployment_request(validation_request):
+                if work_item is not None:
+                    work_item = persist_waiting_for_deployment(validation_request, work_item, storage=storage)
+            elif deployment_status_payload and is_failed_deployment_request(validation_request):
+                work_item = mark_waiting_workflow_failed_for_request(validation_request, parsed, storage=storage)
+            elif deployment_status_payload and is_ready_deployment_request(validation_request):
+                resumed_item = claim_waiting_workflow_for_request(validation_request, parsed, storage=storage)
+                if resumed_item is not None:
+                    waiting_context = resumed_item.runtime_validation_context or {}
+                    if waiting_context.get("workflow_id"):
+                        validation_request.workflow_id = str(waiting_context["workflow_id"])
+                    if waiting_context.get("correlation_id"):
+                        validation_request.correlation_id = str(waiting_context["correlation_id"])
+                    log_starting_hermes(validation_request, runtime_validation_id=resumed_item.runtime_validation_id)
+                    validation = await runtime_validation_store.trigger(validation_request, settings)
+                    resumed_item = mark_waiting_workflow_resumed(resumed_item, storage=storage)
+                    work_item = enqueue_review_from_runtime_validation(validation, settings, storage=storage, existing_item=resumed_item)
+            elif not deployment_status_payload:
+                validation = await runtime_validation_store.trigger(validation_request, settings)
+                work_item = enqueue_review_from_runtime_validation(validation, settings, storage=storage, existing_item=work_item)
         finally:
             if github_client is not None:
                 await github_client.aclose()
-        work_item = enqueue_review_from_runtime_validation(validation, settings, storage=storage, existing_item=work_item)
     else:
         github_client = GitHubClient(token=settings.github_token) if settings.enable_github_writeback else None
         try:
