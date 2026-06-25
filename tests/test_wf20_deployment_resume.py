@@ -223,7 +223,7 @@ def test_ready_deployment_status_resumes_same_workflow_and_dispatches_hermes_wit
     review_item = enqueue_review_from_runtime_validation(result, settings(), existing_item=resumed_item)
 
     assert result.status == "completed"
-    assert hermes.payloads[0]["payload"]["target_url"] == PREVIEW_URL
+    assert hermes.payloads[0]["payload"]["targetUrl"] == PREVIEW_URL
     assert review_item is not None
     assert review_item.id == waiting_item.id
     assert review_item.status == ReviewWorkItemStatus.PENDING_REVIEW
@@ -277,4 +277,4 @@ def test_existing_happy_path_with_immediate_verified_url_still_dispatches_hermes
     result = run(store.trigger(request, settings()))
 
     assert result.status == "completed"
-    assert hermes.payloads[0]["payload"]["target_url"] == PREVIEW_URL
+    assert hermes.payloads[0]["payload"]["targetUrl"] == PREVIEW_URL
