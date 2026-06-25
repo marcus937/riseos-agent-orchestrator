@@ -323,7 +323,7 @@ async def orchestrator_snapshot(
 
 @app.get("/debug/repositories")
 async def debug_repositories(_: None = Depends(_require_debug_read_access)) -> dict[str, object]:
-    return {"repositories": repository_diagnostics(_repository_registry()), "last_discovery_error": getattr(app.state, "last_discovery_error", None)}
+    return {"repositories": repository_diagnostics(_repository_registry()), "last_discovery_error": getattr(app.state, "last_repository_discovery_error", None)}
 
 
 @app.post("/debug/repositories/discover", response_model=RepositoryDiscoveryResult)
