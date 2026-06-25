@@ -158,7 +158,7 @@ async def resolve_vercel_readiness(
         return VercelReadiness.READY, payload_preview_url, "webhook_payload_preview_url", None
 
     if github_client is None or not parsed.repository or not parsed.head_sha:
-        return VercelReadiness.TIMEOUT, None, "vercel_timeout", "No Vercel preview deployment metadata was available before timeout."
+        return VercelReadiness.TIMEOUT, None, "vercel_preview_pending", "Waiting for verified Vercel preview deployment readiness."
 
     statuses: list[dict[str, Any]] = []
     checks: list[dict[str, Any]] = []
@@ -181,7 +181,7 @@ async def resolve_vercel_readiness(
     if any(_github_item_failed(item) for item in [*statuses, *checks] if _looks_like_vercel_item(item)):
         return VercelReadiness.FAILED, None, "vercel_failed", "Vercel preview deployment failed."
 
-    return VercelReadiness.TIMEOUT, None, "vercel_timeout", "Timed out waiting for Vercel preview deployment readiness."
+    return VercelReadiness.TIMEOUT, None, "vercel_preview_pending", "Waiting for verified Vercel preview deployment readiness."
 
 
 class AgentBusRuntimeValidationStore(RuntimeValidationStore):
@@ -196,6 +196,21 @@ class AgentBusRuntimeValidationStore(RuntimeValidationStore):
         self._github_client_factory = github_client_factory or _default_github_client
 
     async def trigger(self, request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationResult:
+        existing = _find_resumed_runtime_validation(self._items.values(), request)
+        if existing is not None:
+            log_event(
+                "WORKFLOW_ALREADY_RESUMED",
+                workflow_id=request.workflow_id,
+                repo=request.repo,
+                pr=request.pr_number,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                commit_sha=getattr(request, "commit_sha", None),
+                preview_url=request.target_url,
+                validation_id=existing.validation_id,
+            )
+            return existing
+
         profile = str(getattr(request, "validation_profile", None) or frontend_validation_profile_for_repo(request.repo).validation_profile or "frontend_playwright")
         commit_sha = getattr(request, "commit_sha", None)
         agent_bus_client = self._agent_bus_client_factory(settings) if settings.enable_agent_bus_dispatch else None
@@ -205,7 +220,21 @@ class AgentBusRuntimeValidationStore(RuntimeValidationStore):
                 request.work_item_id = await _ensure_agent_bus_work_item(agent_bus_client, request, settings, profile=profile, commit_sha=commit_sha)
                 await _record_agent_bus_state(agent_bus_client, request, RuntimeValidationState.REQUESTED, profile=profile, commit_sha=commit_sha)
 
-            if request.target_url is None and request.target_url_source in {"vercel_failed", "vercel_timeout", "vercel_preview_pending"}:
+            if request.target_url is None and request.target_url_source == "vercel_preview_pending":
+                log_event(
+                    "WAITING_FOR_DEPLOYMENT",
+                    workflow_id=request.workflow_id,
+                    correlation_id=request.correlation_id,
+                    repo=request.repo,
+                    pr=request.pr_number,
+                    pr_number=request.pr_number,
+                    branch=request.branch,
+                    commit_sha=commit_sha,
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+                return await super().trigger(request, settings)
+
+            if request.target_url is None and request.target_url_source in {"vercel_failed", "vercel_timeout"}:
                 result = _blocked_result_from_request(request, settings, profile=profile)
                 if agent_bus_client is not None:
                     await _record_agent_bus_state(
@@ -219,6 +248,30 @@ class AgentBusRuntimeValidationStore(RuntimeValidationStore):
                     )
                 await _write_github_runtime_outcome(github_client, request, result, commit_sha=commit_sha)
                 return result
+
+            if request.target_url:
+                log_event(
+                    "DEPLOYMENT_READY",
+                    workflow_id=request.workflow_id,
+                    repo=request.repo,
+                    pr=request.pr_number,
+                    pr_number=request.pr_number,
+                    branch=request.branch,
+                    commit_sha=commit_sha,
+                    preview_url=request.target_url,
+                    target_url=request.target_url,
+                    target_url_source=request.target_url_source,
+                )
+                log_event(
+                    "STARTING_HERMES",
+                    workflow_id=request.workflow_id,
+                    repo=request.repo,
+                    pr=request.pr_number,
+                    pr_number=request.pr_number,
+                    branch=request.branch,
+                    commit_sha=commit_sha,
+                    preview_url=request.target_url,
+                )
 
             if agent_bus_client is not None:
                 await _record_agent_bus_state(agent_bus_client, request, RuntimeValidationState.RUNNING, profile=profile, commit_sha=commit_sha)
@@ -527,6 +580,23 @@ def _workflow_id(parsed: ParsedGitHubEvent) -> str:
 
 def _workflow_correlation_id(parsed: ParsedGitHubEvent) -> str:
     return _workflow_id(parsed)
+
+
+def _find_resumed_runtime_validation(results: Any, request: RuntimeValidationRequest) -> RuntimeValidationResult | None:
+    if not request.target_url:
+        return None
+    for result in results:
+        if result.repo != request.repo:
+            continue
+        if result.workflow_id and request.workflow_id and result.workflow_id != request.workflow_id:
+            continue
+        if result.pr_number is not None and request.pr_number is not None and result.pr_number != request.pr_number:
+            continue
+        if result.branch and request.branch and result.branch != request.branch:
+            continue
+        if result.hermes.target_url == request.target_url and result.status in {"pending", "completed", "failed", "blocked"}:
+            return result
+    return None
 
 
 def _console_summary(evidence: RuntimeValidationEvidenceSummary | None) -> dict[str, Any]:

@@ -209,7 +209,7 @@ def test_frontend_pr_vercel_ready_dispatches_hermes_and_records_agent_bus_sequen
     ]
 
 
-def test_payload_preview_url_without_verified_vercel_status_blocks_hermes_dispatch() -> None:
+def test_missing_verified_vercel_status_waits_without_hermes_dispatch() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     agent_bus = FakeAgentBusClient()
     github = FakeGitHubClient(statuses=[])
@@ -219,9 +219,10 @@ def test_payload_preview_url_without_verified_vercel_status_blocks_hermes_dispat
 
     result = run(store.trigger(request, settings()))
 
-    assert result.status == "blocked"
+    assert result.status == "pending"
+    assert result.hermes.status == "SKIPPED"
     assert hermes.payloads == []
-    assert agent_bus.states[-1]["state"] == RuntimeValidationState.BLOCKED.value
+    assert [state["state"] for state in agent_bus.states] == [RuntimeValidationState.REQUESTED.value]
 
 
 def test_frontend_pr_vercel_failed_records_blocked_without_hermes_dispatch() -> None:
@@ -286,15 +287,15 @@ def test_documentation_only_work_skips_hermes() -> None:
     assert runtime_validation_required_for_parsed(parsed, settings(), has_review_context=False) is False
 
 
-def test_vercel_timeout_records_blocked() -> None:
+def test_vercel_pending_records_wait_state() -> None:
     parsed = parse_github_event("pull_request", pr_payload(preview_url=None))
     github = FakeGitHubClient(statuses=[])
     readiness, target_url, source, reason = run(resolve_vercel_readiness(parsed, github))
 
     assert readiness == VercelReadiness.TIMEOUT
     assert target_url is None
-    assert source == "vercel_timeout"
-    assert "Timed out" in reason
+    assert source == "vercel_preview_pending"
+    assert "Waiting for verified Vercel preview" in reason
 
 
 def test_runtime_validation_visible_through_result_review_dispatch() -> None:

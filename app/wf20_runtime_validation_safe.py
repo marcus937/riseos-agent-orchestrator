@@ -196,7 +196,7 @@ async def resolve_verified_vercel_readiness(
     decision = _decide_from_candidates(
         parsed,
         candidates,
-        fallback_reason="Timed out waiting for verified Vercel preview deployment readiness.",
+        fallback_reason="Waiting for verified Vercel preview deployment readiness.",
     )
     _log_final_decision(parsed, decision, candidates)
     return decision
@@ -267,7 +267,7 @@ def _decide_from_candidates(
             return VercelReadiness.READY, str(candidate["preview_url"]), f"github_verified_{candidate['source']}_preview_url", None
     if any(candidate.get("failed") for candidate in candidates):
         return VercelReadiness.FAILED, None, "vercel_failed", "Vercel preview deployment failed."
-    return VercelReadiness.TIMEOUT, None, "vercel_timeout", fallback_reason
+    return VercelReadiness.TIMEOUT, None, "vercel_preview_pending", fallback_reason
 
 
 def _log_candidate_decision(parsed: ParsedGitHubEvent, candidate: dict[str, Any]) -> None:
@@ -276,6 +276,7 @@ def _log_candidate_decision(parsed: ParsedGitHubEvent, candidate: dict[str, Any]
         **_decision_context(parsed),
         workflow_id=_workflow_id(parsed),
         source=candidate.get("source"),
+        source_type=candidate.get("source"),
         deployment_id=candidate.get("deployment_id"),
         deployment_status_id=candidate.get("deployment_status_id"),
         environment=candidate.get("environment"),
@@ -313,9 +314,13 @@ def _decision_context(parsed: ParsedGitHubEvent) -> dict[str, Any]:
     return {
         "repository": parsed.repository,
         "repo": parsed.repository,
+        "repo_full_name": parsed.repository,
         "pr_number": parsed.pull_request_number,
+        "pr": parsed.pull_request_number,
         "branch": parsed.head_ref,
+        "ref": parsed.head_ref or parsed.ref,
         "head_sha": parsed.head_sha,
+        "expected_head_sha": parsed.head_sha,
         "commit_sha": parsed.head_sha,
     }
 
