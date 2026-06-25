@@ -102,6 +102,7 @@ class AgentTaskSubmissionResponse(BaseModel):
 
 
 app = FastAPI(title="RiseOS Agent Orchestrator", version="0.1.0")
+app.state.runtime_validation_store = runtime_validation_store
 register_workflow_routes(app)
 register_circuit_runtime_validation_routes(app)
 
