@@ -209,7 +209,7 @@ def test_frontend_pr_vercel_ready_dispatches_hermes_and_records_agent_bus_sequen
     ]
 
 
-def test_payload_preview_url_without_verified_vercel_status_blocks_hermes_dispatch() -> None:
+def test_payload_preview_url_without_verified_vercel_status_waits_for_deployment_resume() -> None:
     parsed = parse_github_event("pull_request", pr_payload())
     agent_bus = FakeAgentBusClient()
     github = FakeGitHubClient(statuses=[])
@@ -219,9 +219,11 @@ def test_payload_preview_url_without_verified_vercel_status_blocks_hermes_dispat
 
     result = run(store.trigger(request, settings()))
 
-    assert result.status == "blocked"
+    assert result.status == "pending"
+    assert result.bb2.review_status == "pending"
+    assert result.hermes.status == "SKIPPED"
     assert hermes.payloads == []
-    assert agent_bus.states[-1]["state"] == RuntimeValidationState.BLOCKED.value
+    assert agent_bus.states == []
 
 
 def test_frontend_pr_vercel_failed_records_blocked_without_hermes_dispatch() -> None:
