@@ -144,6 +144,7 @@ def test_runtime_validation_handoff_uses_canonical_store_and_calls_hermes_http(m
     assert fake_http.posts
     assert fake_http.posts[0]["url"] == "https://hermes.example.test/api/v1/jobs"
     assert fake_http.posts[0]["json"]["payload"]["targetUrl"] == "https://jarvis-mission-control-gules.vercel.app"
+    assert fake_http.posts[0]["json"]["payload"]["commitSha"] == "abc123def456"
 
     events = _log_events(caplog)
     event_names = {event.get("event") for event in events}
