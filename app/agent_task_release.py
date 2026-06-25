@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any, Protocol
 
-from app.agent_task_dispatch import AgentTaskDependencyBlocked, dispatch_agent_task_to_agent_bus
+from app.agent_task_dispatch import AgentTaskDependencyBlocked, dispatch_agent_task_to_agent_bus, evaluate_agent_task_dependencies
 from app.agent_tasks import (
     AgentTask,
     AgentTaskStatus,
@@ -47,22 +47,26 @@ async def release_runnable_agent_tasks(
             continue
         if not _is_runnable(task):
             continue
-        if settings is not None:
-            decision = await schedule_engineering_workforce(task, settings, signal_client=client)
-            if decision.applied:
-                apply_scheduler_decision(task, decision)
-                append_lifecycle_event(
-                    task,
-                    "engineering_workforce_scheduled",
-                    metadata=decision.metadata(),
-                )
-                store.save_agent_task(task)
         try:
+            dependency_state = await evaluate_agent_task_dependencies(task, dependency_client)
+            if not dependency_state.dependencies_satisfied:
+                raise AgentTaskDependencyBlocked(dependency_state)
+            if settings is not None:
+                decision = await schedule_engineering_workforce(task, settings, signal_client=client)
+                if decision.applied:
+                    apply_scheduler_decision(task, decision)
+                    append_lifecycle_event(
+                        task,
+                        "engineering_workforce_scheduled",
+                        metadata=decision.metadata(),
+                    )
+                    store.save_agent_task(task)
             work_item_id = await dispatch_agent_task_to_agent_bus(
                 task,
                 client,
                 review_agent=review_agent,
                 dependency_client=dependency_client,
+                dependency_state=dependency_state,
             )
         except AgentTaskDependencyBlocked as exc:
             task.agent_bus_dispatch_error = str(exc)
