@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 
 import app.circuit_runtime_validation as runtime_module
+from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.review_queue import ReviewWorkItemStatus, review_queue
@@ -130,6 +131,54 @@ def pull_request_record(*, branch: str = "codex-m2/happy-path", sha: str = "abc1
         },
         "labels": [],
     }
+
+
+def waiting_request() -> RuntimeValidationRequest:
+    request = RuntimeValidationRequest(
+        repo="marcus937/jarvis-mission-control",
+        pr_number=137,
+        branch="codex-m2/happy-path",
+        base_branch="agent-integration",
+        target_url=None,
+        target_url_source="vercel_preview_pending",
+        target_url_pending_reason="Timed out waiting for verified Vercel preview deployment readiness.",
+        validation_type="playwright",
+        requested_by="orchestrator_wf20",
+        correlation_id="wf21-correlation",
+        workflow_id="wf20-marcus937-jarvis-mission-control-pr-137-abc123def456",
+        work_item_id="work-item-137",
+    )
+    object.__setattr__(request, "commit_sha", "abc123def4567890")
+    return request
+
+
+def ready_request() -> RuntimeValidationRequest:
+    target_url = "https://jarvis-mission-control-git-codex-m2-happy-path-marcus937.vercel.app"
+    request = waiting_request().model_copy(
+        update={
+            "target_url": target_url,
+            "target_url_source": "github_verified_deployment_status_preview_url",
+            "target_url_pending_reason": None,
+        }
+    )
+    object.__setattr__(request, "commit_sha", "abc123def4567890")
+    return request
+
+
+def test_waiting_deployment_request_resumes_with_ready_url_once(monkeypatch: Any) -> None:
+    monkeypatch.setattr(runtime_module, "_dns_resolution_blocker", lambda host: None)
+    hermes = FakeHermesClient()
+    store = AgentBusRuntimeValidationStore(hermes_client_factory=lambda: hermes)
+
+    waiting = run(store.trigger(waiting_request(), settings()))
+    first_ready = run(store.trigger(ready_request(), settings()))
+    duplicate_ready = run(store.trigger(ready_request(), settings()))
+
+    assert waiting.status == "pending"
+    assert first_ready.status == "completed"
+    assert duplicate_ready.validation_id == first_ready.validation_id
+    assert len(hermes.posts) == 1
+    assert hermes.posts[0]["targetUrl"] == ready_request().target_url
 
 
 def test_duplicate_ready_deployment_status_does_not_launch_hermes_twice(monkeypatch: Any) -> None:
