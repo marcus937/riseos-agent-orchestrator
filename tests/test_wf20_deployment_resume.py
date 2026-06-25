@@ -1,12 +1,11 @@
 import asyncio
 from typing import Any
 
-from app.clients.agent_bus import AgentBusClient
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
 from app.review_queue import ReviewWorkItemStatus, review_queue
-from app.runtime_validation_review_bridge import create_runtime_validation_pending_item, enqueue_review_from_runtime_validation
+from app.runtime_validation_review_bridge import create_runtime_validation_pending_item, enqueue_review_from_runtime_validation, enqueue_runtime_pending_item
 from app.wf20_deployment_resume import (
     claim_waiting_workflow_for_request,
     is_ready_deployment_request,
@@ -185,7 +184,7 @@ def create_waiting_item() -> tuple[Any, Any]:
     review_queue.reset()
     parsed = parse_github_event("pull_request", pr_payload())
     request = run(runtime_validation_request_from_parsed(parsed, settings(), github_client=FakeGitHubClient(statuses=[])))
-    item = create_runtime_validation_pending_item(parsed)
+    item = enqueue_runtime_pending_item(create_runtime_validation_pending_item(parsed))
     item = persist_waiting_for_deployment(request, item)
     return request, item
 
