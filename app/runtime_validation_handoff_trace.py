@@ -33,6 +33,7 @@ def install_runtime_validation_handoff_trace() -> None:
 
 def _patch_runtime_validation_store(runtime_module: Any) -> None:
     original_trigger = runtime_module.RuntimeValidationStore.trigger
+    original_build_runtime_payload = getattr(runtime_module, "_build_runtime_payload", None)
 
     @wraps(original_trigger)
     async def traced_trigger(self: Any, request: Any, settings: Any) -> Any:
@@ -87,6 +88,22 @@ def _patch_runtime_validation_store(runtime_module: Any) -> None:
 
     runtime_module.RuntimeValidationStore.trigger = traced_trigger
 
+    if callable(original_build_runtime_payload):
+        @wraps(original_build_runtime_payload)
+        def traced_build_runtime_payload(request: Any, target_url: str, correlation_id: str, settings: Any, *, target_source: str) -> dict[str, Any]:
+            payload = original_build_runtime_payload(request, target_url, correlation_id, settings, target_source=target_source)
+            commit_sha = _request_fields(request).get("commit_sha")
+            if commit_sha:
+                payload["commitSha"] = commit_sha
+                payload["commit_sha"] = commit_sha
+                nested = payload.get("payload")
+                if isinstance(nested, dict):
+                    nested["commitSha"] = commit_sha
+                    nested["commit_sha"] = commit_sha
+            return payload
+
+        runtime_module._build_runtime_payload = traced_build_runtime_payload
+
 
 def _patch_agent_bus_runtime_validation_store(wf20_module: Any) -> None:
     original_trigger = wf20_module.AgentBusRuntimeValidationStore.trigger
@@ -127,19 +144,23 @@ def _patch_agent_bus_runtime_validation_store(wf20_module: Any) -> None:
         request = args[1] if len(args) > 1 else kwargs.get("request")
         state = args[2] if len(args) > 2 else kwargs.get("state")
         runtime_result = kwargs.get("runtime_result")
+        trace = _request_fields(request)
+        if runtime_result is not None:
+            trace["runtime_validation_id"] = getattr(runtime_result, "validation_id", None)
         log_event(
             "agent_bus_runtime_validation_write_started",
-            **_request_fields(request),
-            runtime_validation_id=getattr(runtime_result, "validation_id", None),
+            **trace,
             lookup_key="AgentBusClient.record_runtime_validation",
             runtime_state=getattr(state, "value", state),
             target_url=getattr(request, "target_url", None),
         )
         result = await original_record(*args, **kwargs)
+        completed_trace = _request_fields(request)
+        if runtime_result is not None:
+            completed_trace["runtime_validation_id"] = getattr(runtime_result, "validation_id", None)
         log_event(
             "agent_bus_runtime_validation_write_completed",
-            **_request_fields(request),
-            runtime_validation_id=getattr(runtime_result, "validation_id", None),
+            **completed_trace,
             lookup_key="AgentBusClient.record_runtime_validation",
             runtime_state=getattr(state, "value", state),
             lookup_result=_compact_mapping(result),
