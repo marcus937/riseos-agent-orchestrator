@@ -7,6 +7,7 @@ from uuid import uuid4
 from app.circuit_runtime_validation import RuntimeValidationResult, stable_validation_digest
 from app.config import Settings
 from app.github_events import GitHubEventType, ParsedGitHubEvent
+from app.operational_logging import log_event
 from app.review_queue import (
     ReviewLifecycleStage,
     ReviewWorkItem,
@@ -68,6 +69,22 @@ def enqueue_review_from_runtime_validation(
     record_lifecycle_stage(item, ReviewLifecycleStage.BB2_REVIEW_REQUESTED_FROM_RUNTIME_VALIDATION)
     result.bb2.packet_created = True
     result.bb2.review_requested = True
+    log_event(
+        "runtime_validation_context_attached_to_review_item",
+        work_item_id=item.id,
+        agent_bus_work_item_id=result.work_item_id,
+        workflow_id=result.workflow_id,
+        runtime_validation_id=result.validation_id,
+        evidence_packet_id=result.evidence_id,
+        repository=result.repo,
+        pr_number=result.pr_number,
+        branch=result.branch,
+        commit_sha=_commit_sha_from_result(result),
+        target_url=result.hermes.target_url,
+        hermes_job_id=result.hermes.job_id,
+        terminal_status=result.status,
+        gate_lookup_key=_gate_lookup_key(result),
+    )
 
     if storage is not None:
         storage.save_review_work_item(item)
@@ -90,10 +107,16 @@ def runtime_validation_context_from_result(result: RuntimeValidationResult) -> d
         "pr_number": result.pr_number,
         "branch": result.branch,
         "base_branch": result.base_branch,
+        "work_item_id": result.work_item_id,
+        "agent_bus_work_item_id": result.work_item_id,
+        "evidence_id": result.evidence_id,
+        "evidence_packet_id": result.evidence_id,
+        "workflow_id": result.workflow_id,
         "correlation_id": result.correlation_id,
         "created_at": result.created_at.isoformat(),
         "completed_at": result.completed_at.isoformat() if result.completed_at else None,
         "error": result.error,
+        "hermes_job_id": result.hermes.job_id,
         "hermes_status": result.hermes.status,
         "target_url": result.hermes.target_url,
         "target_source": result.hermes.target_source,
@@ -103,6 +126,8 @@ def runtime_validation_context_from_result(result: RuntimeValidationResult) -> d
         "network_failures": result.evidence.network_failure_count,
         "network_non_2xx": result.evidence.network_non_2xx_count,
         "evidence_artifacts": result.evidence.artifacts,
+        "gate_lookup_key": _gate_lookup_key(result),
+        "review_dispatch": result.review_dispatch,
         "hermes": hermes,
         "evidence": evidence,
         "bb2_packet": bb2,
@@ -173,3 +198,24 @@ def _find_pending_runtime_result(result: RuntimeValidationResult, *, storage: An
         ):
             return item
     return None
+
+
+def _gate_lookup_key(result: RuntimeValidationResult) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in {
+            "work_item_id": result.work_item_id,
+            "workflow_id": result.workflow_id,
+            "repository": result.repo,
+            "pr_number": result.pr_number,
+            "branch": result.branch,
+            "commit_sha": _commit_sha_from_result(result),
+        }.items()
+        if value is not None
+    }
+
+
+def _commit_sha_from_result(result: RuntimeValidationResult) -> str | None:
+    review_dispatch = result.review_dispatch if isinstance(result.review_dispatch, dict) else {}
+    value = review_dispatch.get("commit_sha") or review_dispatch.get("commitSha")
+    return str(value) if value else None
