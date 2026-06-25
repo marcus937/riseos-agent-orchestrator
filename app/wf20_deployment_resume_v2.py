@@ -31,7 +31,11 @@ def install_event_driven_wf20_runtime_validation() -> None:
 
     async def trigger(self: Any, request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationResult:
         if is_waiting_for_deployment_request(request):
-            return _pending_waiting_result(request)
+            result = _pending_waiting_result(request)
+            items = getattr(self, "_items", None)
+            if isinstance(items, dict):
+                items[result.validation_id] = result
+            return result
         return await original_trigger(self, request, settings)
 
     AgentBusRuntimeValidationStore.trigger = trigger  # type: ignore[method-assign]
