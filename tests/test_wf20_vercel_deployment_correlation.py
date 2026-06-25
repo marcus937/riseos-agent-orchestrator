@@ -154,6 +154,7 @@ def test_deployment_status_webhook_routes_and_hydrates_pr_context() -> None:
     github.pulls = [pull_request_record()]
 
     assert parsed.event_type == GitHubEventType.PULL_REQUEST
+    assert parsed.action_label == "wf20_deployment_ready_resume"
     assert parsed.pull_request_number is None
     assert runtime_validation_required_for_parsed(parsed, Settings(enable_runtime_validation_review_bridge=True), has_review_context=False) is True
 
@@ -165,9 +166,10 @@ def test_deployment_status_webhook_routes_and_hydrates_pr_context() -> None:
     assert request.target_url == target_url
     assert request.target_url_source == "github_verified_webhook_payload_preview_url"
     assert request.workflow_id == "wf20-marcus937-jarvis-mission-control-pr-136-abc123def456"
+    assert getattr(request, "raw_github_event") == parsed.raw
 
 
-def test_runtime_validation_only_blocks_when_all_candidate_sources_lack_ready_preview() -> None:
+def test_runtime_validation_only_waits_when_all_candidate_sources_lack_ready_preview() -> None:
     parsed = parse_github_event("pull_request", pull_request_payload())
     github = FakeGitHubClient()
     github.statuses = [{"context": "Vercel", "state": "pending", "target_url": "https://example.com"}]
@@ -178,5 +180,5 @@ def test_runtime_validation_only_blocks_when_all_candidate_sources_lack_ready_pr
 
     assert readiness == VercelReadiness.TIMEOUT
     assert resolved_url is None
-    assert target_source == "vercel_timeout"
+    assert target_source == "vercel_preview_pending"
     assert reason == "Timed out waiting for verified Vercel preview deployment readiness."

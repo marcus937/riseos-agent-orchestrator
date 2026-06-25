@@ -100,12 +100,14 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
         deployment = payload.get("deployment") or {}
         deployment_status = payload.get("deployment_status") or {}
         state = str(deployment_status.get("state") or payload.get("action") or "")
+        ready = state.lower() in {"success", "ready"}
         return ParsedGitHubEvent(
             **{
                 **base,
                 "event_type": GitHubEventType.PULL_REQUEST,
-                "action": "ready_for_review" if state.lower() in {"success", "ready"} else "synchronize",
+                "action": "ready_for_review" if ready else "synchronize",
             },
+            action_label="wf20_deployment_ready_resume" if ready else "wf20_deployment_status_noop",
             ref=deployment.get("ref"),
             head_ref=deployment.get("ref"),
             head_sha=deployment.get("sha"),
