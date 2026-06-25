@@ -134,9 +134,9 @@ def log_starting_hermes(
     )
 
 
-def log_hermes_not_launched(reason: str, request: RuntimeValidationRequest | None = None, **fields: Any) -> None:
+def log_hermes_not_launched(event: str, request: RuntimeValidationRequest | None = None, **fields: Any) -> None:
     log_event(
-        reason,
+        event,
         workflow_id=request.workflow_id if request else fields.pop("workflow_id", None),
         repository=request.repo if request else fields.pop("repository", None),
         branch=request.branch if request else fields.pop("branch", None),
