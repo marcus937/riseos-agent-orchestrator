@@ -209,6 +209,9 @@ def test_runtime_dependent_pr_is_pending_before_terminal_validation(monkeypatch)
         return _result("completed")
 
     monkeypatch.setattr("app.main.runtime_validation_store.trigger", fake_trigger)
+    app_state_store = getattr(app.state, "runtime_validation_store", None)
+    if app_state_store is not None:
+        monkeypatch.setattr(app_state_store, "trigger", fake_trigger)
     _post_pr(
         client,
         _runtime_pr_payload(
