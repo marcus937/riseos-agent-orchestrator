@@ -1,13 +1,15 @@
+import json
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.circuit_runtime_validation import runtime_validation_store
+from app.circuit_runtime_validation import runtime_validation_store as base_runtime_validation_store
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
-from app.main import app
+from app.main import app, runtime_validation_store as canonical_runtime_validation_store
+from app.wf20_runtime_validation import AgentBusRuntimeValidationStore
 
 
 class FakeRuntimeHermesClient:
@@ -67,10 +69,13 @@ def _client(monkeypatch) -> TestClient:
     monkeypatch.setenv("HERMES_M2_TOKEN", "hermes-secret")
     monkeypatch.setenv("HERMES_M2_ENABLE_DISPATCH", "true")
     monkeypatch.setenv("HERMES_DEFAULT_TARGET", "https://jarvis-mission-control-gules.vercel.app")
+    monkeypatch.delenv("ENABLE_AGENT_BUS_DISPATCH", raising=False)
     monkeypatch.setattr(
         "app.circuit_runtime_validation.socket.getaddrinfo",
         lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 443))],
     )
+    app.state.runtime_validation_store = canonical_runtime_validation_store
+    canonical_runtime_validation_store._items.clear()
     get_settings.cache_clear()
     return TestClient(app)
 
@@ -86,6 +91,16 @@ def _request(target_url: str = "https://jarvis-mission-control-gules.vercel.app"
     }
 
 
+def _log_events(caplog) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for record in caplog.records:
+        try:
+            events.append(json.loads(record.getMessage()))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
 def test_runtime_validation_routes_are_registered_explicitly_and_idempotently() -> None:
     route_count = len(app.routes)
     register_circuit_runtime_validation_routes(app)
@@ -98,6 +113,31 @@ def test_runtime_validation_routes_are_registered_explicitly_and_idempotently() 
     assert "/api/v1/runtime-validations/{validation_id}" in route_paths
     assert "/api/v1/runtime-validations/{validation_id}/evidence" in route_paths
     assert "/api/v1/runtime-validations/{validation_id}/bb2-packet" in route_paths
+
+
+def test_runtime_validation_route_uses_app_state_agent_bus_store_not_base_store(monkeypatch, caplog) -> None:
+    client = _client(monkeypatch)
+    assert app.state.runtime_validation_store is canonical_runtime_validation_store
+    assert isinstance(app.state.runtime_validation_store, AgentBusRuntimeValidationStore)
+
+    async def _base_store_must_not_be_used(*args: object, **kwargs: object) -> object:
+        raise AssertionError("/runtime-validations must not use the base module-level RuntimeValidationStore")
+
+    monkeypatch.setattr(base_runtime_validation_store, "trigger", _base_store_must_not_be_used)
+    caplog.set_level("INFO", logger="riseos_agent_orchestrator")
+
+    response = client.post(
+        "/api/v1/runtime-validations",
+        headers={"X-Orchestrator-Admin-Token": "admin-secret"},
+        json=_request("http://127.0.0.1:3000"),
+    )
+
+    assert response.status_code == 201
+    store_logs = [event for event in _log_events(caplog) if event.get("event") == "runtime_validation_store_selected"]
+    assert store_logs
+    assert store_logs[-1]["dispatch_path"] == "runtime_validation_route"
+    assert store_logs[-1]["store_class"] == "AgentBusRuntimeValidationStore"
+    assert store_logs[-1]["store_module"] == "app.wf20_runtime_validation"
 
 
 def test_runtime_validation_requires_admin_token(monkeypatch) -> None:
@@ -134,7 +174,7 @@ def test_runtime_validation_blocks_unsafe_target_and_can_be_retrieved(monkeypatc
         json=_request("http://127.0.0.1:3000"),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     payload = response.json()
     assert payload["status"] == "blocked"
     assert payload["bb2"]["review_status"] == "blocked"
@@ -169,7 +209,7 @@ def test_runtime_validation_blocks_credential_bearing_url(monkeypatch) -> None:
         json=_request("https://user:pass@jarvis-mission-control-gules.vercel.app"),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert response.json()["status"] == "blocked"
     assert "credentials" in response.json()["error"]
 
@@ -187,15 +227,15 @@ def test_runtime_validation_blocks_private_dns_resolution(monkeypatch) -> None:
         json=_request(),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert response.json()["status"] == "blocked"
     assert "private" in response.json()["error"]
 
 
-def test_runtime_validation_successful_mocked_hermes_dispatch_hydrates_evidence(monkeypatch) -> None:
+def test_frontend_runtime_validation_route_reaches_hermes_dispatch_with_verified_target(monkeypatch) -> None:
     client = _client(monkeypatch)
     fake = FakeRuntimeHermesClient()
-    monkeypatch.setattr(runtime_validation_store, "_hermes_client_factory", lambda: fake)
+    monkeypatch.setattr(canonical_runtime_validation_store, "_hermes_client_factory", lambda: fake)
 
     response = client.post(
         "/api/v1/runtime-validations",
@@ -203,7 +243,7 @@ def test_runtime_validation_successful_mocked_hermes_dispatch_hydrates_evidence(
         json=_request(),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["hermes"]["job_id"] == "job-circuit-123"
@@ -214,8 +254,11 @@ def test_runtime_validation_successful_mocked_hermes_dispatch_hydrates_evidence(
     assert payload["evidence"]["artifacts"][0]["sha256"] == "abc123"
     assert payload["bb2"]["packet_created"] is True
     assert payload["bb2"]["review_context"]["field_propagation_matrix"]["page_title"] is True
+    assert fake.jobs
     assert fake.jobs[0][0] == "https://hermes.example.test"
     assert fake.jobs[0][1] == "hermes-secret"
+    assert fake.jobs[0][2]["payload"]["repo"] == "marcus937/jarvis-mission-control"
+    assert fake.jobs[0][2]["payload"]["targetUrl"] == "https://jarvis-mission-control-gules.vercel.app"
     assert fake.closed is True
 
 

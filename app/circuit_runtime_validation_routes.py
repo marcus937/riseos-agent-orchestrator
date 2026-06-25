@@ -15,6 +15,7 @@ from app.circuit_runtime_validation import (
     runtime_validation_store,
 )
 from app.config import Settings, get_settings
+from app.operational_logging import log_event
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
@@ -54,7 +55,7 @@ def _require_runtime_admin_token(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid orchestrator admin token")
 
 
-@router.post("", response_model=RuntimeValidationResult)
+@router.post("", response_model=RuntimeValidationResult, status_code=status.HTTP_201_CREATED)
 async def create_runtime_validation(
     request: RuntimeValidationRequest,
     http_request: Request,
@@ -62,7 +63,9 @@ async def create_runtime_validation(
     settings: Settings = Depends(get_settings),
 ) -> RuntimeValidationResult:
     request = _request_with_default_base_branch(request, settings)
-    result = await runtime_validation_store.trigger(request, settings)
+    store = _runtime_validation_store(http_request)
+    _log_runtime_validation_store_selected(store, request, dispatch_path="runtime_validation_route")
+    result = await store.trigger(request, settings)
     enqueue_review_from_runtime_validation(
         result,
         settings,
@@ -74,9 +77,10 @@ async def create_runtime_validation(
 @router.get("/{validation_id}", response_model=RuntimeValidationResult)
 async def get_runtime_validation(
     validation_id: str,
+    http_request: Request,
     _: None = Depends(_require_runtime_admin_token),
 ) -> RuntimeValidationResult:
-    result = runtime_validation_store.get(validation_id)
+    result = _runtime_validation_store(http_request).get(validation_id)
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime validation not found")
     return result
@@ -85,9 +89,10 @@ async def get_runtime_validation(
 @router.get("/{validation_id}/evidence", response_model=RuntimeValidationEvidenceSummary)
 async def get_runtime_validation_evidence(
     validation_id: str,
+    http_request: Request,
     _: None = Depends(_require_runtime_admin_token),
 ) -> RuntimeValidationEvidenceSummary:
-    result = runtime_validation_store.get(validation_id)
+    result = _runtime_validation_store(http_request).get(validation_id)
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime validation not found")
     return result.evidence
@@ -96,9 +101,10 @@ async def get_runtime_validation_evidence(
 @router.get("/{validation_id}/bb2-packet", response_model=RuntimeValidationBB2Packet)
 async def get_runtime_validation_bb2_packet(
     validation_id: str,
+    http_request: Request,
     _: None = Depends(_require_runtime_admin_token),
 ) -> RuntimeValidationBB2Packet:
-    result = runtime_validation_store.get(validation_id)
+    result = _runtime_validation_store(http_request).get(validation_id)
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime validation not found")
     return result.bb2
@@ -114,6 +120,27 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
             setattr(route, "path", "")
     _add_route_path_markers(app)
     app.state.circuit_runtime_validation_routes_registered = True
+
+
+def _runtime_validation_store(request: Request) -> Any:
+    return getattr(request.app.state, "runtime_validation_store", runtime_validation_store)
+
+
+def _log_runtime_validation_store_selected(store: Any, request: RuntimeValidationRequest, *, dispatch_path: str) -> None:
+    log_event(
+        "runtime_validation_store_selected",
+        dispatch_path=dispatch_path,
+        store_class=store.__class__.__name__,
+        store_module=store.__class__.__module__,
+        repo=request.repo,
+        pr_number=request.pr_number,
+        branch=request.branch,
+        base_branch=request.base_branch,
+        work_item_id=request.work_item_id,
+        evidence_id=request.evidence_id,
+        workflow_id=request.workflow_id,
+        validation_type=request.validation_type,
+    )
 
 
 def _request_with_default_base_branch(request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationRequest:
