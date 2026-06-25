@@ -16,6 +16,7 @@ from app.agent_tasks import (
 )
 from app.circuit_agent_trigger import is_circuit_agent, wake_circuit_agent_for_work
 from app.config import Settings
+from app.engineering_workforce import apply_scheduler_decision, schedule_engineering_workforce
 
 
 logger = logging.getLogger("riseos_agent_orchestrator")
@@ -46,6 +47,16 @@ async def release_runnable_agent_tasks(
             continue
         if not _is_runnable(task):
             continue
+        if settings is not None:
+            decision = await schedule_engineering_workforce(task, settings, signal_client=client)
+            if decision.applied:
+                apply_scheduler_decision(task, decision)
+                append_lifecycle_event(
+                    task,
+                    "engineering_workforce_scheduled",
+                    metadata=decision.metadata(),
+                )
+                store.save_agent_task(task)
         try:
             work_item_id = await dispatch_agent_task_to_agent_bus(
                 task,

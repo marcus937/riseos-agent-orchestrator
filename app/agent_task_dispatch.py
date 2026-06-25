@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from app.agent_tasks import AgentTask
+from app.engineering_workforce import scheduler_metadata_from_task
 from app.task_dependencies import DependencyState, dependency_state_for_issue, parse_issue_dependencies
 
 
@@ -58,6 +59,7 @@ def build_agent_bus_work_item_payload(
         },
     }
     metadata.update(routing)
+    metadata.update(scheduler_metadata_from_task(task))
     payload: dict[str, Any] = {
         "title": task.title,
         "repository": task.repo_full_name,
