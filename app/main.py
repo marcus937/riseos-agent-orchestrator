@@ -19,9 +19,14 @@ from app.wf20_deployment_resume import (
 from app.wf20_resume_diagnostics import log_starting_hermes
 from app.wf20_runtime_validation import (
     AgentBusRuntimeValidationStore,
+    BACKEND_ONLY_LABELS,
+    DOCUMENTATION_ONLY_LABELS,
+    SUPPORTED_PR_ACTIONS,
     _install_agent_bus_runtime_methods,
     _install_github_status_method,
+    frontend_validation_profile_for_repo,
     runtime_validation_required_for_parsed,
+    runtime_validation_route_reason,
 )
 from app.wf20_runtime_validation_safe import runtime_validation_request_from_parsed
 
@@ -174,6 +179,56 @@ def _record_repository_event(parsed: ParsedGitHubEvent, *, work_item_created: bo
                 "last_work_item_generated_at": datetime.now(UTC) if work_item_created else record.last_work_item_generated_at,
             }
         )
+    )
+
+
+def _log_wf20_runtime_gate_decision(
+    parsed: ParsedGitHubEvent,
+    settings: Settings,
+    *,
+    has_review_context: bool,
+    runtime_gated: bool,
+    deployment_status_payload: bool,
+) -> None:
+    event_type = getattr(parsed.event_type, "value", str(parsed.event_type))
+    is_pull_request_event = event_type == "pull_request"
+    labels = list(parsed.labels or [])
+    normalized_labels = {label.lower() for label in labels}
+    documentation_only_or_backend_only = bool(normalized_labels & (DOCUMENTATION_ONLY_LABELS | BACKEND_ONLY_LABELS))
+    frontend_validation_profile = frontend_validation_profile_for_repo(parsed.repository, labels=labels)
+    validation_route_reason = runtime_validation_route_reason(parsed)
+    unsupported_action = is_pull_request_event and parsed.action not in SUPPORTED_PR_ACTIONS
+    repo_profile_missing = (
+        is_pull_request_event
+        and not unsupported_action
+        and not documentation_only_or_backend_only
+        and not frontend_validation_profile.requires_runtime_validation
+        and validation_route_reason is None
+    )
+    log_event(
+        "wf20_runtime_gate_decision",
+        event_type=event_type,
+        action=parsed.action,
+        repository=parsed.repository,
+        pull_request_number=parsed.pull_request_number,
+        head_sha=parsed.head_sha,
+        head_ref=parsed.head_ref,
+        base_ref=parsed.base_ref,
+        labels=labels,
+        has_review_context=has_review_context,
+        runtime_gated=runtime_gated,
+        deployment_status_payload=deployment_status_payload,
+        enable_runtime_validation_review_bridge=settings.enable_runtime_validation_review_bridge,
+        validation_route_reason=validation_route_reason,
+        frontend_validation_profile={
+            "requires_runtime_validation": frontend_validation_profile.requires_runtime_validation,
+            "validation_profile": frontend_validation_profile.validation_profile,
+        },
+        bridge_disabled=not settings.enable_runtime_validation_review_bridge,
+        not_pull_request_event=not is_pull_request_event,
+        unsupported_action=unsupported_action,
+        repo_profile_missing=repo_profile_missing,
+        documentation_only_or_backend_only=documentation_only_or_backend_only,
     )
 
 
@@ -588,6 +643,13 @@ async def github_webhook(
     has_review_context = workflow.review_context is not None
     runtime_gated = runtime_validation_required_for_parsed(parsed, settings, has_review_context=has_review_context)
     deployment_status_payload = is_wf20_deployment_status_payload(parsed)
+    _log_wf20_runtime_gate_decision(
+        parsed,
+        settings,
+        has_review_context=has_review_context,
+        runtime_gated=runtime_gated,
+        deployment_status_payload=deployment_status_payload,
+    )
     if runtime_gated and not deployment_status_payload:
         work_item = enqueue_runtime_pending_item(create_runtime_validation_pending_item(parsed), storage=storage, max_review_items=settings.orchestrator_max_review_items)
         log_queue_item_created(work_item)
