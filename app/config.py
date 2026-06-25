@@ -37,6 +37,9 @@ class Settings:
     agent_bus_timeout_seconds: int = 30
     agent_bus_owner_agent: str = "codex-m2"
     agent_bus_review_agent: str = "bb2"
+    enable_engineering_workforce_scheduler: bool = False
+    circuit_engineering_worker_enabled: bool = True
+    codex_m2_engineering_worker_enabled: bool = True
     circuit_agent_trigger_url: str | None = None
     circuit_agent_access_token: str | None = None
     slack_webhook_url: str | None = None
@@ -103,6 +106,9 @@ def get_settings() -> Settings:
         agent_bus_timeout_seconds=_int_env("AGENT_BUS_TIMEOUT_SECONDS", 30),
         agent_bus_owner_agent=os.getenv("AGENT_BUS_OWNER_AGENT", "codex-m2"),
         agent_bus_review_agent=os.getenv("AGENT_BUS_REVIEW_AGENT", "bb2"),
+        enable_engineering_workforce_scheduler=_bool_env("ENABLE_ENGINEERING_WORKFORCE_SCHEDULER"),
+        circuit_engineering_worker_enabled=os.getenv("CIRCUIT_ENGINEERING_WORKER_ENABLED", "true").lower() == "true",
+        codex_m2_engineering_worker_enabled=os.getenv("CODEX_M2_ENGINEERING_WORKER_ENABLED", "true").lower() == "true",
         circuit_agent_trigger_url=os.getenv("CIRCUIT_AGENT_TRIGGER_URL"),
         circuit_agent_access_token=os.getenv("CIRCUIT_AGENT_ACCESS_TOKEN"),
         slack_webhook_url=legacy_slack_webhook_url,
