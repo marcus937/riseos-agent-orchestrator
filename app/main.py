@@ -607,22 +607,82 @@ async def github_webhook(
 ) -> WebhookAcceptedResponse:
     body = await request.body()
     if not verify_github_signature(settings.github_webhook_secret, body, x_hub_signature_256):
+        log_event(
+            "github_webhook_early_exit",
+            reason="invalid_signature",
+            github_event=x_github_event,
+            github_delivery=x_github_delivery,
+            body_size=len(body),
+        )
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid GitHub webhook signature")
     if not x_github_event:
+        log_event(
+            "github_webhook_early_exit",
+            reason="missing_github_event_header",
+            github_delivery=x_github_delivery,
+            body_size=len(body),
+        )
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing GitHub event header")
     try:
         payload: dict[str, Any] = await request.json()
     except Exception as exc:
+        log_event(
+            "github_webhook_early_exit",
+            reason="invalid_json_payload",
+            github_event=x_github_event,
+            github_delivery=x_github_delivery,
+            body_size=len(body),
+        )
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+    log_event(
+        "github_webhook_before_parse_github_event",
+        github_event=x_github_event,
+        github_delivery=x_github_delivery,
+        body_size=len(body),
+        payload_action=payload.get("action"),
+    )
     try:
         parsed = parse_github_event(x_github_event, payload)
     except UnsupportedGitHubEventError as exc:
+        log_event(
+            "github_webhook_early_exit",
+            reason="unsupported_github_event",
+            github_event=x_github_event,
+            github_delivery=x_github_delivery,
+            body_size=len(body),
+            payload_action=payload.get("action"),
+            error=str(exc),
+        )
         event_store.record_rejected()
         raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail=str(exc)) from exc
+    log_event(
+        "github_webhook_after_parse_github_event",
+        github_event=x_github_event,
+        github_delivery=x_github_delivery,
+        event_type=getattr(parsed.event_type, "value", str(parsed.event_type)),
+        action=parsed.action,
+        repository=parsed.repository,
+        pull_request_number=parsed.pull_request_number,
+        head_sha=parsed.head_sha,
+        head_ref=parsed.head_ref,
+        base_ref=parsed.base_ref,
+    )
 
+    log_event(
+        "github_webhook_before_build_review_workflow",
+        github_event=x_github_event,
+        github_delivery=x_github_delivery,
+        event_type=getattr(parsed.event_type, "value", str(parsed.event_type)),
+        action=parsed.action,
+        repository=parsed.repository,
+        pull_request_number=parsed.pull_request_number,
+        head_sha=parsed.head_sha,
+        head_ref=parsed.head_ref,
+        base_ref=parsed.base_ref,
+    )
     workflow = build_review_workflow(parsed)
     storage = _storage()
     event_id = webhook_delivery_key(parsed, x_github_delivery)
@@ -631,16 +691,55 @@ async def github_webhook(
         if not storage.save_event_record(event_record):
             log_webhook_duplicate_suppressed(parsed, event_id=event_id)
             event_store.record_duplicate()
+            log_event(
+                "github_webhook_early_return",
+                reason="duplicate_event_storage",
+                event_id=event_id,
+                github_event=x_github_event,
+                github_delivery=x_github_delivery,
+                event_type=getattr(parsed.event_type, "value", str(parsed.event_type)),
+                action=parsed.action,
+                repository=parsed.repository,
+                pull_request_number=parsed.pull_request_number,
+                head_sha=parsed.head_sha,
+            )
             return _webhook_response(parsed, workflow)
     elif event_store.has_event_id(event_id):
         log_webhook_duplicate_suppressed(parsed, event_id=event_id)
         event_store.record_duplicate()
+        log_event(
+            "github_webhook_early_return",
+            reason="duplicate_event_memory",
+            event_id=event_id,
+            github_event=x_github_event,
+            github_delivery=x_github_delivery,
+            event_type=getattr(parsed.event_type, "value", str(parsed.event_type)),
+            action=parsed.action,
+            repository=parsed.repository,
+            pull_request_number=parsed.pull_request_number,
+            head_sha=parsed.head_sha,
+        )
         return _webhook_response(parsed, workflow)
     else:
         event_store.record_accepted(parsed, event_id=event_id)
 
     log_webhook_accepted(parsed)
     has_review_context = workflow.review_context is not None
+    log_event(
+        "github_webhook_before_runtime_validation_required",
+        github_event=x_github_event,
+        github_delivery=x_github_delivery,
+        event_id=event_id,
+        event_type=getattr(parsed.event_type, "value", str(parsed.event_type)),
+        action=parsed.action,
+        repository=parsed.repository,
+        pull_request_number=parsed.pull_request_number,
+        head_sha=parsed.head_sha,
+        head_ref=parsed.head_ref,
+        base_ref=parsed.base_ref,
+        has_review_context=has_review_context,
+        enable_runtime_validation_review_bridge=settings.enable_runtime_validation_review_bridge,
+    )
     runtime_gated = runtime_validation_required_for_parsed(parsed, settings, has_review_context=has_review_context)
     deployment_status_payload = is_wf20_deployment_status_payload(parsed)
     _log_wf20_runtime_gate_decision(
