@@ -163,7 +163,7 @@ def test_deployment_status_webhook_routes_and_hydrates_pr_context() -> None:
     assert request.branch == "codex-m2/fatal-react-crash"
     assert request.base_branch == "agent-integration"
     assert request.target_url == target_url
-    assert request.target_url_source == "webhook_payload_preview_url"
+    assert request.target_url_source == "github_verified_webhook_payload_preview_url"
     assert request.workflow_id == "wf20-marcus937-jarvis-mission-control-pr-136-abc123def456"
 
 
