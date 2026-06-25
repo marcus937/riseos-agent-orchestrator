@@ -82,8 +82,9 @@ async def dispatch_agent_task_to_agent_bus(
     *,
     review_agent: str = "bb2",
     dependency_client: AgentTaskDependencyClient | None = None,
+    dependency_state: DependencyState | None = None,
 ) -> str:
-    dependency_state = await evaluate_agent_task_dependencies(task, dependency_client)
+    dependency_state = dependency_state or await evaluate_agent_task_dependencies(task, dependency_client)
     if not dependency_state.dependencies_satisfied:
         raise AgentTaskDependencyBlocked(dependency_state)
     response = await client.create_work_item(build_agent_bus_work_item_payload(task, review_agent=review_agent, dependency_state=dependency_state))
@@ -107,5 +108,26 @@ async def evaluate_agent_task_dependencies(task: AgentTask, dependency_client: A
 def _routing_metadata(task: AgentTask) -> dict[str, Any]:
     evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
     routing = evidence.get("_routing") if isinstance(evidence.get("_routing"), dict) else {}
-    allowed = {"pr_strategy", "base_branch", "source_branch", "source_pr_number", "rework_of_task_id", "rework_attempt", "review_decision_id"}
+    allowed = {
+        "pr_strategy",
+        "base_branch",
+        "source_branch",
+        "source_pr_number",
+        "rework_of_task_id",
+        "rework_attempt",
+        "review_decision_id",
+        "target_agent_explicit",
+        "original_target_agent",
+        "canonical_target_agent",
+        "repo_profile",
+        "repository_profile",
+        "repo_type",
+        "project_type",
+        "allow_circuit_frontend",
+        "circuit_frontend_allowed",
+        "allow_frontend_for_circuit",
+        "preferred_agent",
+        "preferred_engineering_worker",
+        "scheduler_preferred_agent",
+    }
     return {key: value for key, value in routing.items() if key in allowed and value is not None}
