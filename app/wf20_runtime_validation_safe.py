@@ -7,7 +7,7 @@ from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.config import Settings
 from app.github_events import ParsedGitHubEvent
 from app.operational_logging import log_event
-from app.wf20_deployment_resume import install_event_driven_wf20_runtime_validation
+from app.wf20_deployment_resume_v2 import install_event_driven_wf20_runtime_validation
 from app.wf20_runtime_validation import (
     VALIDATION_TYPE,
     VercelReadiness,
