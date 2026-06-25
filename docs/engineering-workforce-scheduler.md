@@ -2,11 +2,13 @@
 
 ## Purpose
 
-The Engineering Workforce Scheduler is an optional Orchestrator layer for unresolved engineering tasks. It chooses between known coding workers without replacing the current explicit dispatch path:
+The Engineering Workforce Scheduler is an optional Orchestrator decision layer for unresolved engineering tasks. It chooses between known coding workers without replacing the current explicit dispatch path:
 
 ```text
-Workflow -> Orchestrator -> Agent Bus -> assigned coder -> evidence -> review
+Workflow -> dependency evaluation -> runnable task -> scheduler -> Agent Bus -> assigned coder -> evidence -> review
 ```
+
+The scheduler is deliberately small: it decides the worker only. It does not create Agent Bus work items, wake Circuit, or change review behavior.
 
 The first supported workers are:
 
@@ -19,42 +21,95 @@ Defaults preserve current behavior.
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `ENABLE_ENGINEERING_WORKFORCE_SCHEDULER` | `false` | Enables scheduler mode for generic engineering targets. |
+| `ENABLE_ENGINEERING_WORKFORCE_SCHEDULER` | `false` | Enables scheduler mode for generic or omitted engineering targets. |
 | `CIRCUIT_ENGINEERING_WORKER_ENABLED` | `true` | Allows Circuit Forge to be selected when scheduler mode is enabled. |
 | `CODEX_M2_ENGINEERING_WORKER_ENABLED` | `true` | Allows codex-m2 to be selected when scheduler mode is enabled. |
 
 When `ENABLE_ENGINEERING_WORKFORCE_SCHEDULER=false`, Orchestrator preserves the task `target_agent` and dispatches exactly as before.
 
-## Explicit Target Agent Compatibility
+## Backwards Compatibility Guarantees
 
-Explicit targets are never silently overridden.
+Explicit targets are not silently overridden.
 
-These values continue through the existing path unchanged:
+These explicit canonical targets continue through the existing direct dispatch path unchanged:
 
 - `target_agent: codex-m2`
-- `target_agent: codex`
 - `target_agent: circuit-forge`
-- `target_agent: circuit`
-- `target_agent: Circuit Forge`
 
-Scheduler mode is only considered for generic engineering targets:
+Known aliases are normalized to canonical worker IDs before downstream dispatch so Agent Bus does not receive mixed identities:
 
-- missing or blank target
+- `codex` -> `codex-m2`
+- `Codex` -> `codex-m2`
+- `circuit` -> `circuit-forge`
+- `Circuit Forge` -> `circuit-forge`
+
+The public workflow API remains backwards compatible. `WorkflowTask.target_agent` still defaults to `codex-m2`, but workflow creation records whether the author actually supplied that field:
+
+- `target_agent_explicit: true` means the author selected an agent.
+- `target_agent_explicit: false` means the author omitted the field and the scheduler may choose when enabled.
+
+Scheduler mode is only considered when the workflow author omitted `target_agent` or supplied one of these generic engineering targets:
+
+- blank target
 - `engineering`
 - `coding`
 - `engineer`
 - `auto-engineer`
+
+## Scheduling Timing
+
+The scheduler runs only after dependency resolution says a task is runnable.
+
+Blocked tasks do not receive:
+
+- scheduler decisions
+- scheduler metadata
+- Agent Bus work item dispatch
+
+This prevents queued dependency chains from consuming stale worker decisions before their predecessors complete.
+
+## Worker Availability States
+
+Worker availability has three production routing states plus disabled/unavailable handling:
+
+| State | Meaning | Routing behavior |
+| --- | --- | --- |
+| `available` | Worker health/queue signals indicate the worker can take work. | Candidate may be selected. |
+| `busy` | Worker is healthy but has active work or explicit busy status. | Scheduler may consider a safe fallback. |
+| `unknown` | Status lookup failed or could not be trusted. | Scheduler preserves the preferred worker and does not automatically reroute. |
+| `unavailable` | Worker is disabled, offline, blocked, or unhealthy. | Scheduler may consider a safe fallback. |
+
+`unknown` is intentionally different from `unavailable`. A transient Agent Bus status lookup failure must not move work from `codex-m2` to `circuit-forge` by accident.
 
 ## Routing Rules
 
 Initial routing is conservative:
 
 1. Prefer `codex-m2` when enabled, healthy, available, and not busy.
-2. Select `circuit-forge` when `codex-m2` is busy or unavailable and Circuit is enabled.
-3. Select `circuit-forge` when task metadata explicitly prefers Circuit.
-4. Treat Circuit as safe fallback for docs, backend, and general coding work.
-5. Do not route frontend-specific work to Circuit by default.
-6. Frontend work may route to Circuit only when task metadata or labels explicitly allow it.
+2. Preserve `codex-m2` when its status is `unknown` unless task metadata explicitly prefers another eligible worker.
+3. Select `circuit-forge` when `codex-m2` is busy or unavailable and the task is safe for Circuit.
+4. Select `circuit-forge` when task metadata explicitly prefers Circuit and Circuit is eligible.
+5. Treat Circuit as a safe fallback for backend, documentation, and general coding work.
+6. Do not route frontend-specific work to Circuit by default.
+7. Do not route frontend repositories to Circuit unless metadata or labels explicitly allow it.
+
+## Repository Guardrails
+
+Repository profile metadata is additive and backwards compatible. The scheduler looks for these keys in task execution evidence or routing metadata:
+
+- `repo_profile`
+- `repository_profile`
+- `repo_type`
+- `project_type`
+
+Current profile rules:
+
+| Profile | Preferred | Fallback |
+| --- | --- | --- |
+| frontend | `codex-m2` | none unless Circuit frontend is explicitly allowed |
+| backend | `codex-m2` | `circuit-forge` when codex is busy/unavailable |
+| docs/documentation | either worker | `circuit-forge` is allowed when codex is busy/unavailable |
+| general/unknown | `codex-m2` | `circuit-forge` when codex is busy/unavailable and no frontend signal exists |
 
 Frontend guardrail keywords include `frontend`, `front-end`, `ui`, `ux`, `react`, `next.js`, `browser`, `css`, `tailwind`, and `playwright`.
 
@@ -76,11 +131,11 @@ Circuit frontend allow markers include:
 - `GET /agents/{agent_id}/status`
 - `GET /agents/{agent_id}/queue`
 
-If no status or queue methods are available, the scheduler assumes codex-m2 is available to preserve the historical codex-first behavior.
+If no status or queue methods are available, the scheduler assumes codex-m2 is available to preserve the historical codex-first behavior. If a status lookup is attempted and fails, codex-m2 is marked `unknown` and remains preferred.
 
 ### circuit-forge
 
-Circuit Forge is effectively available once triggered, but it does not yet publish a true production heartbeat. The scheduler treats Circuit as available by default unless `CIRCUIT_ENGINEERING_WORKER_ENABLED=false`.
+Circuit Forge is effectively available once triggered, but it does not yet publish a true production heartbeat. The scheduler treats Circuit as available by default unless `CIRCUIT_ENGINEERING_WORKER_ENABLED=false`, subject to repository and frontend guardrails.
 
 ## Scheduler Metadata
 
@@ -91,14 +146,17 @@ When scheduler mode selects a worker, Orchestrator records non-invasive metadata
 - `scheduler_candidates`
 - `scheduler_mode: true`
 - `original_target_agent`
+- `target_agent_explicit`
 
-This metadata is additive and does not change the public workflow response contract.
+The candidate snapshot includes each worker's canonical ID, availability state, busy flag, disabled flag, eligibility, reason, and capabilities.
 
 ## Logs
 
 The scheduler emits `[WORKFORCE]` logs for:
 
-- scheduler disabled and explicit target preservation
+- scheduler disabled and target preservation
+- explicit target preservation
+- alias canonicalization
 - task evaluation
 - candidate availability
 - selected worker and selection reason
