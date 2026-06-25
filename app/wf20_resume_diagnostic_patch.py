@@ -40,7 +40,7 @@ def install_wf20_resume_diagnostic_patch() -> None:
                 target_url_source=target_source,
                 runtime_validation_id=_runtime_validation_id(request),
             )
-        elif request.target_url:
+        elif request.target_url and not getattr(AgentBusRuntimeValidationStore, "_wf20_event_driven_installed", False):
             log_starting_hermes(request, runtime_validation_id=_runtime_validation_id(request))
 
         return await original_trigger(self, request, settings)
