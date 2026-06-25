@@ -7,6 +7,7 @@ from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.config import Settings
 from app.github_events import ParsedGitHubEvent
 from app.operational_logging import log_event
+from app.wf20_deployment_resume import install_event_driven_wf20_runtime_validation
 from app.wf20_runtime_validation import (
     VALIDATION_TYPE,
     VercelReadiness,
@@ -21,6 +22,8 @@ from app.wf20_runtime_validation import (
 READY_DEPLOYMENT_STATES = {"success", "ready"}
 FAILED_DEPLOYMENT_STATES = {"error", "failure", "failed", "inactive"}
 PENDING_DEPLOYMENT_STATES = {"pending", "queued", "in_progress", "building"}
+
+install_event_driven_wf20_runtime_validation()
 
 
 def install_safe_wf20_request_builder() -> None:
@@ -53,6 +56,7 @@ async def runtime_validation_request_from_parsed(
     object.__setattr__(request, "validation_profile", profile.validation_profile)
     object.__setattr__(request, "commit_sha", parsed.head_sha)
     object.__setattr__(request, "vercel_readiness", readiness.value)
+    object.__setattr__(request, "raw_github_event", parsed.raw)
     return request
 
 
@@ -267,7 +271,7 @@ def _decide_from_candidates(
             return VercelReadiness.READY, str(candidate["preview_url"]), f"github_verified_{candidate['source']}_preview_url", None
     if any(candidate.get("failed") for candidate in candidates):
         return VercelReadiness.FAILED, None, "vercel_failed", "Vercel preview deployment failed."
-    return VercelReadiness.TIMEOUT, None, "vercel_timeout", fallback_reason
+    return VercelReadiness.TIMEOUT, None, "vercel_preview_pending", fallback_reason
 
 
 def _log_candidate_decision(parsed: ParsedGitHubEvent, candidate: dict[str, Any]) -> None:
