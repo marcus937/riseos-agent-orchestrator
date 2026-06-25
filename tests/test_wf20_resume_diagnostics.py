@@ -153,3 +153,20 @@ def test_no_match_path_emits_terminal_reason(monkeypatch: Any) -> None:
     assert events[0]["event"] == "NO_MATCHING_WAITING_WORKFLOW"
     assert events[0]["workflow_id"] == "wf20-marcus937-jarvis-mission-control-pr-149-abc123"
     assert events[0]["reason"] == "No waiting workflow matched."
+
+
+def test_terminal_log_accepts_reason_field_without_duplicate_binding(monkeypatch: Any) -> None:
+    events = capture(monkeypatch)
+
+    diagnostics.log_hermes_not_launched(
+        diagnostics.TERMINAL_NO_VERIFIED_PREVIEW,
+        request(),
+        reason="Timed out waiting for verified Vercel preview deployment readiness.",
+        target_url_source="vercel_timeout",
+        runtime_validation_id="rv-1",
+    )
+
+    assert events[0]["event"] == "NO_VERIFIED_PREVIEW"
+    assert events[0]["reason"] == "Timed out waiting for verified Vercel preview deployment readiness."
+    assert events[0]["target_url_source"] == "vercel_timeout"
+    assert events[0]["runtime_validation_id"] == "rv-1"
