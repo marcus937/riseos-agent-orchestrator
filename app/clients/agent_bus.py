@@ -70,6 +70,26 @@ class AgentBusClient:
         )
         return _object_response(response, "GET", path)
 
+    async def get_agent_status(self, agent_id: str) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        path = f"/agents/{quote(agent_id, safe='')}/status"
+        response = await self._client.get(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+        )
+        return _object_response(response, "GET", path)
+
+    async def get_agent_queue(self, agent_id: str) -> list[dict[str, Any]]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        path = f"/agents/{quote(agent_id, safe='')}/queue"
+        response = await self._client.get(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+        )
+        return _list_response(response, "GET", path)
+
     @property
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -97,6 +117,20 @@ def _object_response(response: httpx.Response, method: str, path: str) -> dict[s
         raise AgentBusAPIError(method, path, response.status_code, "Malformed JSON response.") from exc
     if not isinstance(data, dict):
         raise AgentBusAPIError(method, path, response.status_code, "Expected object response.")
+    return data
+
+
+def _list_response(response: httpx.Response, method: str, path: str) -> list[dict[str, Any]]:
+    if response.status_code < 200 or response.status_code >= 300:
+        raise AgentBusAPIError(method, path, response.status_code, _response_detail(response))
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise AgentBusAPIError(method, path, response.status_code, "Malformed JSON response.") from exc
+    if not isinstance(data, list):
+        raise AgentBusAPIError(method, path, response.status_code, "Expected list response.")
+    if not all(isinstance(item, dict) for item in data):
+        raise AgentBusAPIError(method, path, response.status_code, "Expected list of object responses.")
     return data
 
 
