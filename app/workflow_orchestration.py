@@ -20,6 +20,7 @@ from app.agent_tasks import (
     create_agent_task,
     refresh_agent_task_dependency_states,
 )
+from app.engineering_workforce import CIRCUIT_FORGE, CODEX_M2, normalize_engineering_agent
 
 
 class WorkflowStatus(StrEnum):
@@ -258,6 +259,7 @@ def create_workflow(request: WorkflowCreateRequest, *, workflow_store: WorkflowS
 
     created_tasks: dict[str, AgentTask] = {}
     for workflow_task in request.tasks:
+        target_agent, target_metadata = _workflow_target_agent_metadata(workflow_task)
         agent_task = create_agent_task(
             AgentTaskCreateRequest(
                 repo_full_name=workflow_task.repo_full_name or request.repo_full_name,
@@ -268,14 +270,14 @@ def create_workflow(request: WorkflowCreateRequest, *, workflow_store: WorkflowS
                 labels=workflow_task.labels,
                 instructions=workflow_task.instructions,
                 acceptance_criteria=workflow_task.acceptance_criteria,
-                target_agent=workflow_task.target_agent,
+                target_agent=target_agent,
                 priority=workflow_task.priority,
                 correlation_id=workflow.workflow_id,
                 dependency_task_ids=[],
             )
         )
         agent_task.source = "workflow_api"
-        agent_task.execution_evidence = {"_routing": _workflow_routing(workflow)}
+        agent_task.execution_evidence = {"_routing": _workflow_routing(workflow) | target_metadata}
         created_tasks[workflow_task.task_key] = agent_task
         workflow.task_key_to_task_id[workflow_task.task_key] = agent_task.task_id
         workflow.task_dependencies[workflow_task.task_key] = _unique_keys(workflow_task.depends_on)
@@ -348,8 +350,10 @@ def update_shared_workflow_routing_after_result(workflow: StoredWorkflow, agent_
     for task in workflow_tasks:
         if task.status != AgentTaskStatus.QUEUED:
             continue
-        routing = _workflow_routing(workflow) | {"source_pr_number": pr_number}
-        task.execution_evidence = {**task.execution_evidence, "_routing": routing}
+        evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+        existing_routing = evidence.get("_routing") if isinstance(evidence.get("_routing"), dict) else {}
+        routing = {**existing_routing, **_workflow_routing(workflow), "source_pr_number": pr_number}
+        task.execution_evidence = {**evidence, "_routing": routing}
         agent_task_store.save_agent_task(task)
 
 
@@ -441,6 +445,20 @@ def _workflow_routing(workflow: StoredWorkflow) -> dict[str, Any]:
     if workflow.shared_pr_number:
         routing["source_pr_number"] = workflow.shared_pr_number
     return routing
+
+
+def _workflow_target_agent_metadata(workflow_task: WorkflowTask) -> tuple[str, dict[str, Any]]:
+    target_agent_explicit = "target_agent" in workflow_task.model_fields_set
+    original_target_agent = workflow_task.target_agent
+    normalized_target_agent = normalize_engineering_agent(original_target_agent)
+    target_agent = normalized_target_agent if target_agent_explicit and normalized_target_agent in {CODEX_M2, CIRCUIT_FORGE} else original_target_agent
+    metadata: dict[str, Any] = {
+        "target_agent_explicit": target_agent_explicit,
+        "original_target_agent": original_target_agent,
+    }
+    if target_agent != original_target_agent:
+        metadata["canonical_target_agent"] = target_agent
+    return target_agent, metadata
 
 
 def _shared_branch_for_workflow(workflow_id: str) -> str:
