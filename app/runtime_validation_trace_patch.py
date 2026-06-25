@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import wraps
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from app.runtime_validation_trace import (
     REJECTION_MESSAGE,
@@ -74,7 +74,30 @@ def _patch_runtime_store(runtime_module: Any) -> None:
 
 
 def _patch_agent_bus_runtime_state(wf20_module: Any) -> None:
+    original_trigger = wf20_module.AgentBusRuntimeValidationStore.trigger
     original_record = wf20_module._record_agent_bus_state
+
+    @wraps(original_trigger)
+    async def traced_agent_bus_trigger(self: Any, request: Any, settings: Any) -> Any:
+        trace_runtime_validation_lookup(
+            "runtime_validation_creation",
+            **request_trace_fields(request),
+            lookup_key="POST /api/v1/runtime-validations -> AgentBusRuntimeValidationStore.trigger",
+            lookup_result="started",
+            missing_field=_missing_request_field(request),
+            validation_type=getattr(request, "validation_type", None),
+        )
+        result = await original_trigger(self, request, settings)
+        trace_runtime_validation_lookup(
+            "runtime_validation_creation_completed",
+            **result_trace_fields(result),
+            lookup_key="AgentBusRuntimeValidationStore.trigger result",
+            lookup_result=getattr(result, "status", None),
+            missing_field=_missing_result_field(result),
+            hermes_status=getattr(getattr(result, "hermes", None), "status", None),
+            bb2_review_status=getattr(getattr(result, "bb2", None), "review_status", None),
+        )
+        return result
 
     @wraps(original_record)
     async def traced_record_agent_bus_state(*args: Any, **kwargs: Any) -> Any:
@@ -112,6 +135,7 @@ def _patch_agent_bus_runtime_state(wf20_module: Any) -> None:
             )
         return result
 
+    wf20_module.AgentBusRuntimeValidationStore.trigger = traced_agent_bus_trigger
     wf20_module._record_agent_bus_state = traced_record_agent_bus_state
 
 
