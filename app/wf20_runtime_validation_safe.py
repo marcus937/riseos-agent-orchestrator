@@ -6,6 +6,7 @@ from app import hermes_contract as contract_module
 from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.config import Settings
 from app.github_events import ParsedGitHubEvent
+from app.operational_logging import log_event
 from app.wf20_runtime_validation import (
     VALIDATION_TYPE,
     VercelReadiness,
@@ -16,6 +17,10 @@ from app.wf20_runtime_validation import (
     _workflow_id,
     frontend_validation_profile_for_repo,
 )
+
+READY_DEPLOYMENT_STATES = {"success", "ready"}
+FAILED_DEPLOYMENT_STATES = {"error", "failure", "failed", "inactive"}
+PENDING_DEPLOYMENT_STATES = {"pending", "queued", "in_progress", "building"}
 
 
 def install_safe_wf20_request_builder() -> None:
@@ -54,40 +59,235 @@ async def resolve_verified_vercel_readiness(
     parsed: ParsedGitHubEvent,
     github_client: Any | None,
 ) -> tuple[VercelReadiness, str | None, str, str | None]:
+    workflow_id = _workflow_id(parsed)
+    context = _decision_context(parsed)
     payload_preview_url = contract_module.preview_url_from_payload(parsed.raw)
-    if github_client is None or not parsed.repository or not parsed.head_sha:
-        return (
-            VercelReadiness.TIMEOUT,
-            None,
-            "vercel_timeout",
-            "No Vercel deployment status was available to verify preview readiness.",
+    candidates: list[dict[str, Any]] = []
+
+    log_event(
+        "vercel_preview_readiness_started",
+        **context,
+        workflow_id=workflow_id,
+        payload_preview_url=payload_preview_url,
+    )
+
+    if payload_preview_url:
+        candidates.append(
+            _candidate(
+                source="webhook_payload",
+                item=parsed.raw,
+                preview_url=payload_preview_url,
+                state=_payload_state(parsed.raw),
+                reason="Preview URL was present in the webhook payload.",
+            )
         )
 
-    statuses: list[dict[str, Any]] = []
-    checks: list[dict[str, Any]] = []
-    try:
-        raw_statuses = await github_client.list_commit_statuses(parsed.repository, parsed.head_sha)
-        statuses = raw_statuses if isinstance(raw_statuses, list) else []
-    except Exception:
-        statuses = []
-    try:
-        raw_checks = await github_client.list_check_runs_for_ref(parsed.repository, parsed.head_sha)
-        checks = raw_checks if isinstance(raw_checks, list) else []
-    except Exception:
-        checks = []
+    if github_client is None or not parsed.repository or not parsed.head_sha:
+        decision = _decide_from_candidates(parsed, candidates, fallback_reason="No Vercel deployment status was available to verify preview readiness.")
+        _log_final_decision(parsed, decision, candidates)
+        return decision
 
-    vercel_items = [item for item in [*statuses, *checks] if _looks_like_vercel_item(item)]
-    if any(_github_item_failed(item) for item in vercel_items):
-        return VercelReadiness.FAILED, None, "vercel_failed", "Vercel preview deployment failed."
+    statuses = await _safe_list(github_client, "list_commit_statuses", parsed.repository, parsed.head_sha)
+    checks = await _safe_list(github_client, "list_check_runs_for_ref", parsed.repository, parsed.head_sha)
+    deployments = await _safe_list(github_client, "list_deployments", parsed.repository, parsed.head_sha)
 
-    for item in vercel_items:
-        preview_url = contract_module.preview_url_from_payload(item) or payload_preview_url
-        if preview_url and _github_item_successful(item):
-            return VercelReadiness.READY, preview_url, "github_verified_vercel_preview_url", None
+    for item in statuses:
+        candidates.append(
+            _candidate(
+                source="commit_status",
+                item=item,
+                preview_url=contract_module.preview_url_from_payload(item) or payload_preview_url,
+                state=str(item.get("state") or ""),
+                reason="Commit status candidate for PR head SHA.",
+            )
+        )
+    for item in checks:
+        state = str(item.get("conclusion") or item.get("status") or "")
+        candidates.append(
+            _candidate(
+                source="check_run",
+                item=item,
+                preview_url=contract_module.preview_url_from_payload(item) or payload_preview_url,
+                state=state,
+                reason="Check-run candidate for PR head SHA.",
+            )
+        )
+    for deployment in deployments:
+        deployment_id = deployment.get("id")
+        statuses_for_deployment: list[dict[str, Any]] = []
+        if deployment_id is not None:
+            statuses_for_deployment = await _safe_list(github_client, "list_deployment_statuses", parsed.repository, deployment_id)
+        if not statuses_for_deployment:
+            candidates.append(
+                _candidate(
+                    source="deployment",
+                    item=deployment,
+                    preview_url=contract_module.preview_url_from_payload(deployment) or payload_preview_url,
+                    state=str(deployment.get("state") or ""),
+                    reason="Deployment candidate had no deployment_status records.",
+                    deployment=deployment,
+                )
+            )
+        for deployment_status in statuses_for_deployment:
+            candidates.append(
+                _candidate(
+                    source="deployment_status",
+                    item=deployment_status,
+                    preview_url=contract_module.preview_url_from_payload(deployment_status)
+                    or contract_module.preview_url_from_payload(deployment)
+                    or payload_preview_url,
+                    state=str(deployment_status.get("state") or ""),
+                    reason="Deployment status candidate for PR head SHA deployment.",
+                    deployment=deployment,
+                )
+            )
 
-    return (
-        VercelReadiness.TIMEOUT,
-        None,
-        "vercel_timeout",
-        "Timed out waiting for verified Vercel preview deployment readiness.",
+    for candidate in candidates:
+        _log_candidate_decision(parsed, candidate)
+
+    decision = _decide_from_candidates(
+        parsed,
+        candidates,
+        fallback_reason="Timed out waiting for verified Vercel preview deployment readiness.",
     )
+    _log_final_decision(parsed, decision, candidates)
+    return decision
+
+
+def _candidate(
+    *,
+    source: str,
+    item: dict[str, Any],
+    preview_url: str | None,
+    state: str | None,
+    reason: str,
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    deployment = deployment or item if source == "deployment" else deployment
+    normalized_state = str(state or "").lower()
+    is_vercel = _looks_like_vercel_item(item) or (deployment is not None and _looks_like_vercel_item(deployment)) or bool(preview_url)
+    ready = bool(preview_url and is_vercel and _candidate_successful(item, normalized_state))
+    failed = bool(is_vercel and _candidate_failed(item, normalized_state))
+    rejection_reason = None
+    if not ready:
+        if not is_vercel:
+            rejection_reason = "candidate was not recognized as Vercel preview metadata"
+        elif not preview_url:
+            rejection_reason = "candidate did not include a usable Vercel preview URL"
+        elif failed:
+            rejection_reason = "candidate reported failed Vercel deployment state"
+        elif normalized_state in PENDING_DEPLOYMENT_STATES:
+            rejection_reason = "candidate reported pending Vercel deployment state"
+        else:
+            rejection_reason = "candidate was not in a verified Ready/success state"
+    return {
+        "source": source,
+        "item": item,
+        "deployment": deployment,
+        "preview_url": preview_url,
+        "state": normalized_state,
+        "environment": item.get("environment") or (deployment or {}).get("environment"),
+        "deployment_id": (deployment or item).get("id") if source in {"deployment", "deployment_status"} else None,
+        "deployment_status_id": item.get("id") if source == "deployment_status" else None,
+        "ready": ready,
+        "failed": failed,
+        "reason": reason,
+        "rejection_reason": rejection_reason,
+    }
+
+
+def _candidate_successful(item: dict[str, Any], state: str) -> bool:
+    if state in READY_DEPLOYMENT_STATES:
+        return True
+    return _github_item_successful(item)
+
+
+def _candidate_failed(item: dict[str, Any], state: str) -> bool:
+    if state in FAILED_DEPLOYMENT_STATES:
+        return True
+    return _github_item_failed(item)
+
+
+def _decide_from_candidates(
+    parsed: ParsedGitHubEvent,
+    candidates: list[dict[str, Any]],
+    *,
+    fallback_reason: str,
+) -> tuple[VercelReadiness, str | None, str, str | None]:
+    for candidate in candidates:
+        if candidate.get("ready") and candidate.get("preview_url"):
+            return VercelReadiness.READY, str(candidate["preview_url"]), f"github_verified_{candidate['source']}_preview_url", None
+    if any(candidate.get("failed") for candidate in candidates):
+        return VercelReadiness.FAILED, None, "vercel_failed", "Vercel preview deployment failed."
+    return VercelReadiness.TIMEOUT, None, "vercel_timeout", fallback_reason
+
+
+def _log_candidate_decision(parsed: ParsedGitHubEvent, candidate: dict[str, Any]) -> None:
+    log_event(
+        "vercel_preview_candidate_evaluated",
+        **_decision_context(parsed),
+        workflow_id=_workflow_id(parsed),
+        source=candidate.get("source"),
+        deployment_id=candidate.get("deployment_id"),
+        deployment_status_id=candidate.get("deployment_status_id"),
+        environment=candidate.get("environment"),
+        state=candidate.get("state"),
+        preview_url=candidate.get("preview_url"),
+        target_url_selected=candidate.get("preview_url") if candidate.get("ready") else None,
+        accepted=bool(candidate.get("ready")),
+        rejected=not bool(candidate.get("ready")),
+        rejection_reason=candidate.get("rejection_reason"),
+        candidate_reason=candidate.get("reason"),
+    )
+
+
+def _log_final_decision(
+    parsed: ParsedGitHubEvent,
+    decision: tuple[VercelReadiness, str | None, str, str | None],
+    candidates: list[dict[str, Any]],
+) -> None:
+    readiness, target_url, target_source, reason = decision
+    log_event(
+        "vercel_preview_readiness_decision",
+        **_decision_context(parsed),
+        workflow_id=_workflow_id(parsed),
+        readiness=readiness.value,
+        target_url_selected=target_url,
+        target_url_source=target_source,
+        reason=reason,
+        candidate_count=len(candidates),
+        accepted_candidate_count=sum(1 for candidate in candidates if candidate.get("ready")),
+        failed_candidate_count=sum(1 for candidate in candidates if candidate.get("failed")),
+    )
+
+
+def _decision_context(parsed: ParsedGitHubEvent) -> dict[str, Any]:
+    return {
+        "repository": parsed.repository,
+        "repo": parsed.repository,
+        "pr_number": parsed.pull_request_number,
+        "branch": parsed.head_ref,
+        "head_sha": parsed.head_sha,
+        "commit_sha": parsed.head_sha,
+    }
+
+
+def _payload_state(value: dict[str, Any]) -> str | None:
+    deployment_status = value.get("deployment_status") if isinstance(value, dict) else None
+    if isinstance(deployment_status, dict) and deployment_status.get("state"):
+        return str(deployment_status.get("state"))
+    if value.get("state"):
+        return str(value.get("state"))
+    return None
+
+
+async def _safe_list(client: Any, method_name: str, *args: Any) -> list[dict[str, Any]]:
+    method = getattr(client, method_name, None)
+    if method is None:
+        return []
+    try:
+        raw = await method(*args)
+    except Exception as exc:
+        log_event("vercel_preview_source_query_failed", source=method_name, error=str(exc))
+        return []
+    return raw if isinstance(raw, list) else []
