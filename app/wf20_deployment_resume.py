@@ -39,7 +39,7 @@ WAITING_TARGET_SOURCES = {"vercel_timeout", "vercel_preview_pending"}
 FAILED_TARGET_SOURCES = {"vercel_failed"}
 READY_SOURCE_PREFIX = "github_verified_"
 
-CorrelationMethod = Literal["SHA", "PR", "BRANCH"]
+CorrelationMethod = Literal["DEPLOYMENT_ID", "WORKFLOW_ID", "CORRELATION_ID", "SHA", "PR", "BRANCH"]
 
 
 def is_wf20_deployment_status_payload(parsed: ParsedGitHubEvent) -> bool:
@@ -159,9 +159,6 @@ def select_waiting_workflow_for_request(
     log_correlation_candidates(waiting_workflows=waiting_workflows)
     deployment_id, deployment_status_id = deployment_ids(parsed)
     repository = request.repo
-    commit_sha = _request_commit_sha(request)
-    pr_number = request.pr_number
-    branch = request.branch
 
     selectable: list[ReviewWorkItem] = []
     for item in waiting_items:
@@ -210,18 +207,24 @@ def select_waiting_workflow_for_request(
             continue
         selectable.append(item)
 
-    selected = _select_by(selectable, request, "SHA")
+    selected = _select_by(selectable, request, "DEPLOYMENT_ID", parsed=parsed)
+    if selected is None:
+        selected = _select_by(selectable, request, "WORKFLOW_ID", parsed=parsed)
+    if selected is None:
+        selected = _select_by(selectable, request, "CORRELATION_ID", parsed=parsed)
+    if selected is None:
+        selected = _select_by(selectable, request, "SHA", parsed=parsed)
     if selected is None:
         _log_match_rejections(selectable, request, parsed, reason=REJECTION_REASON_SHA_MISMATCH)
-        selected = _select_by(selectable, request, "PR")
+        selected = _select_by(selectable, request, "PR", parsed=parsed)
     if selected is None:
         _log_match_rejections(selectable, request, parsed, reason=REJECTION_REASON_PR_MISMATCH)
-        selected = _select_by(selectable, request, "BRANCH")
+        selected = _select_by(selectable, request, "BRANCH", parsed=parsed)
     if selected is None:
         _log_match_rejections(selectable, request, parsed, reason=REJECTION_REASON_BRANCH_MISMATCH)
         return None
 
-    method = _selected_method(selected, request)
+    method = _selected_method(selected, request, parsed)
     log_matched_workflow(
         workflow_id=_candidate_workflow_id(selected) or request.workflow_id or "unknown",
         correlation_method=method,
@@ -242,10 +245,25 @@ def list_waiting_deployment_items(*, storage: Any | None = None) -> list[ReviewW
     return waiting
 
 
-def _select_by(items: list[ReviewWorkItem], request: RuntimeValidationRequest, method: CorrelationMethod) -> ReviewWorkItem | None:
+def _select_by(
+    items: list[ReviewWorkItem],
+    request: RuntimeValidationRequest,
+    method: CorrelationMethod,
+    *,
+    parsed: ParsedGitHubEvent,
+) -> ReviewWorkItem | None:
     for item in items:
         context = item.runtime_validation_context or {}
-        if method == "SHA":
+        if method == "DEPLOYMENT_ID":
+            value = _deployment_id_from_parsed(parsed)
+            candidate = _context_value(context, "deployment_id")
+        elif method == "WORKFLOW_ID":
+            value = request.workflow_id
+            candidate = _candidate_workflow_id(item)
+        elif method == "CORRELATION_ID":
+            value = request.correlation_id
+            candidate = _context_value(context, "correlation_id")
+        elif method == "SHA":
             value = _request_commit_sha(request)
             candidate = item.commit_sha or str(context.get("commit_sha") or "") or None
         elif method == "PR":
@@ -259,8 +277,15 @@ def _select_by(items: list[ReviewWorkItem], request: RuntimeValidationRequest, m
     return None
 
 
-def _selected_method(item: ReviewWorkItem, request: RuntimeValidationRequest) -> CorrelationMethod:
+def _selected_method(item: ReviewWorkItem, request: RuntimeValidationRequest, parsed: ParsedGitHubEvent) -> CorrelationMethod:
     context = item.runtime_validation_context or {}
+    deployment_id = _deployment_id_from_parsed(parsed)
+    if deployment_id is not None and _context_value(context, "deployment_id") == deployment_id:
+        return "DEPLOYMENT_ID"
+    if request.workflow_id is not None and _candidate_workflow_id(item) == request.workflow_id:
+        return "WORKFLOW_ID"
+    if request.correlation_id is not None and _context_value(context, "correlation_id") == request.correlation_id:
+        return "CORRELATION_ID"
     if _request_commit_sha(request) is not None and (item.commit_sha or context.get("commit_sha")) == _request_commit_sha(request):
         return "SHA"
     if request.pr_number is not None and (item.pr_number or _int_or_none(context.get("pr_number"))) == request.pr_number:
@@ -330,6 +355,19 @@ def _candidate_workflow_id(item: ReviewWorkItem) -> str | None:
 def _request_commit_sha(request: RuntimeValidationRequest) -> str | None:
     value = getattr(request, "commit_sha", None)
     return str(value) if value else None
+
+
+def _deployment_id_from_parsed(parsed: ParsedGitHubEvent) -> str | None:
+    value, _status_id = deployment_ids(parsed)
+    return value
+
+
+def _context_value(context: dict[str, Any], key: str) -> str | None:
+    value = context.get(key)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _save_item(item: ReviewWorkItem, storage: Any | None) -> None:
