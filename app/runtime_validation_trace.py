@@ -40,6 +40,7 @@ def trace_runtime_validation_lookup(
         lookup_result=lookup_result,
         missing_field=missing_field,
         rejection_reason=rejection_reason,
+        _include_nulls=True,
         **extra,
     )
 
