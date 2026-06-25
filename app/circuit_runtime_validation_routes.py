@@ -16,7 +16,10 @@ from app.circuit_runtime_validation import (
 )
 from app.config import Settings, get_settings
 from app.operational_logging import log_event
+from app.runtime_validation_handoff_trace import install_runtime_validation_handoff_trace
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
+
+install_runtime_validation_handoff_trace()
 
 router = APIRouter(prefix="/api/v1/runtime-validations", tags=["runtime-validations"])
 _RUNTIME_VALIDATION_ROUTE_PREFIX = "/api/v1/runtime-validations"
@@ -66,6 +69,7 @@ async def create_runtime_validation(
     store = _runtime_validation_store(http_request)
     _log_runtime_validation_store_selected(store, request, dispatch_path="runtime_validation_route")
     result = await store.trigger(request, settings)
+    _ensure_created_response_has_handoff_outcome(result, store)
     enqueue_review_from_runtime_validation(
         result,
         settings,
@@ -140,7 +144,67 @@ def _log_runtime_validation_store_selected(store: Any, request: RuntimeValidatio
         evidence_id=request.evidence_id,
         workflow_id=request.workflow_id,
         validation_type=request.validation_type,
+        target_url=request.target_url,
+        commit_sha=getattr(request, "commit_sha", None),
     )
+
+
+def _ensure_created_response_has_handoff_outcome(result: RuntimeValidationResult, store: Any) -> None:
+    if _has_completed_hermes_outcome(result) or _has_explicit_skip_or_block_reason(result):
+        log_event(
+            "runtime_validation_created_response_contract_satisfied",
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+            evidence_packet_id=result.evidence_id,
+            repository=result.repo,
+            pr_number=result.pr_number,
+            branch=result.branch,
+            target_url=result.hermes.target_url,
+            selected_store_class=store.__class__.__name__,
+            selected_store_module=store.__class__.__module__,
+            runtime_validation_status=result.status,
+            hermes_status=result.hermes.status,
+            hermes_job_id=result.hermes.job_id,
+            skip_block_reason=result.error or result.hermes.error,
+        )
+        return
+    log_event(
+        "runtime_validation_created_response_contract_failed",
+        runtime_validation_id=result.validation_id,
+        workflow_id=result.workflow_id,
+        work_item_id=result.work_item_id,
+        evidence_packet_id=result.evidence_id,
+        repository=result.repo,
+        pr_number=result.pr_number,
+        branch=result.branch,
+        target_url=result.hermes.target_url,
+        selected_store_class=store.__class__.__name__,
+        selected_store_module=store.__class__.__module__,
+        runtime_validation_status=result.status,
+        hermes_status=result.hermes.status,
+        hermes_job_id=result.hermes.job_id,
+        skip_block_reason=result.error or result.hermes.error,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "error": "runtime_validation_created_without_handoff_outcome",
+            "runtime_validation_id": result.validation_id,
+            "status": result.status,
+            "hermes_status": result.hermes.status,
+        },
+    )
+
+
+def _has_completed_hermes_outcome(result: RuntimeValidationResult) -> bool:
+    return result.status == "completed" and result.hermes.status in {"PASSED", "FAILED"}
+
+
+def _has_explicit_skip_or_block_reason(result: RuntimeValidationResult) -> bool:
+    if result.status not in {"blocked", "failed", "pending"}:
+        return False
+    return bool(result.error or result.hermes.error)
 
 
 def _request_with_default_base_branch(request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationRequest:
