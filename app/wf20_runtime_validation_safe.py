@@ -33,6 +33,7 @@ async def runtime_validation_request_from_parsed(
     *,
     github_client: Any | None = None,
 ) -> RuntimeValidationRequest:
+    parsed = await hydrate_deployment_status_pr_context(parsed, github_client)
     profile = frontend_validation_profile_for_repo(parsed.repository, labels=parsed.labels)
     readiness, target_url, target_source, reason = await resolve_verified_vercel_readiness(parsed, github_client)
     request = RuntimeValidationRequest(
@@ -55,6 +56,51 @@ async def runtime_validation_request_from_parsed(
     return request
 
 
+async def hydrate_deployment_status_pr_context(parsed: ParsedGitHubEvent, github_client: Any | None) -> ParsedGitHubEvent:
+    if not _is_deployment_status_payload(parsed.raw):
+        return parsed
+    if parsed.pull_request_number is not None or github_client is None or not parsed.repository or not parsed.head_sha:
+        return parsed
+
+    pulls = await _list_pull_requests_for_commit(github_client, parsed.repository, parsed.head_sha)
+    selected = _select_pull_request_for_commit(pulls, parsed.head_sha, parsed.head_ref)
+    if selected is None:
+        log_event(
+            "vercel_preview_pr_correlation_failed",
+            **_decision_context(parsed),
+            workflow_id=_workflow_id(parsed),
+            deployment_id=_deployment_id(parsed.raw),
+            deployment_status_id=_deployment_status_id(parsed.raw),
+            candidate_pr_count=len(pulls),
+            reason="No pull request matched the deployment commit SHA.",
+        )
+        return parsed
+
+    head = selected.get("head") if isinstance(selected.get("head"), dict) else {}
+    base = selected.get("base") if isinstance(selected.get("base"), dict) else {}
+    labels = selected.get("labels") if isinstance(selected.get("labels"), list) else []
+    hydrated = parsed.model_copy(
+        update={
+            "pull_request_number": selected.get("number"),
+            "head_ref": head.get("ref") or parsed.head_ref,
+            "head_sha": head.get("sha") or parsed.head_sha,
+            "head_repo_full_name": _repo_full_name(head.get("repo")),
+            "base_ref": base.get("ref") or parsed.base_ref,
+            "base_repo_full_name": _repo_full_name(base.get("repo")),
+            "labels": _label_names(labels) or parsed.labels,
+        }
+    )
+    log_event(
+        "vercel_preview_pr_correlation_resolved",
+        **_decision_context(hydrated),
+        workflow_id=_workflow_id(hydrated),
+        deployment_id=_deployment_id(parsed.raw),
+        deployment_status_id=_deployment_status_id(parsed.raw),
+        candidate_pr_count=len(pulls),
+    )
+    return hydrated
+
+
 async def resolve_verified_vercel_readiness(
     parsed: ParsedGitHubEvent,
     github_client: Any | None,
@@ -68,6 +114,8 @@ async def resolve_verified_vercel_readiness(
         "vercel_preview_readiness_started",
         **context,
         workflow_id=workflow_id,
+        deployment_id=_deployment_id(parsed.raw),
+        deployment_status_id=_deployment_status_id(parsed.raw),
         payload_preview_url=payload_preview_url,
     )
 
@@ -291,3 +339,54 @@ async def _safe_list(client: Any, method_name: str, *args: Any) -> list[dict[str
         log_event("vercel_preview_source_query_failed", source=method_name, error=str(exc))
         return []
     return raw if isinstance(raw, list) else []
+
+
+async def _list_pull_requests_for_commit(client: Any, repo: str, sha: str) -> list[dict[str, Any]]:
+    method = getattr(client, "list_pull_requests_for_commit", None)
+    if method is not None:
+        return await _safe_list(client, "list_pull_requests_for_commit", repo, sha)
+    request = getattr(client, "_request", None)
+    if request is None:
+        return []
+    try:
+        raw = await request("GET", f"/repos/{repo}/commits/{sha}/pulls", params={"per_page": 100})
+    except Exception as exc:
+        log_event("vercel_preview_source_query_failed", source="list_pull_requests_for_commit", error=str(exc))
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def _select_pull_request_for_commit(pulls: list[dict[str, Any]], sha: str, branch: str | None) -> dict[str, Any] | None:
+    open_pulls = [pull for pull in pulls if str(pull.get("state") or "open").lower() == "open"] or pulls
+    for pull in open_pulls:
+        head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+        if head.get("sha") == sha:
+            return pull
+    if branch:
+        for pull in open_pulls:
+            head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+            if head.get("ref") == branch:
+                return pull
+    return open_pulls[0] if len(open_pulls) == 1 else None
+
+
+def _is_deployment_status_payload(value: dict[str, Any]) -> bool:
+    return isinstance(value.get("deployment_status"), dict) and isinstance(value.get("deployment"), dict)
+
+
+def _deployment_id(value: dict[str, Any]) -> Any | None:
+    deployment = value.get("deployment") if isinstance(value, dict) else None
+    return deployment.get("id") if isinstance(deployment, dict) else None
+
+
+def _deployment_status_id(value: dict[str, Any]) -> Any | None:
+    deployment_status = value.get("deployment_status") if isinstance(value, dict) else None
+    return deployment_status.get("id") if isinstance(deployment_status, dict) else None
+
+
+def _repo_full_name(value: Any) -> str | None:
+    return str(value.get("full_name")) if isinstance(value, dict) and value.get("full_name") else None
+
+
+def _label_names(value: list[Any]) -> list[str]:
+    return [str(item.get("name")) for item in value if isinstance(item, dict) and item.get("name")]

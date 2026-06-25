@@ -99,9 +99,13 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     if event_type == GitHubEventType.DEPLOYMENT_STATUS:
         deployment = payload.get("deployment") or {}
         deployment_status = payload.get("deployment_status") or {}
+        state = str(deployment_status.get("state") or payload.get("action") or "")
         return ParsedGitHubEvent(
-            **base,
-            action=str(deployment_status.get("state") or payload.get("action") or ""),
+            **{
+                **base,
+                "event_type": GitHubEventType.PULL_REQUEST,
+                "action": "ready_for_review" if state.lower() in {"success", "ready"} else "synchronize",
+            },
             ref=deployment.get("ref"),
             head_ref=deployment.get("ref"),
             head_sha=deployment.get("sha"),
