@@ -215,7 +215,10 @@ def _normalize_access_token(value: str | None) -> str | None:
     normalized = _normalize_optional_text(value)
     if normalized is None:
         return None
-    if normalized.lower().startswith("bearer "):
+    lowered = normalized.lower()
+    if lowered == "bearer":
+        return None
+    if lowered.startswith("bearer "):
         normalized = normalized[7:].strip()
     return normalized or None
 

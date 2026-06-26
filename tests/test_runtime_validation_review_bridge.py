@@ -57,22 +57,30 @@ def _signed_headers(event: str, payload: bytes) -> dict[str, str]:
     }
 
 
-def _runtime_pr_payload(*, head_ref: str = "agent-integration", preview_url: str | None = None) -> dict[str, Any]:
+def _runtime_pr_payload(
+    *,
+    head_ref: str = "agent-integration",
+    preview_url: str | None = None,
+    repo: str = "riseos/example",
+    deployment_state: str | None = None,
+) -> dict[str, Any]:
     payload = {
         "action": "opened",
         "number": 111,
-        "repository": {"full_name": "riseos/example"},
+        "repository": {"full_name": repo},
         "sender": {"login": "circuit"},
         "pull_request": {
             "number": 111,
             "merged": False,
-            "head": {"sha": "abc123", "ref": head_ref, "repo": {"full_name": "riseos/example"}},
-            "base": {"ref": "main", "repo": {"full_name": "riseos/example"}},
+            "head": {"sha": "abc123", "ref": head_ref, "repo": {"full_name": repo}},
+            "base": {"ref": "main", "repo": {"full_name": repo}},
             "labels": [],
         },
     }
     if preview_url:
         payload["deployment_url"] = preview_url
+    if deployment_state:
+        payload["state"] = deployment_state
     return payload
 
 
@@ -204,7 +212,17 @@ def test_runtime_dependent_pr_is_pending_before_terminal_validation(monkeypatch)
         return _result("completed")
 
     monkeypatch.setattr("app.main.runtime_validation_store.trigger", fake_trigger)
-    _post_pr(client, _runtime_pr_payload())
+    app_state_store = getattr(app.state, "runtime_validation_store", None)
+    if app_state_store is not None:
+        monkeypatch.setattr(app_state_store, "trigger", fake_trigger)
+    _post_pr(
+        client,
+        _runtime_pr_payload(
+            repo="marcus937/jarvis-mission-control",
+            preview_url="https://jarvis-mission-control-gules.vercel.app",
+            deployment_state="success",
+        ),
+    )
 
     assert observed_pending is True
     item = review_queue.list_items()[0]

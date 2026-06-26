@@ -20,6 +20,7 @@ from app.review_queue import (
 
 TERMINAL_RUNTIME_VALIDATION_STATUSES = {"blocked", "completed", "failed"}
 RUNTIME_REVIEW_SOURCE = "runtime_validation_bb2_packet"
+IMMUTABLE_CORRELATION_KEYS = ("deployment_id", "workflow_id", "correlation_id")
 
 
 def create_runtime_validation_pending_item(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
@@ -166,14 +167,15 @@ def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeVali
 
 
 def _find_existing_runtime_item(item: ReviewWorkItem, *, storage: Any | None = None) -> ReviewWorkItem | None:
-    identity = review_work_item_identity(item)
     items = storage.list_review_work_items() if storage is not None else review_queue.list_items()
     for existing in items:
-        if review_work_item_identity(existing) == identity and existing.status in {
+        if existing.status not in {
             ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING,
             ReviewWorkItemStatus.PENDING_REVIEW,
             ReviewWorkItemStatus.REVIEWING,
         }:
+            continue
+        if _runtime_items_correlate(existing, item):
             return existing
     return None
 
@@ -198,6 +200,37 @@ def _find_pending_runtime_result(result: RuntimeValidationResult, *, storage: An
         ):
             return item
     return None
+
+
+def _runtime_items_correlate(existing: ReviewWorkItem, candidate: ReviewWorkItem) -> bool:
+    if existing.repo_full_name != candidate.repo_full_name:
+        return False
+    if existing.event_type != candidate.event_type:
+        return False
+
+    existing_context = existing.runtime_validation_context if isinstance(existing.runtime_validation_context, dict) else {}
+    candidate_context = candidate.runtime_validation_context if isinstance(candidate.runtime_validation_context, dict) else {}
+    for key in IMMUTABLE_CORRELATION_KEYS:
+        existing_value = _context_value(existing_context, key)
+        candidate_value = _context_value(candidate_context, key)
+        if existing_value and candidate_value:
+            return existing_value == candidate_value
+
+    if existing.commit_sha and candidate.commit_sha:
+        return existing.commit_sha == candidate.commit_sha
+    if existing.pr_number is not None and candidate.pr_number is not None:
+        return existing.pr_number == candidate.pr_number
+    if existing.branch and candidate.branch and existing.branch == candidate.branch:
+        return existing.pr_number is None or candidate.pr_number is None or existing.pr_number == candidate.pr_number
+    return review_work_item_identity(existing) == review_work_item_identity(candidate)
+
+
+def _context_value(context: dict[str, Any], key: str) -> str | None:
+    value = context.get(key)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _gate_lookup_key(result: RuntimeValidationResult) -> dict[str, object]:

@@ -12,7 +12,9 @@ logger = logging.getLogger("riseos_agent_orchestrator")
 
 
 def log_event(event: str, **fields: Any) -> None:
-    payload = {"event": event, **{key: value for key, value in fields.items() if value is not None}}
+    include_nulls = bool(fields.pop("_include_nulls", False))
+    event_fields = fields if include_nulls else {key: value for key, value in fields.items() if value is not None}
+    payload = {"event": event, **event_fields}
     logger.info(json.dumps(payload, sort_keys=True, default=str))
 
 
