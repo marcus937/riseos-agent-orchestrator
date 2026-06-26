@@ -1,5 +1,11 @@
+import io
+import logging
+
 from app.github_events import parse_github_event
 from app.operational_logging import (
+    LOGGER_NAME,
+    configure_operational_logger,
+    logger,
     log_event,
     log_github_writeback_attempted,
     log_github_writeback_result,
@@ -39,3 +45,33 @@ def test_structured_logging_functions_are_callable() -> None:
     log_github_writeback_attempted()
     log_github_writeback_result(attempted=True, success=True, error=None)
     log_github_writeback_result(attempted=True, success=False, error="GitHub failed")
+
+
+def test_operational_logger_has_info_level_stream_path() -> None:
+    stream = io.StringIO()
+    original_handlers = list(logger.handlers)
+    original_level = logger.level
+    original_disabled = logger.disabled
+    original_propagate = logger.propagate
+    try:
+        logger.handlers.clear()
+        logger.setLevel(logging.NOTSET)
+        logger.disabled = False
+        logger.propagate = False
+
+        configured = configure_operational_logger(stream)
+        log_event("logger_stream_probe", repo_full_name="riseos/example")
+
+        assert configured is logging.getLogger(LOGGER_NAME)
+        assert logger.level == logging.INFO
+        assert logger.disabled is False
+        assert logger.propagate is True
+        assert any(getattr(handler, "_riseos_operational_handler", False) for handler in logger.handlers)
+        assert '"event": "logger_stream_probe"' in stream.getvalue()
+        assert '"repo_full_name": "riseos/example"' in stream.getvalue()
+    finally:
+        logger.handlers.clear()
+        logger.handlers.extend(original_handlers)
+        logger.setLevel(original_level)
+        logger.disabled = original_disabled
+        logger.propagate = original_propagate

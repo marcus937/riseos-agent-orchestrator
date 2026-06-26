@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any
+from typing import Any, TextIO
 
 from app.correlation import correlation_id_from_item, correlation_id_from_parsed
 from app.github_events import ParsedGitHubEvent
@@ -8,7 +8,26 @@ from app.review_queue import ReviewWorkItem
 from app.slack_issue_dispatch import SlackIssueDispatchResult
 
 
-logger = logging.getLogger("riseos_agent_orchestrator")
+LOGGER_NAME = "riseos_agent_orchestrator"
+logger = logging.getLogger(LOGGER_NAME)
+
+
+def configure_operational_logger(stream: TextIO | None = None) -> logging.Logger:
+    """Ensure structured operational logs have an INFO-level process stream path."""
+
+    logger.disabled = False
+    logger.setLevel(logging.INFO)
+    if not any(getattr(handler, "_riseos_operational_handler", False) for handler in logger.handlers):
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._riseos_operational_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+    logger.propagate = True
+    return logger
+
+
+configure_operational_logger()
 
 
 def log_event(event: str, **fields: Any) -> None:
