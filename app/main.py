@@ -605,6 +605,7 @@ async def github_webhook(
     x_hub_signature_256: Annotated[str | None, Header(alias="X-Hub-Signature-256")] = None,
     settings: Settings = Depends(get_settings),
 ) -> WebhookAcceptedResponse:
+    print("### GITHUB_WEBHOOK_ENTERED ###", flush=True)
     body = await request.body()
     if not verify_github_signature(settings.github_webhook_secret, body, x_hub_signature_256):
         log_event(
@@ -646,6 +647,7 @@ async def github_webhook(
     )
     try:
         parsed = parse_github_event(x_github_event, payload)
+        print("### AFTER_PARSE ###", flush=True)
     except UnsupportedGitHubEventError as exc:
         log_event(
             "github_webhook_early_exit",
@@ -741,6 +743,7 @@ async def github_webhook(
         enable_runtime_validation_review_bridge=settings.enable_runtime_validation_review_bridge,
     )
     runtime_gated = runtime_validation_required_for_parsed(parsed, settings, has_review_context=has_review_context)
+    print(f"### RUNTIME_GATED={runtime_gated} ###", flush=True)
     deployment_status_payload = is_wf20_deployment_status_payload(parsed)
     _log_wf20_runtime_gate_decision(
         parsed,
