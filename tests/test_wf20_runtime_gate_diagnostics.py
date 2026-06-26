@@ -232,7 +232,6 @@ def test_ready_deployment_status_webhook_reaches_runtime_validation_request_buil
         enable_runtime_validation_review_bridge=True,
         enable_github_writeback=False,
         enable_agent_bus_dispatch=False,
-        enable_slack_issue_dispatch=False,
         enable_task_dispatch=False,
     )
     app.dependency_overrides[get_settings] = lambda: settings
