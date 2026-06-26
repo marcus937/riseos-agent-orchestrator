@@ -79,6 +79,25 @@ def _full_name(raw_repo: Any) -> str | None:
     return str(full_name) if full_name else None
 
 
+def _log_wf20_parsed_event_summary(parsed: ParsedGitHubEvent) -> None:
+    from app.operational_logging import log_event
+
+    log_event(
+        "wf20_parsed_event_summary",
+        repository=parsed.repository,
+        event_type=str(parsed.event_type),
+        action=parsed.action,
+        pull_request_number=parsed.pull_request_number,
+        issue_number=parsed.issue_number,
+        head_sha=parsed.head_sha,
+        base_branch=parsed.base_ref,
+        head_branch=parsed.head_ref,
+        actor=parsed.sender,
+        labels=parsed.labels,
+        _include_nulls=True,
+    )
+
+
 def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHubEvent:
     try:
         event_type = GitHubEventType(event_name)
@@ -94,14 +113,16 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
     }
 
     if event_type == GitHubEventType.PING:
-        return ParsedGitHubEvent(**base)
+        parsed = ParsedGitHubEvent(**base)
+        _log_wf20_parsed_event_summary(parsed)
+        return parsed
 
     if event_type == GitHubEventType.DEPLOYMENT_STATUS:
         deployment = payload.get("deployment") or {}
         deployment_status = payload.get("deployment_status") or {}
         state = str(deployment_status.get("state") or payload.get("action") or "")
         ready = state.lower() in {"success", "ready"}
-        return ParsedGitHubEvent(
+        parsed = ParsedGitHubEvent(
             **{
                 **base,
                 "event_type": GitHubEventType.PULL_REQUEST,
@@ -112,11 +133,13 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
             head_ref=deployment.get("ref"),
             head_sha=deployment.get("sha"),
         )
+        _log_wf20_parsed_event_summary(parsed)
+        return parsed
 
     if event_type == GitHubEventType.ISSUE_COMMENT:
         issue = payload.get("issue") or {}
         comment_body = (payload.get("comment") or {}).get("body")
-        return ParsedGitHubEvent(
+        parsed = ParsedGitHubEvent(
             **base,
             issue_number=issue.get("number"),
             issue_title=issue.get("title"),
@@ -127,10 +150,12 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
             comment_body=comment_body,
             head_sha=extract_commit_sha_from_comment(comment_body),
         )
+        _log_wf20_parsed_event_summary(parsed)
+        return parsed
 
     if event_type == GitHubEventType.ISSUES:
         issue = payload.get("issue") or {}
-        return ParsedGitHubEvent(
+        parsed = ParsedGitHubEvent(
             **base,
             issue_number=issue.get("number"),
             issue_title=issue.get("title"),
@@ -139,20 +164,24 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
             action_label=_action_label(payload),
             labels=_label_names(issue.get("labels")),
         )
+        _log_wf20_parsed_event_summary(parsed)
+        return parsed
 
     if event_type == GitHubEventType.PUSH:
-        return ParsedGitHubEvent(
+        parsed = ParsedGitHubEvent(
             **base,
             ref=payload.get("ref"),
             before=payload.get("before"),
             after=payload.get("after"),
             head_sha=payload.get("after"),
         )
+        _log_wf20_parsed_event_summary(parsed)
+        return parsed
 
     pull_request = payload.get("pull_request") or {}
     head = pull_request.get("head") or {}
     base_ref = pull_request.get("base") or {}
-    return ParsedGitHubEvent(
+    parsed = ParsedGitHubEvent(
         **base,
         pull_request_number=pull_request.get("number") or payload.get("number"),
         pull_request_merged=pull_request.get("merged"),
@@ -164,6 +193,8 @@ def parse_github_event(event_name: str, payload: dict[str, Any]) -> ParsedGitHub
         base_repo_full_name=_full_name(base_ref.get("repo")),
         labels=_label_names(pull_request.get("labels")),
     )
+    _log_wf20_parsed_event_summary(parsed)
+    return parsed
 
 
 def extract_commit_sha_from_comment(body: str | None) -> str | None:
