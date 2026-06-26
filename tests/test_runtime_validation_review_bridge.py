@@ -62,6 +62,7 @@ def _runtime_pr_payload(
     head_ref: str = "agent-integration",
     preview_url: str | None = None,
     repo: str = "riseos/example",
+    deployment_state: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "action": "opened",
@@ -78,6 +79,8 @@ def _runtime_pr_payload(
     }
     if preview_url:
         payload["deployment_url"] = preview_url
+    if deployment_state:
+        payload["state"] = deployment_state
     return payload
 
 
@@ -217,6 +220,7 @@ def test_runtime_dependent_pr_is_pending_before_terminal_validation(monkeypatch)
         _runtime_pr_payload(
             repo="marcus937/jarvis-mission-control",
             preview_url="https://jarvis-mission-control-gules.vercel.app",
+            deployment_state="success",
         ),
     )
 
