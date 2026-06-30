@@ -15,7 +15,7 @@ from app.pr_workflow_state import (
 )
 from app.review_queue import ReviewProcessResponse
 from app.reviewer.decision import ReviewDecisionType
-from app.task_dispatch import BB2_DECISION_LABELS, LABEL_BB2_REVIEW_NEEDED
+from app.task_dispatch import BB2_DECISION_LABELS, LABEL_BB2_REVIEW_NEEDED, workflow_chain_ready_to_merge_deferred
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ async def writeback_review_decision(
         return GitHubWritebackResult(error="issue_number or pr_number is required for GitHub writeback.")
 
     current_labels = await _current_issue_labels(client, item.repo_full_name, target_number, fallback=item.labels)
-    labels = _target_labels(response.decision.decision, current_labels)
+    labels = _target_labels(response.decision.decision, current_labels, item=item)
     label = labels[0]
     labels_to_remove = _labels_to_remove(current_labels, labels)
     comment_body = build_writeback_comment(response, labels=labels)
@@ -200,10 +200,12 @@ def build_writeback_comment(response: ReviewProcessResponse, *, labels: list[str
     )
 
 
-def _target_labels(decision: ReviewDecisionType, current_labels: set[str]) -> list[str]:
+def _target_labels(decision: ReviewDecisionType, current_labels: set[str], *, item: Any | None = None) -> list[str]:
     state_label = bb2_state_label_for_decision(decision)
     stable_labels = (current_labels - BB2_TRANSIENT_LABELS) | {state_label}
     transition_labels = bb2_decision_transition_labels(decision, stable_labels)
+    if item is not None and workflow_chain_ready_to_merge_deferred(item, decision):
+        transition_labels = [label for label in transition_labels if label != LABEL_READY_TO_MERGE]
     labels = [state_label]
     for transition_label in transition_labels:
         if transition_label not in labels and transition_label not in BB2_REVIEW_REQUEST_LABELS:
