@@ -565,6 +565,11 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
 
 
 def workflow_chain_context_from_continuation(continuation: WorkflowContinuation) -> dict[str, Any]:
+    dispatch_reason = "workflow_chain_approval_continuation"
+    if continuation.next_workflow_step == continuation.current_workflow_step:
+        dispatch_reason = "workflow_chain_needs_changes"
+    elif continuation.status == WorkflowContinuationStatus.RETRY_PENDING:
+        dispatch_reason = "workflow_chain_retry"
     return {
         "repository": continuation.repository,
         "issue_number": None,
@@ -580,7 +585,7 @@ def workflow_chain_context_from_continuation(continuation: WorkflowContinuation)
         "previous_review_queue_item_id": None,
         "continuation_id": continuation.continuation_id,
         "idempotency_key": continuation.idempotency_key,
-        "dispatch_reason": "workflow_chain_retry" if continuation.status == WorkflowContinuationStatus.RETRY_PENDING else "workflow_chain_approval_continuation",
+        "dispatch_reason": dispatch_reason,
     }
 
 
