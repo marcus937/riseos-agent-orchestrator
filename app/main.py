@@ -97,7 +97,8 @@ from app.runtime_validation_review_decision import review_decision_from_runtime_
 from app.security import verify_github_signature
 from app.slack_issue_dispatch import SlackIssueDispatchResult, dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
-from app.task_dispatch import dispatch_next_agent_task
+from app.task_dispatch import dispatch_next_agent_task, dispatch_workflow_chain_continuation, resume_workflow_continuations
+from app.workflow_continuation import SQLiteWorkflowContinuationStore, build_workflow_continuation_store
 from app.workflow_routes import register_workflow_routes
 
 
@@ -130,6 +131,8 @@ async def startup() -> None:
         settings.orchestrator_db_path,
         max_review_items=settings.orchestrator_max_review_items,
     )
+    continuation_store = build_workflow_continuation_store(settings.orchestrator_db_path)
+    app.state.workflow_continuation_store = continuation_store
     if storage is not None:
         storage.reclaim_stale_review_claims(older_than_seconds=settings.review_claim_timeout_seconds)
     app.state.storage = storage
@@ -143,10 +146,29 @@ async def startup() -> None:
             app.state.last_repository_discovery_error = str(exc)
         finally:
             await github_client.aclose()
+    if continuation_store is not None and settings.enable_task_dispatch:
+        await _resume_workflow_continuations(settings, continuation_store)
 
 
 def _storage() -> SQLiteStateStore | None:
     return getattr(app.state, "storage", None)
+
+
+def _workflow_continuation_store() -> SQLiteWorkflowContinuationStore | None:
+    return getattr(app.state, "workflow_continuation_store", None)
+
+
+async def _resume_workflow_continuations(settings: Settings, continuation_store: SQLiteWorkflowContinuationStore) -> None:
+    agent_bus_client = AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token) if settings.enable_agent_bus_dispatch else None
+    try:
+        await resume_workflow_continuations(
+            continuation_store,
+            agent_bus_client=agent_bus_client,
+            agent_bus_enabled=settings.enable_agent_bus_dispatch,
+        )
+    finally:
+        if agent_bus_client is not None:
+            await agent_bus_client.aclose()
 
 
 def _repository_registry() -> RepositoryRegistryStore:
@@ -301,6 +323,24 @@ async def create_agent_task(
         auto_registered=not existed_before,
         issue_number=task.issue_number,
     )
+
+
+@app.get("/api/v1/workflow-continuations/{workflow_chain_id}")
+async def get_workflow_continuations(workflow_chain_id: str, _: None = Depends(_require_debug_read_access)) -> dict[str, Any]:
+    store = _workflow_continuation_store()
+    if store is None:
+        return {"workflow_chain_id": workflow_chain_id, "continuations": []}
+    continuations = store.list_workflow_continuations(workflow_chain_id)
+    latest = continuations[-1] if continuations else None
+    return {
+        "workflow_chain_id": workflow_chain_id,
+        "current_workflow_step": latest.current_workflow_step if latest else None,
+        "next_workflow_step": latest.next_workflow_step if latest else None,
+        "status": latest.status.value if latest else None,
+        "work_item_id": latest.current_work_item_id if latest else None,
+        "retry_status": latest.status.value if latest and latest.status.value == "RETRY_PENDING" else None,
+        "continuations": [continuation.model_dump(mode="json") for continuation in continuations],
+    }
 
 
 @app.get("/api/v1/orchestrator/snapshot", response_model=OrchestratorSnapshot)
@@ -539,37 +579,38 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
         response.github_writeback_success = writeback.success
         response.github_writeback_error = writeback.error
         record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED, success=writeback.success, error=writeback.error)
-        if writeback.success and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
-            if settings.enable_agent_bus_dispatch:
-                record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED)
-            task_dispatch = await dispatch_next_agent_task(
-                response.work_item.repo_full_name,
-                github_client,
+        if writeback.success:
+            task_dispatch = await dispatch_workflow_chain_continuation(
+                response.work_item,
+                response.decision.decision,
                 enabled=settings.enable_task_dispatch,
                 agent_bus_client=agent_bus_client,
                 agent_bus_enabled=settings.enable_agent_bus_dispatch,
-                owner_agent=settings.agent_bus_owner_agent,
-                review_agent=settings.agent_bus_review_agent,
-                work_branch=settings.work_branch,
+                continuation_store=_workflow_continuation_store(),
+                base_branch=settings.base_branch or "agent-integration",
             )
-            agent_bus_attempted = bool(getattr(task_dispatch, "agent_bus_attempted", False))
-            agent_bus_success = bool(getattr(task_dispatch, "agent_bus_success", False))
-            agent_bus_work_item_id = getattr(task_dispatch, "agent_bus_work_item_id", None)
-            agent_bus_error = getattr(task_dispatch, "agent_bus_error", None)
-            agent_bus_payload = getattr(task_dispatch, "agent_bus_payload", None)
-            response.task_dispatch_attempted = bool(getattr(task_dispatch, "attempted", False))
-            response.task_dispatch_success = bool(getattr(task_dispatch, "success", False))
-            response.task_dispatch_issue_number = getattr(task_dispatch, "issue_number", None)
-            response.task_dispatch_error = getattr(task_dispatch, "error", None)
-            response.agent_bus_dispatch_attempted = agent_bus_attempted
-            response.agent_bus_dispatch_success = agent_bus_success
-            response.agent_bus_work_item_id = agent_bus_work_item_id
-            response.agent_bus_dispatch_error = agent_bus_error
-            response.agent_bus_payload = agent_bus_payload
-            response.work_item.agent_bus_work_item_id = agent_bus_work_item_id
-            response.work_item.agent_bus_dispatch_error = agent_bus_error
-            if agent_bus_attempted:
-                record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED, success=agent_bus_success, error=agent_bus_error)
+            if task_dispatch is None and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
+                if settings.enable_agent_bus_dispatch:
+                    record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED)
+                task_dispatch = await dispatch_next_agent_task(
+                    response.work_item.repo_full_name,
+                    github_client,
+                    enabled=settings.enable_task_dispatch,
+                    agent_bus_client=agent_bus_client,
+                    agent_bus_enabled=settings.enable_agent_bus_dispatch,
+                    owner_agent=settings.agent_bus_owner_agent,
+                    review_agent=settings.agent_bus_review_agent,
+                    work_branch=settings.work_branch,
+                )
+            if task_dispatch is not None:
+                _attach_task_dispatch_result(response, task_dispatch)
+                if getattr(task_dispatch, "agent_bus_attempted", False):
+                    record_lifecycle_stage(
+                        response.work_item,
+                        ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED,
+                        success=bool(getattr(task_dispatch, "agent_bus_success", False)),
+                        error=getattr(task_dispatch, "agent_bus_error", None),
+                    )
     finally:
         await github_client.aclose()
         if agent_bus_client is not None:
@@ -579,6 +620,26 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     log_review_completed(response.work_item, decision=response.decision.decision.value)
     record_lifecycle_stage(response.work_item, ReviewLifecycleStage.REVIEW_COMPLETED)
     return response
+
+
+def _attach_task_dispatch_result(response: ReviewProcessResponse, task_dispatch: Any) -> None:
+    agent_bus_attempted = bool(getattr(task_dispatch, "agent_bus_attempted", False))
+    agent_bus_success = bool(getattr(task_dispatch, "agent_bus_success", False))
+    agent_bus_work_item_id = getattr(task_dispatch, "agent_bus_work_item_id", None)
+    agent_bus_error = getattr(task_dispatch, "agent_bus_error", None)
+    agent_bus_payload = getattr(task_dispatch, "agent_bus_payload", None)
+    response.task_dispatch_attempted = bool(getattr(task_dispatch, "attempted", False))
+    response.task_dispatch_success = bool(getattr(task_dispatch, "success", False))
+    response.task_dispatch_issue_number = getattr(task_dispatch, "issue_number", None)
+    response.task_dispatch_error = getattr(task_dispatch, "error", None)
+    response.agent_bus_dispatch_attempted = agent_bus_attempted
+    response.agent_bus_dispatch_success = agent_bus_success
+    response.agent_bus_work_item_id = agent_bus_work_item_id
+    response.agent_bus_dispatch_error = agent_bus_error
+    response.agent_bus_payload = agent_bus_payload
+    if agent_bus_work_item_id is not None:
+        response.work_item.agent_bus_work_item_id = agent_bus_work_item_id
+    response.work_item.agent_bus_dispatch_error = agent_bus_error
 
 
 def _runtime_evidence_context_from_item(item: ReviewWorkItem) -> list[dict[str, object]]:
@@ -859,7 +920,7 @@ def _webhook_response(parsed: ParsedGitHubEvent, workflow: Any) -> WebhookAccept
 def _require_admin_token(settings: Settings, provided_token: str | None) -> None:
     if not settings.orchestrator_admin_token:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="ORCHESTRATOR_ADMIN_TOKEN is required before processing review queue items.")
-    if not provided_token or not hmac.compare_digest(provided_token, settings.orchestrator_admin_token):
+    if not provided_token or not hmac.compare_digest(settings.orchestrator_admin_token, provided_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid orchestrator admin token")
 
 
