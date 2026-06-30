@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -29,6 +30,7 @@ class WorkflowContinuation(BaseModel):
     workflow_chain_id: str
     current_workflow_step: str
     next_workflow_step: str
+    workflow_steps: list[str] | None = None
     repository: str
     pr_number: int
     branch: str
@@ -101,6 +103,7 @@ class SQLiteWorkflowContinuationStore:
                     workflow_chain_id TEXT NOT NULL,
                     current_workflow_step TEXT NOT NULL,
                     next_workflow_step TEXT NOT NULL,
+                    workflow_steps TEXT,
                     repository TEXT NOT NULL,
                     pr_number INTEGER NOT NULL,
                     branch TEXT NOT NULL,
@@ -122,6 +125,8 @@ class SQLiteWorkflowContinuationStore:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_continuations)").fetchall()}
             if "next_work_item_id" not in columns:
                 conn.execute("ALTER TABLE workflow_continuations ADD COLUMN next_work_item_id TEXT")
+            if "workflow_steps" not in columns:
+                conn.execute("ALTER TABLE workflow_continuations ADD COLUMN workflow_steps TEXT")
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_continuations_idempotency
@@ -141,6 +146,7 @@ class SQLiteWorkflowContinuationStore:
                     workflow_chain_id,
                     current_workflow_step,
                     next_workflow_step,
+                    workflow_steps,
                     repository,
                     pr_number,
                     branch,
@@ -156,13 +162,14 @@ class SQLiteWorkflowContinuationStore:
                     created_at,
                     updated_at,
                     completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, NULL)
                 """,
                 (
                     continuation_id,
                     str(payload["workflow_chain_id"]),
                     str(payload["current_workflow_step"]),
                     str(payload["next_workflow_step"]),
+                    _workflow_steps_json(payload.get("workflow_steps")),
                     str(payload["repository"]),
                     int(payload["pr_number"]),
                     str(payload["branch"]),
@@ -377,7 +384,34 @@ def _continuation_from_row(row: sqlite3.Row | None) -> WorkflowContinuation:
     data = dict(row)
     if not data.get("next_work_item_id"):
         data["next_work_item_id"] = data.get("current_work_item_id")
+    data["workflow_steps"] = _workflow_steps_from_json(data.get("workflow_steps"))
     return WorkflowContinuation.model_validate(data)
+
+
+def _workflow_steps_json(value: Any) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return json.dumps([str(item) for item in value if str(item).strip()])
+    return None
+
+
+def _workflow_steps_from_json(value: Any) -> list[str] | None:
+    if not value:
+        return None
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = [part.strip() for part in value.split(",")]
+        if isinstance(parsed, list):
+            steps = [str(item).strip() for item in parsed if str(item).strip()]
+            return steps or None
+    return None
 
 
 def _optional_text(value: Any) -> str | None:
