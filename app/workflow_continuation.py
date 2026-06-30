@@ -350,10 +350,10 @@ def build_workflow_continuation_store(db_path: str | None) -> SQLiteWorkflowCont
 def workflow_continuation_idempotency_key(
     *,
     workflow_chain_id: str,
-    repository: str | None = None,
     pr_number: int,
     branch: str,
     next_workflow_step: str,
+    repository: str | None = None,
 ) -> str:
     if repository:
         return f"workflow-chain:{workflow_chain_id}:{repository}:{pr_number}:{branch}:{next_workflow_step}"
