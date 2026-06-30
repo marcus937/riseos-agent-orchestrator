@@ -303,7 +303,7 @@ def _bridge_metadata(result: RuntimeValidationResult) -> dict[str, Any]:
             "hermes_status": result.hermes.status,
             "runtime_validation_status": result.status,
             "target_url": result.hermes.target_url,
-            "artifact_metadata": result.evidence.artifacts,
+            "artifact_metadata": _artifact_metadata(result.evidence.artifacts),
             "review_dispatch": result.review_dispatch,
         }
     )
@@ -341,6 +341,28 @@ def _artifact_reference(artifact: Any) -> str | None:
                 return str(value)
         return None
     return str(artifact) if artifact is not None else None
+
+
+def _artifact_metadata(artifacts: list[Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for index, artifact in enumerate(artifacts):
+        if isinstance(artifact, dict):
+            metadata[_artifact_metadata_key(artifact, index)] = artifact
+        elif artifact is not None:
+            reference = str(artifact)
+            metadata[reference] = {"reference": reference}
+    return metadata
+
+
+def _artifact_metadata_key(artifact: dict[str, Any], index: int) -> str:
+    for key in ("file_name", "filename", "name"):
+        value = artifact.get(key)
+        if value:
+            return str(value)
+    reference = _artifact_reference(artifact)
+    if reference:
+        return reference.rsplit("/", 1)[-1] or reference
+    return f"artifact_{index + 1}"
 
 
 def _hermes_passed(result: RuntimeValidationResult) -> bool:
