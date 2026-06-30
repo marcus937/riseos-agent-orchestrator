@@ -29,6 +29,8 @@ class FakeAgentBusLifecycleClient:
         return {"id": work_item_id, "status": self.status}
 
     async def create_review_packet(self, payload: dict[str, Any]) -> dict[str, Any]:
+        assert isinstance(payload.get("test_results"), dict)
+        assert all(isinstance(artifact, str) for artifact in payload.get("artifacts", []))
         self.review_packets.append(payload)
         return {"id": f"review-packet-{len(self.review_packets)}"}
 
@@ -85,7 +87,12 @@ def _settings() -> Settings:
     )
 
 
-def _result(*, hermes_status: str = "PASSED", work_item_id: str | None = "work-item-123") -> RuntimeValidationResult:
+def _result(
+    *,
+    hermes_status: str = "PASSED",
+    work_item_id: str | None = "work-item-123",
+    artifacts: list[dict[str, Any]] | None = None,
+) -> RuntimeValidationResult:
     review_status = "approved" if hermes_status == "PASSED" else "needs_changes"
     return RuntimeValidationResult(
         validation_id="runtime-validation-123",
@@ -118,7 +125,7 @@ def _result(*, hermes_status: str = "PASSED", work_item_id: str | None = "work-i
             final_url="https://jarvis-mission-control-gules.vercel.app",
             http_status=200,
             screenshot_present=True,
-            artifacts=[{"file_name": "summary.json", "sha256": "abc123"}],
+            artifacts=artifacts or [{"file_name": "summary.json", "sha256": "abc123"}],
         ),
         bb2=RuntimeValidationBB2Packet(packet_created=True, review_status=review_status),
     )
@@ -134,9 +141,45 @@ def test_passed_runtime_validation_advances_original_agent_bus_item_to_completed
     assert client.status == "COMPLETED"
     assert client.review_packets[0]["reviewer"] == "bb2"
     assert client.review_packets[0]["review_status"] == "approved"
+    assert client.review_packets[0]["metadata"]["approval_scope"] == "agent_bus_workflow_progression_only"
+    assert client.review_packets[0]["metadata"]["merge_authorization"] is False
     assert client.attachments[0]["review_packet_id"] == "review-packet-1"
     assert client.transitions == ["READY_FOR_REVIEW", "REVIEW_IN_PROGRESS", "APPROVED"]
     assert len(client.completions) == 1
+
+
+def test_passed_runtime_validation_review_packet_matches_agent_bus_schema() -> None:
+    client = FakeAgentBusLifecycleClient(status="IN_PROGRESS")
+
+    asyncio.run(advance_agent_bus_from_runtime_validation(_result(), _settings(), agent_bus_client=client))
+
+    packet = client.review_packets[0]
+    assert isinstance(packet["test_results"], dict)
+    assert packet["test_results"]["hermes_playwright_runtime_validation"]["status"] == "PASSED"
+    assert packet["artifacts"] == ["summary.json"]
+    assert packet["metadata"]["artifact_metadata"] == [{"file_name": "summary.json", "sha256": "abc123"}]
+    assert packet["metadata"]["approval_scope"] == "agent_bus_workflow_progression_only"
+    assert packet["metadata"]["merge_authorization"] is False
+
+
+def test_hermes_artifact_dicts_are_converted_to_string_references() -> None:
+    client = FakeAgentBusLifecycleClient(status="IN_PROGRESS")
+    artifacts = [
+        {"retrieval": "GET /api/v1/evidence/hermes-job-123/files/summary.json", "file_name": "summary.json"},
+        {"url": "https://agent-bus.example.test/evidence/screenshot.png", "file_name": "screenshot.png"},
+        {"sha256": "stable-sha-only"},
+    ]
+
+    asyncio.run(
+        advance_agent_bus_from_runtime_validation(_result(artifacts=artifacts), _settings(), agent_bus_client=client)
+    )
+
+    assert client.review_packets[0]["artifacts"] == [
+        "GET /api/v1/evidence/hermes-job-123/files/summary.json",
+        "https://agent-bus.example.test/evidence/screenshot.png",
+        "stable-sha-only",
+    ]
+    assert all(isinstance(artifact, str) for artifact in client.review_packets[0]["artifacts"])
 
 
 def test_passed_runtime_validation_replay_is_idempotent_for_completed_work_item() -> None:
