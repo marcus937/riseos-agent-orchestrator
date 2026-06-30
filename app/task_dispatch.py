@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.circuit_agent_trigger import CircuitAgentTriggerClient, wake_circuit_agent_for_work
 from app.config import Settings, get_settings
+from app.operational_logging import log_event
 from app.reviewer.decision import ReviewDecisionType
 from app.task_dependencies import dependency_state_for_issue
 
@@ -39,6 +40,11 @@ BB2_DECISION_LABELS = {
 }
 
 DEFAULT_AGENT_BUS_PRIORITY = "normal"
+WF_CHAIN_STEPS = tuple(f"WF{step}" for step in range(21, 30))
+FINAL_WF_CHAIN_STEP = "WF29"
+WF_CHAIN_OWNER_AGENT = "codex-m2"
+WF_CHAIN_REVIEW_AGENT = "bb2"
+WF_CHAIN_BASE_BRANCH = "agent-integration"
 
 
 class TaskDispatchClient(Protocol):
@@ -246,6 +252,89 @@ async def dispatch_next_agent_task(
     )
 
 
+async def dispatch_workflow_chain_continuation(
+    item: Any,
+    decision: ReviewDecisionType,
+    *,
+    enabled: bool,
+    agent_bus_client: AgentBusDispatchClient | None,
+    agent_bus_enabled: bool,
+    base_branch: str = WF_CHAIN_BASE_BRANCH,
+) -> TaskDispatchResult | None:
+    continuation = workflow_chain_continuation_for_decision(item, decision, base_branch=base_branch)
+    if continuation is None:
+        return None
+    if not enabled:
+        return TaskDispatchResult()
+
+    payload = build_workflow_chain_work_item_payload(continuation)
+    log_event(
+        "wf_chain_continue_selected",
+        previous_work_item_id=continuation["previous_work_item_id"],
+        previous_workflow_step=continuation["previous_workflow_step"],
+        next_workflow_step=continuation["next_workflow_step"],
+        reused_pr_number=continuation["pr_number"],
+        reused_branch=continuation["branch"],
+        repository=continuation["repository"],
+        workflow_chain_id=continuation.get("workflow_chain_id"),
+        commit_sha=continuation.get("commit_sha"),
+        owner_agent=WF_CHAIN_OWNER_AGENT,
+        review_agent=WF_CHAIN_REVIEW_AGENT,
+        dispatch_reason=continuation["dispatch_reason"],
+    )
+
+    lifecycle_events = ["agent_bus_dispatch_started"]
+    if not agent_bus_enabled:
+        return TaskDispatchResult(
+            attempted=True,
+            success=False,
+            issue_number=continuation.get("issue_number"),
+            error="Agent Bus dispatch is required for workflow chain continuation.",
+            agent_bus_attempted=False,
+            agent_bus_success=False,
+            agent_bus_payload=payload,
+            lifecycle_events=lifecycle_events,
+        )
+    if agent_bus_client is None:
+        return TaskDispatchResult(
+            attempted=True,
+            success=False,
+            issue_number=continuation.get("issue_number"),
+            error="Agent Bus dispatch is enabled but no Agent Bus client is configured.",
+            agent_bus_attempted=True,
+            agent_bus_success=False,
+            agent_bus_error="Agent Bus dispatch is enabled but no Agent Bus client is configured.",
+            agent_bus_payload=payload,
+            lifecycle_events=lifecycle_events,
+        )
+
+    try:
+        response = await agent_bus_client.create_work_item(payload)
+        raw_work_item_id = response.get("work_item_id") or response.get("id")
+        agent_bus_work_item_id = str(raw_work_item_id) if raw_work_item_id else None
+        agent_bus_success = agent_bus_work_item_id is not None
+        agent_bus_error = None if agent_bus_success else "Agent Bus work item response did not include work_item_id."
+        if agent_bus_success:
+            lifecycle_events.append("agent_bus_dispatch_completed")
+    except Exception as exc:
+        agent_bus_work_item_id = None
+        agent_bus_success = False
+        agent_bus_error = str(exc)
+
+    return TaskDispatchResult(
+        attempted=True,
+        success=agent_bus_success,
+        issue_number=continuation.get("issue_number"),
+        error=agent_bus_error,
+        agent_bus_attempted=True,
+        agent_bus_success=agent_bus_success,
+        agent_bus_work_item_id=agent_bus_work_item_id,
+        agent_bus_error=agent_bus_error,
+        agent_bus_payload=payload,
+        lifecycle_events=lifecycle_events,
+    )
+
+
 def build_agent_bus_work_item_payload(
     repo_full_name: str,
     issue: AgentTaskIssue,
@@ -284,6 +373,155 @@ def build_agent_bus_work_item_payload(
     }
 
 
+def build_workflow_chain_work_item_payload(continuation: dict[str, Any]) -> dict[str, Any]:
+    metadata = {
+        "source": "riseos-agent-orchestrator",
+        "dispatch_reason": continuation["dispatch_reason"],
+        "workflow_chain_id": continuation.get("workflow_chain_id"),
+        "workflow_step": continuation["next_workflow_step"],
+        "previous_workflow_step": continuation["previous_workflow_step"],
+        "previous_work_item_id": continuation["previous_work_item_id"],
+        "previous_review_queue_item_id": continuation.get("previous_review_queue_item_id"),
+        "repository": continuation["repository"],
+        "pr_number": continuation["pr_number"],
+        "branch": continuation["branch"],
+        "base_branch": continuation["base_branch"],
+        "commit_sha": continuation.get("commit_sha"),
+        "issue_number": continuation.get("issue_number"),
+        "reuse_existing_pr": True,
+        "create_new_pr": False,
+        "open_new_pr": False,
+        "merge_required_before_next_step": False,
+        "routing": {
+            "owner_agent": WF_CHAIN_OWNER_AGENT,
+            "owner_capabilities": ["coding", "github", "testing"],
+            "owner_agent_type": "implementation",
+            "review_agent": WF_CHAIN_REVIEW_AGENT,
+            "reviewer_capabilities": ["pr_review"],
+            "reviewer_agent_type": "review",
+        },
+    }
+    return _compact_payload(
+        {
+            "title": _workflow_chain_title(continuation),
+            "repository": continuation["repository"],
+            "issue_number": continuation.get("issue_number"),
+            "pr_number": continuation["pr_number"],
+            "priority": DEFAULT_AGENT_BUS_PRIORITY,
+            "owner_agent": WF_CHAIN_OWNER_AGENT,
+            "review_agent": WF_CHAIN_REVIEW_AGENT,
+            "metadata": _compact_payload(metadata),
+        }
+    )
+
+
+def workflow_chain_continuation_for_decision(
+    item: Any,
+    decision: ReviewDecisionType,
+    *,
+    base_branch: str = WF_CHAIN_BASE_BRANCH,
+) -> dict[str, Any] | None:
+    context = workflow_chain_context_from_item(item, base_branch=base_branch)
+    if context is None:
+        return None
+    current_step = context["workflow_step"]
+    if decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
+        next_step = next_workflow_chain_step(current_step)
+        if next_step is None:
+            return None
+        context["next_workflow_step"] = next_step
+        context["dispatch_reason"] = "workflow_chain_approval_continuation"
+        return context
+    if decision == ReviewDecisionType.NEEDS_CHANGES:
+        context["next_workflow_step"] = current_step
+        context["dispatch_reason"] = "workflow_chain_needs_changes"
+        return context
+    return None
+
+
+def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_BASE_BRANCH) -> dict[str, Any] | None:
+    runtime_context = _dict_value(getattr(item, "runtime_validation_context", None))
+    review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
+    workflow_step = _normalize_workflow_step(
+        _first_present(
+            review_dispatch.get("workflow_step"),
+            review_dispatch.get("workflowStep"),
+            runtime_context.get("workflow_step"),
+            runtime_context.get("workflowStep"),
+        )
+    )
+    if workflow_step not in WF_CHAIN_STEPS:
+        return None
+
+    repo = _string_or_none(getattr(item, "repo_full_name", None)) or _string_or_none(
+        _first_present(review_dispatch.get("repository"), runtime_context.get("repo"), runtime_context.get("repository"))
+    )
+    pr_number = _int_or_none(
+        _first_present(getattr(item, "pr_number", None), review_dispatch.get("pr_number"), runtime_context.get("pr_number"))
+    )
+    branch = _string_or_none(
+        _first_present(getattr(item, "branch", None), review_dispatch.get("branch"), runtime_context.get("branch"))
+    )
+    if not repo or pr_number is None or not branch:
+        return None
+
+    return {
+        "repository": repo,
+        "issue_number": _int_or_none(
+            _first_present(getattr(item, "issue_number", None), review_dispatch.get("issue_number"), runtime_context.get("issue_number"))
+        ),
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": _string_or_none(
+            _first_present(getattr(item, "base_branch", None), review_dispatch.get("base_branch"), runtime_context.get("base_branch"))
+        )
+        or base_branch,
+        "commit_sha": _string_or_none(
+            _first_present(getattr(item, "commit_sha", None), review_dispatch.get("commit_sha"), runtime_context.get("commit_sha"))
+        ),
+        "workflow_chain_id": _string_or_none(
+            _first_present(
+                review_dispatch.get("workflow_chain_id"),
+                review_dispatch.get("workflowChainId"),
+                runtime_context.get("workflow_chain_id"),
+                runtime_context.get("workflow_id"),
+            )
+        ),
+        "workflow_step": workflow_step,
+        "previous_workflow_step": workflow_step,
+        "previous_work_item_id": _string_or_none(
+            _first_present(
+                getattr(item, "agent_bus_work_item_id", None),
+                runtime_context.get("agent_bus_work_item_id"),
+                runtime_context.get("work_item_id"),
+                getattr(item, "id", None),
+            )
+        ),
+        "previous_review_queue_item_id": _string_or_none(getattr(item, "id", None)),
+    }
+
+
+def workflow_chain_ready_to_merge_deferred(item: Any, decision: ReviewDecisionType) -> bool:
+    if decision != ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
+        return False
+    step = workflow_chain_step_from_item(item)
+    return step in WF_CHAIN_STEPS and step != FINAL_WF_CHAIN_STEP
+
+
+def workflow_chain_step_from_item(item: Any) -> str | None:
+    context = workflow_chain_context_from_item(item)
+    return context["workflow_step"] if context else None
+
+
+def next_workflow_chain_step(workflow_step: str) -> str | None:
+    if workflow_step not in WF_CHAIN_STEPS:
+        return None
+    index = WF_CHAIN_STEPS.index(workflow_step)
+    if index >= len(WF_CHAIN_STEPS) - 1:
+        return None
+    return WF_CHAIN_STEPS[index + 1]
+
+
 def build_circuit_assignment_body(issue: AgentTaskIssue) -> str:
     task_summary = _trim_issue_body(issue.body)
     return (
@@ -300,6 +538,13 @@ def build_circuit_assignment_body(issue: AgentTaskIssue) -> str:
         "- Comment `Status: Done` with the PR URL and completed commit SHA when finished.\n\n"
         "Task summary:\n"
         f"{task_summary}"
+    )
+
+
+def _workflow_chain_title(continuation: dict[str, Any]) -> str:
+    return (
+        f"{continuation['next_workflow_step']}: continue PR #{continuation['pr_number']} "
+        f"on {continuation['branch']}"
     )
 
 
@@ -346,3 +591,46 @@ def _trim_issue_body(body: str | None) -> str:
     if len(text) <= 4000:
         return text
     return f"{text[:4000].rstrip()}\n\n[Task summary truncated for assignment comment.]"
+
+
+def _normalize_workflow_step(value: Any) -> str | None:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    normalized = text.upper()
+    if normalized.startswith("WF") and normalized[2:].isdigit():
+        return normalized
+    if normalized.isdigit():
+        return f"WF{normalized}"
+    return normalized
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
