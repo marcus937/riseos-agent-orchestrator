@@ -70,6 +70,75 @@ class AgentBusClient:
         )
         return _object_response(response, "GET", path)
 
+    async def create_review_packet(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        response = await self._client.post(
+            f"{self._base_url}/review-packets",
+            headers=self._headers(),
+            json=payload,
+        )
+        return _object_response(response, "POST", "/review-packets")
+
+    async def attach_review_to_work_item(self, work_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        path = f"/work-items/{quote(work_item_id, safe='')}/review"
+        response = await self._client.post(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+            json=payload,
+        )
+        return _object_response(response, "POST", path)
+
+    async def transition_work_item(
+        self,
+        work_item_id: str,
+        *,
+        status: str,
+        actor: str,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        owner_agent: str | None = None,
+        review_agent: str | None = None,
+    ) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        path = f"/work-items/{quote(work_item_id, safe='')}/transition"
+        payload = _compact_payload(
+            {
+                "status": status,
+                "actor": actor,
+                "reason": reason,
+                "metadata": metadata,
+                "owner_agent": owner_agent,
+                "review_agent": review_agent,
+            }
+        )
+        response = await self._client.post(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+            json=payload,
+        )
+        return _object_response(response, "POST", path)
+
+    async def complete_work_item(
+        self,
+        work_item_id: str,
+        *,
+        actor: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
+        path = f"/work-items/{quote(work_item_id, safe='')}/complete"
+        response = await self._client.post(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+            json=_compact_payload({"actor": actor, "metadata": metadata}),
+        )
+        return _object_response(response, "POST", path)
+
     async def get_agent_status(self, agent_id: str) -> dict[str, Any]:
         if not self._base_url:
             raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
@@ -106,6 +175,10 @@ class AgentBusClient:
 
     def _runtime_validation_headers(self) -> dict[str, str]:
         return self._headers()
+
+
+def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _object_response(response: httpx.Response, method: str, path: str) -> dict[str, Any]:
