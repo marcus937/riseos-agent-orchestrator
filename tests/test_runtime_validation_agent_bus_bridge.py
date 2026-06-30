@@ -31,6 +31,10 @@ class FakeAgentBusLifecycleClient:
     async def create_review_packet(self, payload: dict[str, Any]) -> dict[str, Any]:
         assert isinstance(payload.get("test_results"), dict)
         assert all(isinstance(artifact, str) for artifact in payload.get("artifacts", []))
+        artifact_metadata = payload.get("metadata", {}).get("artifact_metadata", {})
+        assert isinstance(artifact_metadata, dict)
+        assert all(isinstance(name, str) for name in artifact_metadata)
+        assert all(isinstance(value, dict) for value in artifact_metadata.values())
         self.review_packets.append(payload)
         return {"id": f"review-packet-{len(self.review_packets)}"}
 
@@ -157,7 +161,7 @@ def test_passed_runtime_validation_review_packet_matches_agent_bus_schema() -> N
     assert isinstance(packet["test_results"], dict)
     assert packet["test_results"]["hermes_playwright_runtime_validation"]["status"] == "PASSED"
     assert packet["artifacts"] == ["summary.json"]
-    assert packet["metadata"]["artifact_metadata"] == [{"file_name": "summary.json", "sha256": "abc123"}]
+    assert packet["metadata"]["artifact_metadata"] == {"summary.json": {"file_name": "summary.json", "sha256": "abc123"}}
     assert packet["metadata"]["approval_scope"] == "agent_bus_workflow_progression_only"
     assert packet["metadata"]["merge_authorization"] is False
 
@@ -180,6 +184,48 @@ def test_hermes_artifact_dicts_are_converted_to_string_references() -> None:
         "stable-sha-only",
     ]
     assert all(isinstance(artifact, str) for artifact in client.review_packets[0]["artifacts"])
+
+
+def test_runtime_bridge_preserves_full_artifact_metadata_by_file_name() -> None:
+    client = FakeAgentBusLifecycleClient(status="IN_PROGRESS")
+    console_artifact = {
+        "file_name": "console.json",
+        "content_type": "application/json",
+        "retrieval": "GET /api/v1/evidence/evidence-123/files/console.json",
+        "sha256": "console-sha",
+    }
+    logs_artifact = {
+        "file_name": "logs.json",
+        "content_type": "application/json",
+        "retrieval": "GET /api/v1/evidence/evidence-123/files/logs.json",
+        "sha256": "logs-sha",
+    }
+
+    asyncio.run(
+        advance_agent_bus_from_runtime_validation(
+            _result(artifacts=[console_artifact, logs_artifact]),
+            _settings(),
+            agent_bus_client=client,
+        )
+    )
+
+    packet = client.review_packets[0]
+    assert packet["artifacts"] == [
+        "GET /api/v1/evidence/evidence-123/files/console.json",
+        "GET /api/v1/evidence/evidence-123/files/logs.json",
+    ]
+    assert packet["metadata"]["artifact_metadata"] == {
+        "console.json": console_artifact,
+        "logs.json": logs_artifact,
+    }
+    assert client.attachments[0]["metadata"]["artifact_metadata"] == {
+        "console.json": console_artifact,
+        "logs.json": logs_artifact,
+    }
+    assert client.completions[0]["metadata"]["artifact_metadata"] == {
+        "console.json": console_artifact,
+        "logs.json": logs_artifact,
+    }
 
 
 def test_passed_runtime_validation_replay_is_idempotent_for_completed_work_item() -> None:
