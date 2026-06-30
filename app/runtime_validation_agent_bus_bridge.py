@@ -229,7 +229,7 @@ def _review_packet_payload(result: RuntimeValidationResult, settings: Settings, 
             "findings": [] if approved else [_failure_finding(result)],
             "required_changes": [] if approved else [_failure_finding(result)],
             "evidence_packet_ids_reviewed": [result.evidence_id] if result.evidence_id else [],
-            "artifacts": result.evidence.artifacts,
+            "artifacts": _artifact_references(result.evidence.artifacts),
             "metadata": _bridge_metadata(result),
             "risk_level": "low" if approved else "medium",
             "review_type": "runtime_validation",
@@ -237,16 +237,7 @@ def _review_packet_payload(result: RuntimeValidationResult, settings: Settings, 
             "assumed": [],
             "unverified": [] if approved else ["Hermes Playwright runtime validation did not pass."],
             "commands_run": [],
-            "test_results": [
-                _compact(
-                    {
-                        "name": "Hermes Playwright runtime validation",
-                        "status": result.hermes.status,
-                        "job_id": result.hermes.job_id,
-                        "target_url": result.hermes.target_url,
-                    }
-                )
-            ],
+            "test_results": _test_results_payload(result),
             "urls": [result.hermes.target_url] if result.hermes.target_url else [],
         }
     )
@@ -312,9 +303,44 @@ def _bridge_metadata(result: RuntimeValidationResult) -> dict[str, Any]:
             "hermes_status": result.hermes.status,
             "runtime_validation_status": result.status,
             "target_url": result.hermes.target_url,
+            "artifact_metadata": result.evidence.artifacts,
             "review_dispatch": result.review_dispatch,
         }
     )
+
+
+def _test_results_payload(result: RuntimeValidationResult) -> dict[str, Any]:
+    return {
+        "hermes_playwright_runtime_validation": _compact(
+            {
+                "name": "Hermes Playwright runtime validation",
+                "status": result.hermes.status,
+                "job_id": result.hermes.job_id,
+                "target_url": result.hermes.target_url,
+            }
+        )
+    }
+
+
+def _artifact_references(artifacts: list[Any]) -> list[str]:
+    references: list[str] = []
+    for artifact in artifacts:
+        reference = _artifact_reference(artifact)
+        if reference:
+            references.append(reference)
+    return references
+
+
+def _artifact_reference(artifact: Any) -> str | None:
+    if isinstance(artifact, str):
+        return artifact
+    if isinstance(artifact, dict):
+        for key in ("retrieval", "retrieval_url", "url", "file_name", "filename", "name", "sha256"):
+            value = artifact.get(key)
+            if value:
+                return str(value)
+        return None
+    return str(artifact) if artifact is not None else None
 
 
 def _hermes_passed(result: RuntimeValidationResult) -> bool:
