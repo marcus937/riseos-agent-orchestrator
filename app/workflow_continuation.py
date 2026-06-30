@@ -35,6 +35,7 @@ class WorkflowContinuation(BaseModel):
     base_branch: str | None = None
     previous_work_item_id: str | None = None
     current_work_item_id: str | None = None
+    next_work_item_id: str | None = None
     idempotency_key: str
     status: WorkflowContinuationStatus
     dispatch_attempts: int = 0
@@ -106,6 +107,7 @@ class SQLiteWorkflowContinuationStore:
                     base_branch TEXT,
                     previous_work_item_id TEXT,
                     current_work_item_id TEXT,
+                    next_work_item_id TEXT,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     status TEXT NOT NULL,
                     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
@@ -117,6 +119,9 @@ class SQLiteWorkflowContinuationStore:
                 )
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_continuations)").fetchall()}
+            if "next_work_item_id" not in columns:
+                conn.execute("ALTER TABLE workflow_continuations ADD COLUMN next_work_item_id TEXT")
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_continuations_idempotency
@@ -142,6 +147,7 @@ class SQLiteWorkflowContinuationStore:
                     base_branch,
                     previous_work_item_id,
                     current_work_item_id,
+                    next_work_item_id,
                     idempotency_key,
                     status,
                     dispatch_attempts,
@@ -150,7 +156,7 @@ class SQLiteWorkflowContinuationStore:
                     created_at,
                     updated_at,
                     completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, NULL)
                 """,
                 (
                     continuation_id,
@@ -163,6 +169,7 @@ class SQLiteWorkflowContinuationStore:
                     _optional_text(payload.get("base_branch")),
                     _optional_text(payload.get("previous_work_item_id")),
                     _optional_text(payload.get("current_work_item_id")),
+                    _optional_text(payload.get("next_work_item_id")),
                     str(payload["idempotency_key"]),
                     status,
                     now.isoformat(),
@@ -175,7 +182,7 @@ class SQLiteWorkflowContinuationStore:
                 (str(payload["idempotency_key"]),),
             ).fetchone()
         continuation = _continuation_from_row(row)
-        log_continuation_event("CONTINUATION_CREATED" if created else "CONTINUATION_ALREADY_EXISTS", continuation)
+        log_continuation_event("CONTINUATION_CREATED" if created else "CONTINUATION_REUSED", continuation)
         return continuation, created
 
     def create_failed_workflow_continuation(self, payload: dict[str, Any], *, reason: str) -> WorkflowContinuation:
@@ -187,7 +194,7 @@ class SQLiteWorkflowContinuationStore:
             last_error=reason,
             completed_at=datetime.now(UTC),
         )
-        log_continuation_event("CONTINUATION_FAILED", continuation)
+        log_continuation_event("CONTINUATION_FAILED", continuation, reason=reason)
         return continuation
 
     def acquire_workflow_continuation_lock(
@@ -226,7 +233,7 @@ class SQLiteWorkflowContinuationStore:
             log_continuation_event("CONTINUATION_LOCK_ACQUIRED", continuation)
             log_continuation_event("CONTINUATION_DISPATCH_STARTED", continuation)
         else:
-            log_continuation_event("CONTINUATION_ALREADY_EXISTS", continuation)
+            log_continuation_event("CONTINUATION_REUSED", continuation)
         return continuation, acquired
 
     def mark_workflow_continuation_dispatched(
@@ -239,9 +246,10 @@ class SQLiteWorkflowContinuationStore:
             continuation_id,
             WorkflowContinuationStatus.DISPATCHED,
             current_work_item_id=work_item_id,
+            next_work_item_id=work_item_id,
             last_error=None,
         )
-        log_continuation_event("CONTINUATION_DISPATCH_SUCCEEDED", continuation)
+        log_continuation_event("CONTINUATION_DISPATCHED", continuation)
         return continuation
 
     def mark_workflow_continuation_retry_pending(
@@ -251,8 +259,7 @@ class SQLiteWorkflowContinuationStore:
         error: str,
     ) -> WorkflowContinuation:
         continuation = self._update_status(continuation_id, WorkflowContinuationStatus.RETRY_PENDING, last_error=error)
-        log_continuation_event("CONTINUATION_DISPATCH_FAILED", continuation)
-        log_continuation_event("CONTINUATION_RETRY_SCHEDULED", continuation)
+        log_continuation_event("CONTINUATION_RETRY_PENDING", continuation, error=error)
         return continuation
 
     def mark_workflow_continuation_changes_requested(self, continuation_id: str) -> WorkflowContinuation:
@@ -293,6 +300,7 @@ class SQLiteWorkflowContinuationStore:
         status: WorkflowContinuationStatus,
         *,
         current_work_item_id: str | None = None,
+        next_work_item_id: str | None = None,
         last_error: str | None = None,
         completed_at: datetime | None = None,
     ) -> WorkflowContinuation:
@@ -303,6 +311,7 @@ class SQLiteWorkflowContinuationStore:
                 UPDATE workflow_continuations
                 SET status = ?,
                     current_work_item_id = COALESCE(?, current_work_item_id),
+                    next_work_item_id = COALESCE(?, next_work_item_id),
                     last_error = ?,
                     completed_at = COALESCE(?, completed_at),
                     updated_at = ?
@@ -311,6 +320,7 @@ class SQLiteWorkflowContinuationStore:
                 (
                     status.value,
                     current_work_item_id,
+                    next_work_item_id,
                     last_error,
                     completed_at.isoformat() if completed_at else None,
                     now.isoformat(),
@@ -333,14 +343,18 @@ def build_workflow_continuation_store(db_path: str | None) -> SQLiteWorkflowCont
 def workflow_continuation_idempotency_key(
     *,
     workflow_chain_id: str,
+    repository: str | None = None,
     pr_number: int,
     branch: str,
     next_workflow_step: str,
 ) -> str:
+    if repository:
+        return f"workflow-chain:{workflow_chain_id}:{repository}:{pr_number}:{branch}:{next_workflow_step}"
     return f"wf-chain:{workflow_chain_id}:{pr_number}:{branch}:{next_workflow_step}"
 
 
 def log_continuation_event(event_name: str, continuation: WorkflowContinuation, **extra: Any) -> None:
+    work_item_id = continuation.next_work_item_id or continuation.current_work_item_id
     log_event(
         event_name,
         workflow_chain_id=continuation.workflow_chain_id,
@@ -348,10 +362,11 @@ def log_continuation_event(event_name: str, continuation: WorkflowContinuation, 
         next_workflow_step=continuation.next_workflow_step,
         continuation_id=continuation.continuation_id,
         idempotency_key=continuation.idempotency_key,
-        work_item_id=continuation.current_work_item_id,
+        work_item_id=work_item_id,
         pr_number=continuation.pr_number,
         branch=continuation.branch,
         status=continuation.status.value,
+        retry_count=continuation.dispatch_attempts,
         **extra,
     )
 
@@ -360,6 +375,8 @@ def _continuation_from_row(row: sqlite3.Row | None) -> WorkflowContinuation:
     if row is None:
         raise LookupError("Workflow continuation row not found.")
     data = dict(row)
+    if not data.get("next_work_item_id"):
+        data["next_work_item_id"] = data.get("current_work_item_id")
     return WorkflowContinuation.model_validate(data)
 
 
