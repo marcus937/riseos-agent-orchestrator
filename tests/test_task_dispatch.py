@@ -1,13 +1,18 @@
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from app.clients.github import GitHubClient
+from app.github_events import GitHubEventType
 from app.reviewer.decision import ReviewDecisionType
+from app.review_queue import ReviewWorkItem
 from app.task_dispatch import (
     LABEL_AGENT_NEXT,
     AgentTaskIssue,
     build_circuit_assignment_body,
     dispatch_next_agent_task,
+    dispatch_workflow_chain_continuation,
     list_agent_ready_issues,
     select_next_agent_task,
     should_dispatch_next_task,
@@ -48,6 +53,15 @@ class FakeTaskDispatchClient:
         return {"labels": [label]}
 
 
+class FakeAgentBusDispatchClient:
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, Any]] = []
+
+    async def create_work_item(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.payloads.append(payload)
+        return {"work_item_id": f"workflow-chain-{len(self.payloads)}"}
+
+
 def issue(number: int, *, created_at: str, labels: list[str], title: str | None = None, body: str | None = None) -> dict[str, Any]:
     return {
         "number": number,
@@ -56,6 +70,36 @@ def issue(number: int, *, created_at: str, labels: list[str], title: str | None 
         "created_at": created_at,
         "labels": [{"name": label} for label in labels],
     }
+
+
+def workflow_item(step: str = "WF21") -> ReviewWorkItem:
+    now = datetime.now(UTC)
+    item = ReviewWorkItem(
+        id=str(uuid4()),
+        created_at=now,
+        updated_at=now,
+        repo_full_name="marcus937/jarvis-mission-control",
+        event_type=GitHubEventType.PULL_REQUEST,
+        branch="codex-m2/wf21-chain",
+        base_branch="agent-integration",
+        commit_sha="a" * 40,
+        issue_number=321,
+        pr_number=123,
+        agent_bus_work_item_id="agent-bus-wf21",
+    )
+    item.runtime_validation_context = {
+        "workflow_id": "workflow-123",
+        "review_dispatch": {
+            "workflow_chain_id": "wf-chain-123",
+            "workflow_step": step,
+            "repository": "marcus937/jarvis-mission-control",
+            "pr_number": 123,
+            "branch": "codex-m2/wf21-chain",
+            "base_branch": "agent-integration",
+            "commit_sha": "b" * 40,
+        },
+    }
+    return item
 
 
 def test_dispatch_disabled_does_nothing() -> None:
@@ -134,6 +178,99 @@ def test_dispatch_posts_assignment_comment_and_agent_next_label() -> None:
     assert "Never merge or deploy" in body
     assert "PR URL and completed commit SHA" in body
     assert "Implement task dispatch." in body
+
+
+def test_wf21_approval_dispatches_wf22_on_same_pr_branch() -> None:
+    agent_bus = FakeAgentBusDispatchClient()
+
+    result = run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF21"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+        )
+    )
+
+    assert result is not None
+    assert result.success is True
+    assert result.agent_bus_work_item_id == "workflow-chain-1"
+    payload = agent_bus.payloads[0]
+    assert payload["owner_agent"] == "codex-m2"
+    assert payload["review_agent"] == "bb2"
+    assert payload["repository"] == "marcus937/jarvis-mission-control"
+    assert payload["pr_number"] == 123
+    assert payload["metadata"]["workflow_step"] == "WF22"
+    assert payload["metadata"]["previous_workflow_step"] == "WF21"
+    assert payload["metadata"]["branch"] == "codex-m2/wf21-chain"
+    assert payload["metadata"]["previous_work_item_id"] == "agent-bus-wf21"
+
+
+def test_wf22_continuation_does_not_target_main_or_create_fresh_branch() -> None:
+    agent_bus = FakeAgentBusDispatchClient()
+
+    run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF21"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+        )
+    )
+
+    metadata = agent_bus.payloads[0]["metadata"]
+    assert metadata["workflow_step"] == "WF22"
+    assert metadata["base_branch"] == "agent-integration"
+    assert metadata["branch"] == "codex-m2/wf21-chain"
+    assert metadata["branch"] != "main"
+    assert metadata["reuse_existing_pr"] is True
+    assert metadata["create_new_pr"] is False
+    assert metadata["open_new_pr"] is False
+    assert metadata["merge_required_before_next_step"] is False
+
+
+def test_wf29_approval_does_not_dispatch_followup_work_item() -> None:
+    agent_bus = FakeAgentBusDispatchClient()
+
+    result = run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF29"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+        )
+    )
+
+    assert result is None
+    assert agent_bus.payloads == []
+
+
+def test_needs_changes_returns_to_codex_m2_on_same_pr_branch() -> None:
+    agent_bus = FakeAgentBusDispatchClient()
+
+    result = run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF24"),
+            ReviewDecisionType.NEEDS_CHANGES,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+        )
+    )
+
+    assert result is not None
+    payload = agent_bus.payloads[0]
+    assert payload["owner_agent"] == "codex-m2"
+    assert payload["review_agent"] == "bb2"
+    assert payload["pr_number"] == 123
+    assert payload["metadata"]["workflow_step"] == "WF24"
+    assert payload["metadata"]["previous_workflow_step"] == "WF24"
+    assert payload["metadata"]["dispatch_reason"] == "workflow_chain_needs_changes"
+    assert payload["metadata"]["branch"] == "codex-m2/wf21-chain"
+    assert payload["metadata"]["create_new_pr"] is False
 
 
 def test_assignment_comment_body_includes_circuit_instructions() -> None:
