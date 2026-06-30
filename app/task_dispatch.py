@@ -10,6 +10,13 @@ from app.config import Settings, get_settings
 from app.operational_logging import log_event
 from app.reviewer.decision import ReviewDecisionType
 from app.task_dependencies import dependency_state_for_issue
+from app.workflow_continuation import (
+    WorkflowContinuation,
+    WorkflowContinuationStatus,
+    WorkflowContinuationStore,
+    log_continuation_event,
+    workflow_continuation_idempotency_key,
+)
 
 
 LABEL_AGENT_TASK = "agent-task"
@@ -45,6 +52,11 @@ FINAL_WF_CHAIN_STEP = "WF29"
 WF_CHAIN_OWNER_AGENT = "codex-m2"
 WF_CHAIN_REVIEW_AGENT = "bb2"
 WF_CHAIN_BASE_BRANCH = "agent-integration"
+_EXISTING_WORK_STATUSES = {
+    WorkflowContinuationStatus.DISPATCHED,
+    WorkflowContinuationStatus.RUNNING,
+    WorkflowContinuationStatus.WAITING_FOR_REVIEW,
+}
 
 
 class TaskDispatchClient(Protocol):
@@ -103,6 +115,9 @@ class TaskDispatchResult(BaseModel):
     circuit_wakeup_attempted: bool = False
     circuit_wakeup_success: bool = False
     circuit_wakeup_error: str | None = None
+    continuation_id: str | None = None
+    continuation_status: str | None = None
+    idempotency_key: str | None = None
 
 
 def should_dispatch_next_task(decision: ReviewDecisionType) -> bool:
@@ -259,80 +274,126 @@ async def dispatch_workflow_chain_continuation(
     enabled: bool,
     agent_bus_client: AgentBusDispatchClient | None,
     agent_bus_enabled: bool,
+    continuation_store: WorkflowContinuationStore | None = None,
     base_branch: str = WF_CHAIN_BASE_BRANCH,
 ) -> TaskDispatchResult | None:
-    continuation = workflow_chain_continuation_for_decision(item, decision, base_branch=base_branch)
-    if continuation is None:
+    missing_reason = workflow_chain_missing_metadata_reason(item)
+    if missing_reason is not None:
+        return _record_missing_metadata_continuation(item, continuation_store, base_branch=base_branch, reason=missing_reason)
+
+    continuation_context = workflow_chain_continuation_for_decision(item, decision, base_branch=base_branch)
+    if continuation_context is None:
         return None
     if not enabled:
         return TaskDispatchResult()
+    if continuation_store is None:
+        return TaskDispatchResult(
+            attempted=True,
+            success=False,
+            error="Workflow continuation store is required for workflow chain continuation.",
+        )
 
-    payload = build_workflow_chain_work_item_payload(continuation)
-    log_event(
-        "wf_chain_continue_selected",
-        previous_work_item_id=continuation["previous_work_item_id"],
-        previous_workflow_step=continuation["previous_workflow_step"],
-        next_workflow_step=continuation["next_workflow_step"],
-        reused_pr_number=continuation["pr_number"],
-        reused_branch=continuation["branch"],
-        repository=continuation["repository"],
-        workflow_chain_id=continuation.get("workflow_chain_id"),
-        commit_sha=continuation.get("commit_sha"),
-        owner_agent=WF_CHAIN_OWNER_AGENT,
-        review_agent=WF_CHAIN_REVIEW_AGENT,
-        dispatch_reason=continuation["dispatch_reason"],
+    continuation, created = continuation_store.resolve_or_create_workflow_continuation(
+        build_workflow_continuation_payload(continuation_context)
+    )
+    if decision == ReviewDecisionType.NEEDS_CHANGES and continuation.current_work_item_id:
+        continuation = continuation_store.mark_workflow_continuation_changes_requested(continuation.continuation_id)
+        return _continuation_result(continuation, success=True, agent_bus_attempted=False)
+    if not created and continuation.status in _EXISTING_WORK_STATUSES and continuation.current_work_item_id:
+        return _continuation_result(continuation, success=True, agent_bus_attempted=False)
+
+    return await _dispatch_existing_workflow_continuation(
+        continuation,
+        agent_bus_client=agent_bus_client,
+        agent_bus_enabled=agent_bus_enabled,
+        continuation_store=continuation_store,
     )
 
-    lifecycle_events = ["agent_bus_dispatch_started"]
+
+async def resume_workflow_continuations(
+    continuation_store: WorkflowContinuationStore,
+    *,
+    agent_bus_client: AgentBusDispatchClient | None,
+    agent_bus_enabled: bool,
+) -> list[TaskDispatchResult]:
+    results: list[TaskDispatchResult] = []
+    for continuation in continuation_store.list_retryable_workflow_continuations():
+        result = await _dispatch_existing_workflow_continuation(
+            continuation,
+            agent_bus_client=agent_bus_client,
+            agent_bus_enabled=agent_bus_enabled,
+            continuation_store=continuation_store,
+            include_dispatching=True,
+            retry=True,
+        )
+        results.append(result)
+    return results
+
+
+async def _dispatch_existing_workflow_continuation(
+    continuation: WorkflowContinuation,
+    *,
+    agent_bus_client: AgentBusDispatchClient | None,
+    agent_bus_enabled: bool,
+    continuation_store: WorkflowContinuationStore,
+    include_dispatching: bool = False,
+    retry: bool = False,
+) -> TaskDispatchResult:
+    payload = build_workflow_chain_work_item_payload(workflow_chain_context_from_continuation(continuation))
     if not agent_bus_enabled:
-        return TaskDispatchResult(
-            attempted=True,
-            success=False,
-            issue_number=continuation.get("issue_number"),
+        continuation = continuation_store.mark_workflow_continuation_retry_pending(
+            continuation.continuation_id,
             error="Agent Bus dispatch is required for workflow chain continuation.",
-            agent_bus_attempted=False,
-            agent_bus_success=False,
-            agent_bus_payload=payload,
-            lifecycle_events=lifecycle_events,
         )
+        return _continuation_result(continuation, success=False, agent_bus_attempted=False, payload=payload)
     if agent_bus_client is None:
-        return TaskDispatchResult(
-            attempted=True,
-            success=False,
-            issue_number=continuation.get("issue_number"),
+        continuation = continuation_store.mark_workflow_continuation_retry_pending(
+            continuation.continuation_id,
             error="Agent Bus dispatch is enabled but no Agent Bus client is configured.",
-            agent_bus_attempted=True,
-            agent_bus_success=False,
-            agent_bus_error="Agent Bus dispatch is enabled but no Agent Bus client is configured.",
-            agent_bus_payload=payload,
-            lifecycle_events=lifecycle_events,
         )
+        return _continuation_result(continuation, success=False, agent_bus_attempted=True, payload=payload)
+
+    locked, acquired = continuation_store.acquire_workflow_continuation_lock(
+        continuation.continuation_id,
+        include_dispatching=include_dispatching,
+    )
+    if not acquired:
+        return _continuation_result(locked, success=bool(locked.current_work_item_id), agent_bus_attempted=False, payload=payload)
 
     try:
         response = await agent_bus_client.create_work_item(payload)
         raw_work_item_id = response.get("work_item_id") or response.get("id")
-        agent_bus_work_item_id = str(raw_work_item_id) if raw_work_item_id else None
-        agent_bus_success = agent_bus_work_item_id is not None
-        agent_bus_error = None if agent_bus_success else "Agent Bus work item response did not include work_item_id."
-        if agent_bus_success:
-            lifecycle_events.append("agent_bus_dispatch_completed")
+        work_item_id = str(raw_work_item_id) if raw_work_item_id else ""
+        if not work_item_id:
+            raise RuntimeError("Agent Bus work item response did not include work_item_id.")
+        dispatched = continuation_store.mark_workflow_continuation_dispatched(locked.continuation_id, work_item_id=work_item_id)
+        if retry:
+            log_continuation_event("CONTINUATION_RETRY_SUCCEEDED", dispatched)
+        return _continuation_result(dispatched, success=True, agent_bus_attempted=True, payload=payload)
     except Exception as exc:
-        agent_bus_work_item_id = None
-        agent_bus_success = False
-        agent_bus_error = str(exc)
+        failed = continuation_store.mark_workflow_continuation_retry_pending(locked.continuation_id, error=str(exc))
+        return _continuation_result(failed, success=False, agent_bus_attempted=True, payload=payload)
 
-    return TaskDispatchResult(
-        attempted=True,
-        success=agent_bus_success,
-        issue_number=continuation.get("issue_number"),
-        error=agent_bus_error,
-        agent_bus_attempted=True,
-        agent_bus_success=agent_bus_success,
-        agent_bus_work_item_id=agent_bus_work_item_id,
-        agent_bus_error=agent_bus_error,
-        agent_bus_payload=payload,
-        lifecycle_events=lifecycle_events,
+
+def build_workflow_continuation_payload(context: dict[str, Any]) -> dict[str, Any]:
+    idempotency_key = workflow_continuation_idempotency_key(
+        workflow_chain_id=context["workflow_chain_id"],
+        pr_number=context["pr_number"],
+        branch=context["branch"],
+        next_workflow_step=context["next_workflow_step"],
     )
+    return {
+        "workflow_chain_id": context["workflow_chain_id"],
+        "current_workflow_step": context["previous_workflow_step"],
+        "next_workflow_step": context["next_workflow_step"],
+        "repository": context["repository"],
+        "pr_number": context["pr_number"],
+        "branch": context["branch"],
+        "base_branch": context.get("base_branch"),
+        "previous_work_item_id": context.get("previous_work_item_id"),
+        "current_work_item_id": context.get("current_work_item_id"),
+        "idempotency_key": idempotency_key,
+    }
 
 
 def build_agent_bus_work_item_payload(
@@ -388,6 +449,8 @@ def build_workflow_chain_work_item_payload(continuation: dict[str, Any]) -> dict
         "base_branch": continuation["base_branch"],
         "commit_sha": continuation.get("commit_sha"),
         "issue_number": continuation.get("issue_number"),
+        "continuation_id": continuation.get("continuation_id"),
+        "idempotency_key": continuation.get("idempotency_key"),
         "reuse_existing_pr": True,
         "create_new_pr": False,
         "open_new_pr": False,
@@ -450,7 +513,14 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
             runtime_context.get("workflowStep"),
         )
     )
-    if workflow_step not in WF_CHAIN_STEPS:
+    workflow_chain_id = _string_or_none(
+        _first_present(
+            review_dispatch.get("workflow_chain_id"),
+            review_dispatch.get("workflowChainId"),
+            runtime_context.get("workflow_chain_id"),
+        )
+    )
+    if workflow_step not in WF_CHAIN_STEPS or not workflow_chain_id:
         return None
 
     repo = _string_or_none(getattr(item, "repo_full_name", None)) or _string_or_none(
@@ -479,14 +549,7 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
         "commit_sha": _string_or_none(
             _first_present(getattr(item, "commit_sha", None), review_dispatch.get("commit_sha"), runtime_context.get("commit_sha"))
         ),
-        "workflow_chain_id": _string_or_none(
-            _first_present(
-                review_dispatch.get("workflow_chain_id"),
-                review_dispatch.get("workflowChainId"),
-                runtime_context.get("workflow_chain_id"),
-                runtime_context.get("workflow_id"),
-            )
-        ),
+        "workflow_chain_id": workflow_chain_id,
         "workflow_step": workflow_step,
         "previous_workflow_step": workflow_step,
         "previous_work_item_id": _string_or_none(
@@ -499,6 +562,49 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
         ),
         "previous_review_queue_item_id": _string_or_none(getattr(item, "id", None)),
     }
+
+
+def workflow_chain_context_from_continuation(continuation: WorkflowContinuation) -> dict[str, Any]:
+    return {
+        "repository": continuation.repository,
+        "issue_number": None,
+        "pr_number": continuation.pr_number,
+        "branch": continuation.branch,
+        "base_branch": continuation.base_branch or WF_CHAIN_BASE_BRANCH,
+        "commit_sha": None,
+        "workflow_chain_id": continuation.workflow_chain_id,
+        "workflow_step": continuation.current_workflow_step,
+        "previous_workflow_step": continuation.current_workflow_step,
+        "next_workflow_step": continuation.next_workflow_step,
+        "previous_work_item_id": continuation.previous_work_item_id,
+        "previous_review_queue_item_id": None,
+        "continuation_id": continuation.continuation_id,
+        "idempotency_key": continuation.idempotency_key,
+        "dispatch_reason": "workflow_chain_retry" if continuation.status == WorkflowContinuationStatus.RETRY_PENDING else "workflow_chain_approval_continuation",
+    }
+
+
+def workflow_chain_missing_metadata_reason(item: Any) -> str | None:
+    runtime_context = _dict_value(getattr(item, "runtime_validation_context", None))
+    review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
+    if not runtime_context or not review_dispatch:
+        return None
+    workflow_step = _first_present(
+        review_dispatch.get("workflow_step"),
+        review_dispatch.get("workflowStep"),
+        runtime_context.get("workflow_step"),
+        runtime_context.get("workflowStep"),
+    )
+    workflow_chain_id = _first_present(
+        review_dispatch.get("workflow_chain_id"),
+        review_dispatch.get("workflowChainId"),
+        runtime_context.get("workflow_chain_id"),
+    )
+    if workflow_step and workflow_chain_id:
+        return None
+    if workflow_step or workflow_chain_id or runtime_context.get("source") == "runtime_validation_bb2_packet":
+        return "MISSING_WORKFLOW_METADATA"
+    return None
 
 
 def workflow_chain_ready_to_merge_deferred(item: Any, decision: ReviewDecisionType) -> bool:
@@ -538,6 +644,88 @@ def build_circuit_assignment_body(issue: AgentTaskIssue) -> str:
         "- Comment `Status: Done` with the PR URL and completed commit SHA when finished.\n\n"
         "Task summary:\n"
         f"{task_summary}"
+    )
+
+
+def _record_missing_metadata_continuation(
+    item: Any,
+    continuation_store: WorkflowContinuationStore | None,
+    *,
+    base_branch: str,
+    reason: str,
+) -> TaskDispatchResult:
+    repo = _string_or_none(getattr(item, "repo_full_name", None)) or "UNKNOWN_REPOSITORY"
+    branch = _string_or_none(getattr(item, "branch", None)) or "UNKNOWN_BRANCH"
+    pr_number = _int_or_none(getattr(item, "pr_number", None)) or 0
+    workflow_chain_id = f"UNKNOWN:{_string_or_none(getattr(item, 'id', None)) or 'untracked'}"
+    idempotency_key = workflow_continuation_idempotency_key(
+        workflow_chain_id=workflow_chain_id,
+        pr_number=pr_number,
+        branch=branch,
+        next_workflow_step="UNKNOWN",
+    )
+    payload = {
+        "workflow_chain_id": workflow_chain_id,
+        "current_workflow_step": "UNKNOWN",
+        "next_workflow_step": "UNKNOWN",
+        "repository": repo,
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "previous_work_item_id": _string_or_none(getattr(item, "agent_bus_work_item_id", None)) or _string_or_none(getattr(item, "id", None)),
+        "idempotency_key": idempotency_key,
+    }
+    if continuation_store is not None:
+        continuation = continuation_store.create_failed_workflow_continuation(payload, reason=reason)
+        continuation_id = continuation.continuation_id
+        continuation_status = continuation.status.value
+    else:
+        continuation_id = None
+        continuation_status = WorkflowContinuationStatus.FAILED.value
+    log_event(
+        "CONTINUATION_FAILED",
+        workflow_chain_id=workflow_chain_id,
+        current_workflow_step="UNKNOWN",
+        next_workflow_step="UNKNOWN",
+        continuation_id=continuation_id,
+        idempotency_key=idempotency_key,
+        work_item_id=payload["previous_work_item_id"],
+        pr_number=pr_number,
+        branch=branch,
+        status=continuation_status,
+        reason=reason,
+    )
+    return TaskDispatchResult(
+        attempted=True,
+        success=False,
+        error=reason,
+        continuation_id=continuation_id,
+        continuation_status=continuation_status,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _continuation_result(
+    continuation: WorkflowContinuation,
+    *,
+    success: bool,
+    agent_bus_attempted: bool,
+    payload: dict[str, Any] | None = None,
+) -> TaskDispatchResult:
+    return TaskDispatchResult(
+        attempted=True,
+        success=success,
+        issue_number=None,
+        error=continuation.last_error,
+        agent_bus_attempted=agent_bus_attempted,
+        agent_bus_success=success and agent_bus_attempted,
+        agent_bus_work_item_id=continuation.current_work_item_id,
+        agent_bus_error=continuation.last_error,
+        agent_bus_payload=payload,
+        lifecycle_events=["agent_bus_dispatch_completed"] if success and agent_bus_attempted else [],
+        continuation_id=continuation.continuation_id,
+        continuation_status=continuation.status.value,
+        idempotency_key=continuation.idempotency_key,
     )
 
 
