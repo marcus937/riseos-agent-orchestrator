@@ -16,6 +16,7 @@ from app.circuit_runtime_validation import (
 )
 from app.config import Settings, get_settings
 from app.operational_logging import log_event
+from app.runtime_validation_agent_bus_bridge import advance_agent_bus_from_runtime_validation
 from app.runtime_validation_handoff_trace import install_runtime_validation_handoff_trace
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
 
@@ -75,6 +76,7 @@ async def create_runtime_validation(
         settings,
         storage=getattr(http_request.app.state, "storage", None),
     )
+    await advance_agent_bus_from_runtime_validation(result, settings)
     return result
 
 
