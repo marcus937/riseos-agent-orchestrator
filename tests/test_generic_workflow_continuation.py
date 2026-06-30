@@ -195,7 +195,12 @@ def test_generic_final_step_does_not_dispatch_and_allows_ready_to_merge(tmp_path
         )
     )
     response = _review_response_for_generic_step("gamma", sequence)
-    writeback = run(writeback_review_decision(response, FakeWritebackClient(["bb-review-needed"])))
+    writeback = run(
+        writeback_review_decision(
+            response,
+            FakeWritebackClient(["runtime-agent", "playwright", "agent-verified", "bb-review-needed"]),
+        )
+    )
 
     assert result is None
     assert agent_bus.payloads == []
