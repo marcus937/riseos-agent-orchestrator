@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -14,9 +15,11 @@ from app.task_dispatch import (
     dispatch_next_agent_task,
     dispatch_workflow_chain_continuation,
     list_agent_ready_issues,
+    resume_workflow_continuations,
     select_next_agent_task,
     should_dispatch_next_task,
 )
+from app.workflow_continuation import SQLiteWorkflowContinuationStore, WorkflowContinuationStatus
 
 
 def run(coro: Any) -> Any:
@@ -54,11 +57,14 @@ class FakeTaskDispatchClient:
 
 
 class FakeAgentBusDispatchClient:
-    def __init__(self) -> None:
+    def __init__(self, *, fail: bool = False) -> None:
         self.payloads: list[dict[str, Any]] = []
+        self.fail = fail
 
     async def create_work_item(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.payloads.append(payload)
+        if self.fail:
+            raise RuntimeError("agent bus unavailable")
         return {"work_item_id": f"workflow-chain-{len(self.payloads)}"}
 
 
@@ -70,6 +76,10 @@ def issue(number: int, *, created_at: str, labels: list[str], title: str | None 
         "created_at": created_at,
         "labels": [{"name": label} for label in labels],
     }
+
+
+def continuation_store(tmp_path: Path) -> SQLiteWorkflowContinuationStore:
+    return SQLiteWorkflowContinuationStore(str(tmp_path / "continuations.db"))
 
 
 def workflow_item(step: str = "WF21") -> ReviewWorkItem:
@@ -180,8 +190,9 @@ def test_dispatch_posts_assignment_comment_and_agent_next_label() -> None:
     assert "Implement task dispatch." in body
 
 
-def test_wf21_approval_dispatches_wf22_on_same_pr_branch() -> None:
+def test_wf21_approval_dispatches_wf22_on_same_pr_branch(tmp_path: Path) -> None:
     agent_bus = FakeAgentBusDispatchClient()
+    store = continuation_store(tmp_path)
 
     result = run(
         dispatch_workflow_chain_continuation(
@@ -190,12 +201,14 @@ def test_wf21_approval_dispatches_wf22_on_same_pr_branch() -> None:
             enabled=True,
             agent_bus_client=agent_bus,
             agent_bus_enabled=True,
+            continuation_store=store,
         )
     )
 
     assert result is not None
     assert result.success is True
     assert result.agent_bus_work_item_id == "workflow-chain-1"
+    assert result.continuation_id is not None
     payload = agent_bus.payloads[0]
     assert payload["owner_agent"] == "codex-m2"
     assert payload["review_agent"] == "bb2"
@@ -205,9 +218,13 @@ def test_wf21_approval_dispatches_wf22_on_same_pr_branch() -> None:
     assert payload["metadata"]["previous_workflow_step"] == "WF21"
     assert payload["metadata"]["branch"] == "codex-m2/wf21-chain"
     assert payload["metadata"]["previous_work_item_id"] == "agent-bus-wf21"
+    assert payload["metadata"]["continuation_id"] == result.continuation_id
+    rows = store.list_workflow_continuations("wf-chain-123")
+    assert len(rows) == 1
+    assert rows[0].status == WorkflowContinuationStatus.DISPATCHED
 
 
-def test_wf22_continuation_does_not_target_main_or_create_fresh_branch() -> None:
+def test_wf22_continuation_does_not_target_main_or_create_fresh_branch(tmp_path: Path) -> None:
     agent_bus = FakeAgentBusDispatchClient()
 
     run(
@@ -217,6 +234,7 @@ def test_wf22_continuation_does_not_target_main_or_create_fresh_branch() -> None
             enabled=True,
             agent_bus_client=agent_bus,
             agent_bus_enabled=True,
+            continuation_store=continuation_store(tmp_path),
         )
     )
 
@@ -231,7 +249,7 @@ def test_wf22_continuation_does_not_target_main_or_create_fresh_branch() -> None
     assert metadata["merge_required_before_next_step"] is False
 
 
-def test_wf29_approval_does_not_dispatch_followup_work_item() -> None:
+def test_wf29_approval_does_not_dispatch_followup_work_item(tmp_path: Path) -> None:
     agent_bus = FakeAgentBusDispatchClient()
 
     result = run(
@@ -241,6 +259,7 @@ def test_wf29_approval_does_not_dispatch_followup_work_item() -> None:
             enabled=True,
             agent_bus_client=agent_bus,
             agent_bus_enabled=True,
+            continuation_store=continuation_store(tmp_path),
         )
     )
 
@@ -248,7 +267,7 @@ def test_wf29_approval_does_not_dispatch_followup_work_item() -> None:
     assert agent_bus.payloads == []
 
 
-def test_needs_changes_returns_to_codex_m2_on_same_pr_branch() -> None:
+def test_needs_changes_returns_to_codex_m2_on_same_pr_branch(tmp_path: Path) -> None:
     agent_bus = FakeAgentBusDispatchClient()
 
     result = run(
@@ -258,6 +277,7 @@ def test_needs_changes_returns_to_codex_m2_on_same_pr_branch() -> None:
             enabled=True,
             agent_bus_client=agent_bus,
             agent_bus_enabled=True,
+            continuation_store=continuation_store(tmp_path),
         )
     )
 
@@ -271,6 +291,234 @@ def test_needs_changes_returns_to_codex_m2_on_same_pr_branch() -> None:
     assert payload["metadata"]["dispatch_reason"] == "workflow_chain_needs_changes"
     assert payload["metadata"]["branch"] == "codex-m2/wf21-chain"
     assert payload["metadata"]["create_new_pr"] is False
+
+
+def test_duplicate_approval_reuses_existing_continuation(tmp_path: Path) -> None:
+    agent_bus = FakeAgentBusDispatchClient()
+    store = continuation_store(tmp_path)
+    item = workflow_item("WF21")
+
+    first = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+    second = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    assert first is not None and second is not None
+    assert first.continuation_id == second.continuation_id
+    assert first.agent_bus_work_item_id == second.agent_bus_work_item_id
+    assert len(agent_bus.payloads) == 1
+    assert len(store.list_workflow_continuations("wf-chain-123")) == 1
+
+
+def test_agent_bus_outage_preserves_retry_pending_continuation(tmp_path: Path) -> None:
+    store = continuation_store(tmp_path)
+    failing_agent_bus = FakeAgentBusDispatchClient(fail=True)
+
+    result = run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF21"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=failing_agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    assert result is not None
+    assert result.success is False
+    assert result.continuation_status == WorkflowContinuationStatus.RETRY_PENDING.value
+    rows = store.list_workflow_continuations("wf-chain-123")
+    assert len(rows) == 1
+    assert rows[0].status == WorkflowContinuationStatus.RETRY_PENDING
+    assert rows[0].last_error == "agent bus unavailable"
+
+
+def test_orchestrator_restart_resumes_retry_pending_continuation(tmp_path: Path) -> None:
+    db_path = tmp_path / "continuations.db"
+    store = SQLiteWorkflowContinuationStore(str(db_path))
+    failing_agent_bus = FakeAgentBusDispatchClient(fail=True)
+    run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF21"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=failing_agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    restarted_store = SQLiteWorkflowContinuationStore(str(db_path))
+    recovered_agent_bus = FakeAgentBusDispatchClient()
+    results = run(
+        resume_workflow_continuations(
+            restarted_store,
+            agent_bus_client=recovered_agent_bus,
+            agent_bus_enabled=True,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].success is True
+    assert results[0].continuation_status == WorkflowContinuationStatus.DISPATCHED.value
+    assert len(restarted_store.list_workflow_continuations("wf-chain-123")) == 1
+    assert len(recovered_agent_bus.payloads) == 1
+
+
+def test_duplicate_retry_reuses_existing_continuation(tmp_path: Path) -> None:
+    store = continuation_store(tmp_path)
+    failing_agent_bus = FakeAgentBusDispatchClient(fail=True)
+    item = workflow_item("WF22")
+    run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=failing_agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    recovered_agent_bus = FakeAgentBusDispatchClient()
+    first_retry = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=recovered_agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+    second_retry = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=recovered_agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    assert first_retry is not None and second_retry is not None
+    assert first_retry.continuation_id == second_retry.continuation_id
+    assert len(recovered_agent_bus.payloads) == 1
+    rows = store.list_workflow_continuations("wf-chain-123")
+    assert len(rows) == 1
+    assert rows[0].status == WorkflowContinuationStatus.DISPATCHED
+
+
+def test_needs_changes_reuses_existing_continuation(tmp_path: Path) -> None:
+    store = continuation_store(tmp_path)
+    agent_bus = FakeAgentBusDispatchClient()
+    item = workflow_item("WF24")
+    first = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.NEEDS_CHANGES,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+    second = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.NEEDS_CHANGES,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    assert first is not None and second is not None
+    assert first.continuation_id == second.continuation_id
+    assert second.continuation_status == WorkflowContinuationStatus.CHANGES_REQUESTED.value
+    assert len(agent_bus.payloads) == 1
+    assert len(store.list_workflow_continuations("wf-chain-123")) == 1
+
+
+def test_continuation_survives_wf21_to_wf23_progression(tmp_path: Path) -> None:
+    store = continuation_store(tmp_path)
+    agent_bus = FakeAgentBusDispatchClient()
+
+    run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF21"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+    run(
+        dispatch_workflow_chain_continuation(
+            workflow_item("WF22"),
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    rows = store.list_workflow_continuations("wf-chain-123")
+    assert [row.next_workflow_step for row in rows] == ["WF22", "WF23"]
+    assert len(agent_bus.payloads) == 2
+
+
+def test_missing_workflow_metadata_never_dispatches_fresh_task(tmp_path: Path) -> None:
+    store = continuation_store(tmp_path)
+    agent_bus = FakeAgentBusDispatchClient()
+    item = workflow_item("WF21")
+    item.runtime_validation_context = {
+        "source": "runtime_validation_bb2_packet",
+        "review_dispatch": {
+            "workflow_step": "WF21",
+            "repository": "marcus937/jarvis-mission-control",
+            "pr_number": 123,
+            "branch": "codex-m2/wf21-chain",
+        },
+    }
+
+    result = run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=store,
+        )
+    )
+
+    assert result is not None
+    assert result.success is False
+    assert result.error == "MISSING_WORKFLOW_METADATA"
+    assert result.continuation_status == WorkflowContinuationStatus.FAILED.value
+    assert agent_bus.payloads == []
 
 
 def test_assignment_comment_body_includes_circuit_instructions() -> None:
