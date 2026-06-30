@@ -1,3 +1,11 @@
+"""Bridge Hermes runtime validation results into the Agent Bus lifecycle.
+
+Hermes PASSED is treated as approval for the Agent Bus workflow gate only: it
+means the runtime validation evidence is sufficient to advance and complete the
+original WorkItem. It is intentionally not PR merge authorization and must not be
+used to merge GitHub pull requests or bypass human/BB2 code-review policy.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Protocol
@@ -47,7 +55,12 @@ async def advance_agent_bus_from_runtime_validation(
     *,
     agent_bus_client: AgentBusLifecycleClient | None = None,
 ) -> dict[str, Any] | None:
-    """Advance the original Agent Bus WorkItem after terminal Hermes validation."""
+    """Advance the original Agent Bus WorkItem after terminal Hermes validation.
+
+    A passing Hermes result is intentionally equivalent to BB2 approval only for
+    Agent Bus workflow progression. It authorizes READY_FOR_REVIEW through
+    COMPLETED transitions for the WorkItem; it does not authorize merging a PR.
+    """
 
     context = _bridge_context(result, settings)
     if not settings.enable_agent_bus_dispatch:
@@ -280,6 +293,12 @@ def _bridge_metadata(result: RuntimeValidationResult) -> dict[str, Any]:
     return _compact(
         {
             "source": "runtime_validation_agent_bus_bridge",
+            "approval_scope": "agent_bus_workflow_progression_only",
+            "merge_authorization": False,
+            "approval_boundary": (
+                "Hermes PASSED satisfies runtime-validation evidence for Agent Bus WorkItem progression; "
+                "it does not authorize PR merge or bypass BB2/human code-review policy."
+            ),
             "workflow_id": result.workflow_id,
             "runtime_validation_id": result.validation_id,
             "work_item_id": result.work_item_id,
