@@ -48,7 +48,6 @@ BB2_DECISION_LABELS = {
 
 DEFAULT_AGENT_BUS_PRIORITY = "normal"
 WF_CHAIN_STEPS = tuple(f"WF{step}" for step in range(21, 30))
-FINAL_WF_CHAIN_STEP = "WF29"
 WF_CHAIN_OWNER_AGENT = "codex-m2"
 WF_CHAIN_REVIEW_AGENT = "bb2"
 WF_CHAIN_BASE_BRANCH = "agent-integration"
@@ -56,6 +55,7 @@ _EXISTING_WORK_STATUSES = {
     WorkflowContinuationStatus.DISPATCHED,
     WorkflowContinuationStatus.RUNNING,
     WorkflowContinuationStatus.WAITING_FOR_REVIEW,
+    WorkflowContinuationStatus.COMPLETED,
 }
 
 
@@ -283,6 +283,8 @@ async def dispatch_workflow_chain_continuation(
 
     continuation_context = workflow_chain_continuation_for_decision(item, decision, base_branch=base_branch)
     if continuation_context is None:
+        if workflow_chain_context_from_item(item, base_branch=base_branch) is not None:
+            log_event("CONTINUATION_SKIPPED_FINAL_STEP", **_workflow_chain_log_context(item))
         return None
     if not enabled:
         return TaskDispatchResult()
@@ -296,10 +298,11 @@ async def dispatch_workflow_chain_continuation(
     continuation, created = continuation_store.resolve_or_create_workflow_continuation(
         build_workflow_continuation_payload(continuation_context)
     )
-    if decision == ReviewDecisionType.NEEDS_CHANGES and continuation.current_work_item_id:
+    existing_work_item_id = continuation.next_work_item_id or continuation.current_work_item_id
+    if decision == ReviewDecisionType.NEEDS_CHANGES and existing_work_item_id:
         continuation = continuation_store.mark_workflow_continuation_changes_requested(continuation.continuation_id)
         return _continuation_result(continuation, success=True, agent_bus_attempted=False)
-    if not created and continuation.status in _EXISTING_WORK_STATUSES and continuation.current_work_item_id:
+    if not created and continuation.status in _EXISTING_WORK_STATUSES and existing_work_item_id:
         return _continuation_result(continuation, success=True, agent_bus_attempted=False)
 
     return await _dispatch_existing_workflow_continuation(
@@ -358,7 +361,7 @@ async def _dispatch_existing_workflow_continuation(
         include_dispatching=include_dispatching,
     )
     if not acquired:
-        return _continuation_result(locked, success=bool(locked.current_work_item_id), agent_bus_attempted=False, payload=payload)
+        return _continuation_result(locked, success=bool(locked.next_work_item_id or locked.current_work_item_id), agent_bus_attempted=False, payload=payload)
 
     try:
         response = await agent_bus_client.create_work_item(payload)
@@ -378,6 +381,7 @@ async def _dispatch_existing_workflow_continuation(
 def build_workflow_continuation_payload(context: dict[str, Any]) -> dict[str, Any]:
     idempotency_key = workflow_continuation_idempotency_key(
         workflow_chain_id=context["workflow_chain_id"],
+        repository=context["repository"],
         pr_number=context["pr_number"],
         branch=context["branch"],
         next_workflow_step=context["next_workflow_step"],
@@ -386,12 +390,14 @@ def build_workflow_continuation_payload(context: dict[str, Any]) -> dict[str, An
         "workflow_chain_id": context["workflow_chain_id"],
         "current_workflow_step": context["previous_workflow_step"],
         "next_workflow_step": context["next_workflow_step"],
+        "workflow_steps": context.get("workflow_steps"),
         "repository": context["repository"],
         "pr_number": context["pr_number"],
         "branch": context["branch"],
         "base_branch": context.get("base_branch"),
         "previous_work_item_id": context.get("previous_work_item_id"),
         "current_work_item_id": context.get("current_work_item_id"),
+        "next_work_item_id": context.get("next_work_item_id"),
         "idempotency_key": idempotency_key,
     }
 
@@ -441,6 +447,9 @@ def build_workflow_chain_work_item_payload(continuation: dict[str, Any]) -> dict
         "workflow_chain_id": continuation.get("workflow_chain_id"),
         "workflow_step": continuation["next_workflow_step"],
         "previous_workflow_step": continuation["previous_workflow_step"],
+        "workflow_steps": continuation.get("workflow_steps"),
+        "workflow_sequence": continuation.get("workflow_steps"),
+        "next_workflow_step": continuation.get("following_workflow_step"),
         "previous_work_item_id": continuation["previous_work_item_id"],
         "previous_review_queue_item_id": continuation.get("previous_review_queue_item_id"),
         "repository": continuation["repository"],
@@ -489,14 +498,20 @@ def workflow_chain_continuation_for_decision(
         return None
     current_step = context["workflow_step"]
     if decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
-        next_step = next_workflow_chain_step(current_step)
+        next_step = next_workflow_chain_step(
+            current_step,
+            workflow_steps=context.get("workflow_steps"),
+            explicit_next=context.get("next_workflow_step"),
+        )
         if next_step is None:
             return None
         context["next_workflow_step"] = next_step
+        context["following_workflow_step"] = next_workflow_chain_step(next_step, workflow_steps=context.get("workflow_steps"))
         context["dispatch_reason"] = "workflow_chain_approval_continuation"
         return context
     if decision == ReviewDecisionType.NEEDS_CHANGES:
         context["next_workflow_step"] = current_step
+        context["following_workflow_step"] = next_workflow_chain_step(current_step, workflow_steps=context.get("workflow_steps"))
         context["dispatch_reason"] = "workflow_chain_needs_changes"
         return context
     return None
@@ -520,7 +535,18 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
             runtime_context.get("workflow_chain_id"),
         )
     )
-    if workflow_step not in WF_CHAIN_STEPS or not workflow_chain_id:
+    workflow_steps = _workflow_steps_from_context(review_dispatch, runtime_context)
+    explicit_next = _normalize_workflow_step(
+        _first_present(
+            review_dispatch.get("next_workflow_step"),
+            review_dispatch.get("nextWorkflowStep"),
+            runtime_context.get("next_workflow_step"),
+            runtime_context.get("nextWorkflowStep"),
+        )
+    )
+    if not workflow_step or not workflow_chain_id:
+        return None
+    if not workflow_steps and explicit_next is None and workflow_step not in WF_CHAIN_STEPS:
         return None
 
     repo = _string_or_none(getattr(item, "repo_full_name", None)) or _string_or_none(
@@ -551,6 +577,8 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
         ),
         "workflow_chain_id": workflow_chain_id,
         "workflow_step": workflow_step,
+        "workflow_steps": workflow_steps,
+        "next_workflow_step": explicit_next,
         "previous_workflow_step": workflow_step,
         "previous_work_item_id": _string_or_none(
             _first_present(
@@ -565,6 +593,7 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
 
 
 def workflow_chain_context_from_continuation(continuation: WorkflowContinuation) -> dict[str, Any]:
+    workflow_steps = continuation.workflow_steps
     dispatch_reason = "workflow_chain_approval_continuation"
     if continuation.next_workflow_step == continuation.current_workflow_step:
         dispatch_reason = "workflow_chain_needs_changes"
@@ -579,8 +608,10 @@ def workflow_chain_context_from_continuation(continuation: WorkflowContinuation)
         "commit_sha": None,
         "workflow_chain_id": continuation.workflow_chain_id,
         "workflow_step": continuation.current_workflow_step,
+        "workflow_steps": workflow_steps,
         "previous_workflow_step": continuation.current_workflow_step,
         "next_workflow_step": continuation.next_workflow_step,
+        "following_workflow_step": next_workflow_chain_step(continuation.next_workflow_step, workflow_steps=workflow_steps),
         "previous_work_item_id": continuation.previous_work_item_id,
         "previous_review_queue_item_id": None,
         "continuation_id": continuation.continuation_id,
@@ -594,20 +625,32 @@ def workflow_chain_missing_metadata_reason(item: Any) -> str | None:
     review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
     if not runtime_context or not review_dispatch:
         return None
-    workflow_step = _first_present(
-        review_dispatch.get("workflow_step"),
-        review_dispatch.get("workflowStep"),
-        runtime_context.get("workflow_step"),
-        runtime_context.get("workflowStep"),
-    )
-    workflow_chain_id = _first_present(
-        review_dispatch.get("workflow_chain_id"),
-        review_dispatch.get("workflowChainId"),
-        runtime_context.get("workflow_chain_id"),
-    )
-    if workflow_step and workflow_chain_id:
+    fields = {
+        "workflow_step": _first_present(
+            review_dispatch.get("workflow_step"),
+            review_dispatch.get("workflowStep"),
+            runtime_context.get("workflow_step"),
+            runtime_context.get("workflowStep"),
+        ),
+        "workflow_chain_id": _first_present(
+            review_dispatch.get("workflow_chain_id"),
+            review_dispatch.get("workflowChainId"),
+            runtime_context.get("workflow_chain_id"),
+        ),
+        "repository": _first_present(getattr(item, "repo_full_name", None), review_dispatch.get("repository"), runtime_context.get("repository"), runtime_context.get("repo")),
+        "pr_number": _first_present(getattr(item, "pr_number", None), review_dispatch.get("pr_number"), runtime_context.get("pr_number")),
+        "branch": _first_present(getattr(item, "branch", None), review_dispatch.get("branch"), runtime_context.get("branch")),
+    }
+    chain_like = any(fields.values()) or runtime_context.get("source") == "runtime_validation_bb2_packet"
+    if not chain_like:
         return None
-    if workflow_step or workflow_chain_id or runtime_context.get("source") == "runtime_validation_bb2_packet":
+    missing = [name for name, value in fields.items() if value in (None, "")]
+    if missing:
+        return "MISSING_WORKFLOW_METADATA"
+    workflow_steps = _workflow_steps_from_context(review_dispatch, runtime_context)
+    explicit_next = _first_present(review_dispatch.get("next_workflow_step"), review_dispatch.get("nextWorkflowStep"), runtime_context.get("next_workflow_step"), runtime_context.get("nextWorkflowStep"))
+    workflow_step = _normalize_workflow_step(fields["workflow_step"])
+    if not workflow_steps and not explicit_next and workflow_step not in WF_CHAIN_STEPS:
         return "MISSING_WORKFLOW_METADATA"
     return None
 
@@ -615,8 +658,14 @@ def workflow_chain_missing_metadata_reason(item: Any) -> str | None:
 def workflow_chain_ready_to_merge_deferred(item: Any, decision: ReviewDecisionType) -> bool:
     if decision != ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
         return False
-    step = workflow_chain_step_from_item(item)
-    return step in WF_CHAIN_STEPS and step != FINAL_WF_CHAIN_STEP
+    context = workflow_chain_context_from_item(item)
+    if context is None:
+        return False
+    return next_workflow_chain_step(
+        context["workflow_step"],
+        workflow_steps=context.get("workflow_steps"),
+        explicit_next=context.get("next_workflow_step"),
+    ) is not None
 
 
 def workflow_chain_step_from_item(item: Any) -> str | None:
@@ -624,13 +673,27 @@ def workflow_chain_step_from_item(item: Any) -> str | None:
     return context["workflow_step"] if context else None
 
 
-def next_workflow_chain_step(workflow_step: str) -> str | None:
-    if workflow_step not in WF_CHAIN_STEPS:
-        return None
-    index = WF_CHAIN_STEPS.index(workflow_step)
-    if index >= len(WF_CHAIN_STEPS) - 1:
-        return None
-    return WF_CHAIN_STEPS[index + 1]
+def next_workflow_chain_step(
+    workflow_step: str,
+    *,
+    workflow_steps: list[str] | None = None,
+    explicit_next: str | None = None,
+) -> str | None:
+    if explicit_next:
+        return _normalize_workflow_step(explicit_next)
+    if workflow_steps:
+        normalized = [_normalize_workflow_step(step) for step in workflow_steps]
+        normalized = [step for step in normalized if step]
+        if workflow_step in normalized:
+            index = normalized.index(workflow_step)
+            if index < len(normalized) - 1:
+                return normalized[index + 1]
+            return None
+    if workflow_step in WF_CHAIN_STEPS:
+        index = WF_CHAIN_STEPS.index(workflow_step)
+        if index < len(WF_CHAIN_STEPS) - 1:
+            return WF_CHAIN_STEPS[index + 1]
+    return None
 
 
 def build_circuit_assignment_body(issue: AgentTaskIssue) -> str:
@@ -665,6 +728,7 @@ def _record_missing_metadata_continuation(
     workflow_chain_id = f"UNKNOWN:{_string_or_none(getattr(item, 'id', None)) or 'untracked'}"
     idempotency_key = workflow_continuation_idempotency_key(
         workflow_chain_id=workflow_chain_id,
+        repository=repo,
         pr_number=pr_number,
         branch=branch,
         next_workflow_step="UNKNOWN",
@@ -688,7 +752,7 @@ def _record_missing_metadata_continuation(
         continuation_id = None
         continuation_status = WorkflowContinuationStatus.FAILED.value
     log_event(
-        "CONTINUATION_FAILED",
+        "CONTINUATION_METADATA_MISSING",
         workflow_chain_id=workflow_chain_id,
         current_workflow_step="UNKNOWN",
         next_workflow_step="UNKNOWN",
@@ -717,6 +781,7 @@ def _continuation_result(
     agent_bus_attempted: bool,
     payload: dict[str, Any] | None = None,
 ) -> TaskDispatchResult:
+    work_item_id = continuation.next_work_item_id or continuation.current_work_item_id
     return TaskDispatchResult(
         attempted=True,
         success=success,
@@ -724,7 +789,7 @@ def _continuation_result(
         error=continuation.last_error,
         agent_bus_attempted=agent_bus_attempted,
         agent_bus_success=success and agent_bus_attempted,
-        agent_bus_work_item_id=continuation.current_work_item_id,
+        agent_bus_work_item_id=work_item_id,
         agent_bus_error=continuation.last_error,
         agent_bus_payload=payload,
         lifecycle_events=["agent_bus_dispatch_completed"] if success and agent_bus_attempted else [],
@@ -739,6 +804,48 @@ def _workflow_chain_title(continuation: dict[str, Any]) -> str:
         f"{continuation['next_workflow_step']}: continue PR #{continuation['pr_number']} "
         f"on {continuation['branch']}"
     )
+
+
+def _workflow_chain_log_context(item: Any) -> dict[str, Any]:
+    context = workflow_chain_context_from_item(item) or {}
+    return {
+        "workflow_chain_id": context.get("workflow_chain_id"),
+        "current_workflow_step": context.get("workflow_step"),
+        "next_workflow_step": context.get("next_workflow_step"),
+        "work_item_id": context.get("previous_work_item_id"),
+        "pr_number": context.get("pr_number"),
+        "branch": context.get("branch"),
+        "status": "FINAL_STEP",
+    }
+
+
+def _workflow_steps_from_context(*contexts: dict[str, Any]) -> list[str] | None:
+    for context in contexts:
+        steps = _normalize_workflow_sequence(
+            _first_present(
+                context.get("workflow_steps"),
+                context.get("workflowSteps"),
+                context.get("workflow_sequence"),
+                context.get("workflowSequence"),
+            )
+        )
+        if steps:
+            return steps
+    return None
+
+
+def _normalize_workflow_sequence(value: Any) -> list[str] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        raw_steps = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        raw_steps = [str(part).strip() for part in value]
+    else:
+        return None
+    steps = [_normalize_workflow_step(step) for step in raw_steps if step]
+    normalized = [step for step in steps if step]
+    return normalized or None
 
 
 def _has_existing_owner(labels: set[str]) -> bool:
@@ -795,7 +902,7 @@ def _normalize_workflow_step(value: Any) -> str | None:
         return normalized
     if normalized.isdigit():
         return f"WF{normalized}"
-    return normalized
+    return text
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
