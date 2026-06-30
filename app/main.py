@@ -97,7 +97,8 @@ from app.runtime_validation_review_decision import review_decision_from_runtime_
 from app.security import verify_github_signature
 from app.slack_issue_dispatch import SlackIssueDispatchResult, dispatch_ready_issue_to_slack
 from app.storage import SQLiteStateStore, build_sqlite_store
-from app.task_dispatch import dispatch_next_agent_task, dispatch_workflow_chain_continuation
+from app.task_dispatch import dispatch_next_agent_task, dispatch_workflow_chain_continuation, resume_workflow_continuations
+from app.workflow_continuation import SQLiteWorkflowContinuationStore, build_workflow_continuation_store
 from app.workflow_routes import register_workflow_routes
 
 
@@ -130,6 +131,8 @@ async def startup() -> None:
         settings.orchestrator_db_path,
         max_review_items=settings.orchestrator_max_review_items,
     )
+    continuation_store = build_workflow_continuation_store(settings.orchestrator_db_path)
+    app.state.workflow_continuation_store = continuation_store
     if storage is not None:
         storage.reclaim_stale_review_claims(older_than_seconds=settings.review_claim_timeout_seconds)
     app.state.storage = storage
@@ -143,10 +146,29 @@ async def startup() -> None:
             app.state.last_repository_discovery_error = str(exc)
         finally:
             await github_client.aclose()
+    if continuation_store is not None and settings.enable_task_dispatch:
+        await _resume_workflow_continuations(settings, continuation_store)
 
 
 def _storage() -> SQLiteStateStore | None:
     return getattr(app.state, "storage", None)
+
+
+def _workflow_continuation_store() -> SQLiteWorkflowContinuationStore | None:
+    return getattr(app.state, "workflow_continuation_store", None)
+
+
+async def _resume_workflow_continuations(settings: Settings, continuation_store: SQLiteWorkflowContinuationStore) -> None:
+    agent_bus_client = AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token) if settings.enable_agent_bus_dispatch else None
+    try:
+        await resume_workflow_continuations(
+            continuation_store,
+            agent_bus_client=agent_bus_client,
+            agent_bus_enabled=settings.enable_agent_bus_dispatch,
+        )
+    finally:
+        if agent_bus_client is not None:
+            await agent_bus_client.aclose()
 
 
 def _repository_registry() -> RepositoryRegistryStore:
@@ -303,6 +325,24 @@ async def create_agent_task(
     )
 
 
+@app.get("/api/v1/workflow-continuations/{workflow_chain_id}")
+async def get_workflow_continuations(workflow_chain_id: str, _: None = Depends(_require_debug_read_access)) -> dict[str, Any]:
+    store = _workflow_continuation_store()
+    if store is None:
+        return {"workflow_chain_id": workflow_chain_id, "continuations": []}
+    continuations = store.list_workflow_continuations(workflow_chain_id)
+    latest = continuations[-1] if continuations else None
+    return {
+        "workflow_chain_id": workflow_chain_id,
+        "current_workflow_step": latest.current_workflow_step if latest else None,
+        "next_workflow_step": latest.next_workflow_step if latest else None,
+        "status": latest.status.value if latest else None,
+        "work_item_id": latest.current_work_item_id if latest else None,
+        "retry_status": latest.status.value if latest and latest.status.value == "RETRY_PENDING" else None,
+        "continuations": [continuation.model_dump(mode="json") for continuation in continuations],
+    }
+
+
 @app.get("/api/v1/orchestrator/snapshot", response_model=OrchestratorSnapshot)
 async def orchestrator_snapshot(
     _: None = Depends(_require_debug_read_access),
@@ -323,7 +363,7 @@ async def orchestrator_snapshot(
 
 @app.get("/debug/repositories")
 async def debug_repositories(_: None = Depends(_require_debug_read_access)) -> dict[str, object]:
-    return {"repositories": repository_diagnostics(_repository_registry()), "last_discovery_error": getattr(app.state, "last_discovery_error", None)}
+    return {"repositories": repository_diagnostics(_repository_registry()), "last_discovery_error": getattr(app.state, "last_repository_discovery_error", None)}
 
 
 @app.post("/debug/repositories/discover", response_model=RepositoryDiscoveryResult)
@@ -546,6 +586,7 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
                 enabled=settings.enable_task_dispatch,
                 agent_bus_client=agent_bus_client,
                 agent_bus_enabled=settings.enable_agent_bus_dispatch,
+                continuation_store=_workflow_continuation_store(),
                 base_branch=settings.base_branch or "agent-integration",
             )
             if task_dispatch is None and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
@@ -596,7 +637,8 @@ def _attach_task_dispatch_result(response: ReviewProcessResponse, task_dispatch:
     response.agent_bus_work_item_id = agent_bus_work_item_id
     response.agent_bus_dispatch_error = agent_bus_error
     response.agent_bus_payload = agent_bus_payload
-    response.work_item.agent_bus_work_item_id = agent_bus_work_item_id
+    if agent_bus_work_item_id is not None:
+        response.work_item.agent_bus_work_item_id = agent_bus_work_item_id
     response.work_item.agent_bus_dispatch_error = agent_bus_error
 
 
