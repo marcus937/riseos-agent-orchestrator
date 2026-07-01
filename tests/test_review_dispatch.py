@@ -29,6 +29,31 @@ def _task():
     return task
 
 
+def _workflow_chain_task():
+    task = _task()
+    task.execution_evidence = {
+        "_workflow_chain": {
+            "workflow_chain_id": "wf-shared-123",
+            "workflow_family": "WF21-WF29 frontend chain",
+            "workflow_steps": ["WF21", "WF22", "WF23"],
+            "workflow_sequence": [
+                {"task_key": "WF21", "title": "WF21", "objective": "Complete WF21."},
+                {"task_key": "WF22", "title": "WF22", "objective": "Complete WF22."},
+                {"task_key": "WF23", "title": "WF23", "objective": "Complete WF23."},
+            ],
+            "workflow_step": "WF21",
+            "current_workflow_step": "WF21",
+            "next_workflow_step": "WF22",
+            "final_workflow_step": "WF23",
+            "continuation_mode": "same_pr_branch",
+            "merge_gate": "final_step_only",
+            "repository": "marcus937/jarvis-mission-control",
+            "base_branch": "agent-integration",
+        }
+    }
+    return task
+
+
 def _result() -> AgentTaskExecutionResult:
     return AgentTaskExecutionResult(
         agent_id="codex-m2",
@@ -80,6 +105,24 @@ def test_review_request_payload_uses_agent_bus_work_item_contract() -> None:
     ]
 
 
+def test_review_request_payload_merges_persisted_workflow_chain_metadata() -> None:
+    task = _workflow_chain_task()
+    result = _result()
+
+    payload = build_agent_bus_review_request_payload(task, result, result.evidence["review_dispatch"], default_review_agent="bb2")
+
+    review_dispatch = payload["metadata"]["review_dispatch"]
+    assert review_dispatch["workflow_chain_id"] == "wf-shared-123"
+    assert review_dispatch["workflow_step"] == "WF21"
+    assert review_dispatch["current_workflow_step"] == "WF21"
+    assert review_dispatch["next_workflow_step"] == "WF22"
+    assert review_dispatch["final_workflow_step"] == "WF23"
+    assert review_dispatch["workflow_steps"] == ["WF21", "WF22", "WF23"]
+    assert review_dispatch["workflow_sequence"][1]["task_key"] == "WF22"
+    assert review_dispatch["continuation_mode"] == "same_pr_branch"
+    assert review_dispatch["merge_gate"] == "final_step_only"
+
+
 def test_execution_result_dispatch_creates_review_owned_work_item() -> None:
     task = _task()
     result = _result()
@@ -106,6 +149,29 @@ def test_execution_result_dispatch_creates_review_owned_work_item() -> None:
     assert stored is not None
     assert stored.execution_evidence["agent_bus_review_work_item_id"] == "review-work-123"
     assert stored.execution_evidence["bb2_review_request_status"] == "queued"
+
+
+def test_execution_result_dispatch_preserves_workflow_chain_metadata() -> None:
+    task = _workflow_chain_task()
+    result = _result()
+    store = InMemoryAgentTaskStore()
+    store.save_agent_task(task)
+    fake_bus = FakeAgentBusClient()
+
+    async def run_dispatch() -> str | None:
+        return await dispatch_bb2_review_request_from_execution_result(
+            task,
+            result,
+            fake_bus,
+            review_agent="bb2",
+            store=store,
+        )
+
+    anyio.run(run_dispatch)
+
+    review_dispatch = fake_bus.payloads[0]["metadata"]["review_dispatch"]
+    assert review_dispatch["workflow_chain_id"] == "wf-shared-123"
+    assert review_dispatch["next_workflow_step"] == "WF22"
 
 
 def test_execution_result_dispatch_is_idempotent_when_review_work_item_exists() -> None:
