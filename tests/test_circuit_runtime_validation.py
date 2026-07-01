@@ -9,6 +9,7 @@ from app.circuit_runtime_validation_routes import register_circuit_runtime_valid
 from app.config import get_settings
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
 from app.main import app, runtime_validation_store as canonical_runtime_validation_store
+from app.review_queue import review_queue
 from app.wf20_runtime_validation import AgentBusRuntimeValidationStore
 
 
@@ -76,6 +77,7 @@ def _client(monkeypatch) -> TestClient:
     )
     app.state.runtime_validation_store = canonical_runtime_validation_store
     canonical_runtime_validation_store._items.clear()
+    review_queue.reset()
     get_settings.cache_clear()
     return TestClient(app)
 
@@ -260,6 +262,36 @@ def test_frontend_runtime_validation_route_reaches_hermes_dispatch_with_verified
     assert fake.jobs[0][2]["payload"]["repo"] == "marcus937/jarvis-mission-control"
     assert fake.jobs[0][2]["payload"]["targetUrl"] == "https://jarvis-mission-control-gules.vercel.app"
     assert fake.closed is True
+
+
+def test_runtime_validation_completion_schedules_bb2_review_processing(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    fake = FakeRuntimeHermesClient()
+    scheduled: list[dict[str, Any]] = []
+    monkeypatch.setattr(canonical_runtime_validation_store, "_hermes_client_factory", lambda: fake)
+
+    async def fake_process_queued_review_item(item_id: str, settings: Any, storage: Any, processor: Any) -> None:
+        scheduled.append({"item_id": item_id, "storage": storage, "processor": processor})
+
+    async def fake_review_processor(item: Any, settings: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(
+        "app.circuit_runtime_validation_routes.process_queued_review_item",
+        fake_process_queued_review_item,
+    )
+    app.state.review_processor = fake_review_processor
+
+    response = client.post(
+        "/api/v1/runtime-validations",
+        headers={"X-Orchestrator-Admin-Token": "admin-secret"},
+        json=_request(),
+    )
+
+    assert response.status_code == 201
+    assert scheduled
+    assert scheduled[0]["item_id"]
+    assert scheduled[0]["processor"] is fake_review_processor
 
 
 def test_runtime_validation_missing_id_returns_404(monkeypatch) -> None:
