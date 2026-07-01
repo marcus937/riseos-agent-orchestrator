@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 from fastapi import FastAPI
 from starlette.routing import Match
 
@@ -19,6 +19,7 @@ from app.operational_logging import log_event
 from app.runtime_validation_agent_bus_bridge import advance_agent_bus_from_runtime_validation
 from app.runtime_validation_handoff_trace import install_runtime_validation_handoff_trace
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
+from app.review_worker import process_queued_review_item
 
 install_runtime_validation_handoff_trace()
 
@@ -63,6 +64,7 @@ def _require_runtime_admin_token(
 async def create_runtime_validation(
     request: RuntimeValidationRequest,
     http_request: Request,
+    background_tasks: BackgroundTasks,
     _: None = Depends(_require_runtime_admin_token),
     settings: Settings = Depends(get_settings),
 ) -> RuntimeValidationResult:
@@ -71,11 +73,13 @@ async def create_runtime_validation(
     _log_runtime_validation_store_selected(store, request, dispatch_path="runtime_validation_route")
     result = await store.trigger(request, settings)
     _ensure_created_response_has_handoff_outcome(result, store)
-    enqueue_review_from_runtime_validation(
+    storage = getattr(http_request.app.state, "storage", None)
+    review_item = enqueue_review_from_runtime_validation(
         result,
         settings,
-        storage=getattr(http_request.app.state, "storage", None),
+        storage=storage,
     )
+    _schedule_runtime_review_processing(review_item, http_request, settings, storage, background_tasks)
     await advance_agent_bus_from_runtime_validation(result, settings)
     return result
 
@@ -130,6 +134,65 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
 
 def _runtime_validation_store(request: Request) -> Any:
     return getattr(request.app.state, "runtime_validation_store", runtime_validation_store)
+
+
+def _schedule_runtime_review_processing(
+    review_item: Any | None,
+    request: Request,
+    settings: Settings,
+    storage: Any | None,
+    background_tasks: BackgroundTasks,
+) -> None:
+    if review_item is None:
+        log_event("runtime_validation_review_processing_skipped", reason="no_review_item")
+        return
+    if not settings.enable_auto_review_processing:
+        log_event(
+            "runtime_validation_review_processing_skipped",
+            reason="auto_review_processing_disabled",
+            work_item_id=getattr(review_item, "id", None),
+            runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        )
+        return
+    status_value = getattr(getattr(review_item, "status", None), "value", getattr(review_item, "status", None))
+    if status_value != "pending_review":
+        log_event(
+            "runtime_validation_review_processing_skipped",
+            reason="review_item_not_pending",
+            work_item_id=getattr(review_item, "id", None),
+            runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+            review_item_status=status_value,
+        )
+        return
+    processor = _review_processor(request)
+    if processor is None:
+        log_event(
+            "runtime_validation_review_processing_skipped",
+            reason="review_processor_unavailable",
+            work_item_id=getattr(review_item, "id", None),
+            runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        )
+        return
+    background_tasks.add_task(process_queued_review_item, review_item.id, settings, storage, processor)
+    log_event(
+        "runtime_validation_review_processing_scheduled",
+        work_item_id=review_item.id,
+        runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        repository=getattr(review_item, "repo_full_name", None),
+        pr_number=getattr(review_item, "pr_number", None),
+        branch=getattr(review_item, "branch", None),
+    )
+
+
+def _review_processor(request: Request) -> Any | None:
+    processor = getattr(request.app.state, "review_processor", None)
+    if processor is not None:
+        return processor
+    try:
+        from app import main as app_main
+    except Exception:
+        return None
+    return getattr(app_main, "_process_work_item", None)
 
 
 def _log_runtime_validation_store_selected(store: Any, request: RuntimeValidationRequest, *, dispatch_path: str) -> None:
