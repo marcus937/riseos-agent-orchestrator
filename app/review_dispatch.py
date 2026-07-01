@@ -27,6 +27,7 @@ async def dispatch_bb2_review_request_from_execution_result(
     if review_dispatch is None:
         logger.info("execution-result did not include review_dispatch; skipping Agent Bus review request task_id=%s", task.task_id)
         return None
+    review_dispatch = _merge_workflow_chain_review_dispatch(task, review_dispatch)
 
     existing_id = task.execution_evidence.get("agent_bus_review_work_item_id")
     if isinstance(existing_id, str) and existing_id.strip():
@@ -68,6 +69,7 @@ def build_agent_bus_review_request_payload(
     *,
     default_review_agent: str = "bb2",
 ) -> dict[str, Any]:
+    review_dispatch = _merge_workflow_chain_review_dispatch(task, review_dispatch)
     reviewer = _first_string(
         review_dispatch,
         "review_agent",
@@ -131,6 +133,40 @@ def _review_dispatch_from_payload(payload: AgentTaskExecutionResult) -> dict[str
     if isinstance(review_dispatch, dict) and review_dispatch:
         return review_dispatch
     return None
+
+
+def _merge_workflow_chain_review_dispatch(task: AgentTask, review_dispatch: dict[str, Any]) -> dict[str, Any]:
+    workflow_chain = _workflow_chain_metadata(task)
+    if not workflow_chain:
+        return review_dispatch
+    merged = dict(review_dispatch)
+    for key, value in workflow_chain.items():
+        merged.setdefault(key, value)
+    if "workflow_step" not in merged and workflow_chain.get("current_workflow_step") is not None:
+        merged["workflow_step"] = workflow_chain["current_workflow_step"]
+    if "current_workflow_step" not in merged and workflow_chain.get("workflow_step") is not None:
+        merged["current_workflow_step"] = workflow_chain["workflow_step"]
+    return merged
+
+
+def _workflow_chain_metadata(task: AgentTask) -> dict[str, Any]:
+    evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+    workflow_chain = evidence.get("_workflow_chain") if isinstance(evidence.get("_workflow_chain"), dict) else {}
+    allowed = {
+        "workflow_chain_id",
+        "workflow_family",
+        "workflow_sequence",
+        "workflow_steps",
+        "workflow_step",
+        "current_workflow_step",
+        "next_workflow_step",
+        "final_workflow_step",
+        "continuation_mode",
+        "merge_gate",
+        "repository",
+        "base_branch",
+    }
+    return {key: value for key, value in workflow_chain.items() if key in allowed and value is not None}
 
 
 def _sanitized_review_dispatch(review_dispatch: dict[str, Any]) -> dict[str, Any]:
