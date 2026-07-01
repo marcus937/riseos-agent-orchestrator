@@ -38,6 +38,7 @@ def build_agent_bus_work_item_payload(
     workflow_id = task.correlation_id if task.correlation_id and task.correlation_id.startswith("wf-") else f"wf-agent-task-{task.task_id}"
     dependency_state = dependency_state or DependencyState()
     routing = _routing_metadata(task)
+    workflow_chain = _workflow_chain_metadata(task)
     metadata = {
         "task_id": task.task_id,
         "workflow_id": workflow_id,
@@ -59,6 +60,7 @@ def build_agent_bus_work_item_payload(
         },
     }
     metadata.update(routing)
+    metadata.update(workflow_chain)
     metadata.update(scheduler_metadata_from_task(task))
     payload: dict[str, Any] = {
         "title": task.title,
@@ -109,3 +111,25 @@ def _routing_metadata(task: AgentTask) -> dict[str, Any]:
     routing = evidence.get("_routing") if isinstance(evidence.get("_routing"), dict) else {}
     allowed = {"pr_strategy", "base_branch", "source_branch", "source_pr_number", "rework_of_task_id", "rework_attempt", "review_decision_id"}
     return {key: value for key, value in routing.items() if key in allowed and value is not None}
+
+
+def _workflow_chain_metadata(task: AgentTask) -> dict[str, Any]:
+    evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+    workflow_chain = evidence.get("_workflow_chain") if isinstance(evidence.get("_workflow_chain"), dict) else {}
+    allowed = {
+        "workflow_chain_id",
+        "workflow_family",
+        "workflow_sequence",
+        "workflow_steps",
+        "workflow_step",
+        "current_workflow_step",
+        "next_workflow_step",
+        "final_workflow_step",
+        "continuation_mode",
+        "merge_gate",
+        "previous_work_item_id",
+        "idempotency_key",
+        "repository",
+        "base_branch",
+    }
+    return {key: value for key, value in workflow_chain.items() if key in allowed and value is not None}
