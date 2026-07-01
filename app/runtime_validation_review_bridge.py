@@ -21,6 +21,18 @@ from app.review_queue import (
 TERMINAL_RUNTIME_VALIDATION_STATUSES = {"blocked", "completed", "failed"}
 RUNTIME_REVIEW_SOURCE = "runtime_validation_bb2_packet"
 IMMUTABLE_CORRELATION_KEYS = ("deployment_id", "workflow_id", "correlation_id")
+_WORKFLOW_CHAIN_KEYS = {
+    "workflow_chain_id",
+    "workflow_family",
+    "workflow_sequence",
+    "workflow_steps",
+    "workflow_step",
+    "current_workflow_step",
+    "next_workflow_step",
+    "final_workflow_step",
+    "continuation_mode",
+    "merge_gate",
+}
 
 
 def create_runtime_validation_pending_item(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
@@ -48,6 +60,8 @@ def enqueue_review_from_runtime_validation(
     *,
     storage: Any | None = None,
     existing_item: ReviewWorkItem | None = None,
+    agent_task_store: Any | None = None,
+    agent_bus_work_item: dict[str, Any] | None = None,
 ) -> ReviewWorkItem | None:
     if not settings.enable_runtime_validation_review_bridge:
         return None
@@ -62,7 +76,13 @@ def enqueue_review_from_runtime_validation(
         return duplicate
 
     item = existing_item or _find_pending_runtime_result(result, storage=storage) or _review_work_item_from_runtime_validation(result)
-    _attach_runtime_validation_context(item, result, digest=digest)
+    _attach_runtime_validation_context(
+        item,
+        result,
+        digest=digest,
+        agent_task_store=agent_task_store,
+        agent_bus_work_item=agent_bus_work_item,
+    )
 
     terminal_stage = ReviewLifecycleStage.RUNTIME_VALIDATION_COMPLETED if result.status == "completed" else ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED
     record_lifecycle_stage(item, terminal_stage, error=result.error)
@@ -151,7 +171,14 @@ def _review_work_item_from_runtime_validation(result: RuntimeValidationResult) -
     )
 
 
-def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeValidationResult, *, digest: str) -> None:
+def _attach_runtime_validation_context(
+    item: ReviewWorkItem,
+    result: RuntimeValidationResult,
+    *,
+    digest: str,
+    agent_task_store: Any | None = None,
+    agent_bus_work_item: dict[str, Any] | None = None,
+) -> None:
     item.repo_full_name = item.repo_full_name or result.repo
     item.branch = item.branch or result.branch
     item.base_branch = item.base_branch or result.base_branch
@@ -163,7 +190,209 @@ def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeVali
     item.runtime_validation_status = result.status
     item.runtime_validation_digest = digest
     item.runtime_validation_completed_at = result.completed_at
-    item.runtime_validation_context = runtime_validation_context_from_result(result)
+    context = runtime_validation_context_from_result(result)
+    _normalize_workflow_chain_metadata(
+        context,
+        result,
+        item=item,
+        agent_task_store=agent_task_store,
+        agent_bus_work_item=agent_bus_work_item,
+    )
+    result.review_dispatch = _dict_value(context.get("review_dispatch"))
+    item.runtime_validation_context = context
+
+
+def _normalize_workflow_chain_metadata(
+    context: dict[str, Any],
+    result: RuntimeValidationResult,
+    *,
+    item: ReviewWorkItem,
+    agent_task_store: Any | None,
+    agent_bus_work_item: dict[str, Any] | None,
+) -> None:
+    review_dispatch = dict(_dict_value(context.get("review_dispatch")))
+    sources = [review_dispatch, context]
+    sources.extend(_agent_bus_work_item_sources(agent_bus_work_item))
+    sources.extend(_agent_bus_runtime_validation_sources(review_dispatch))
+    sources.extend(_agent_task_sources(result, item=item, agent_task_store=agent_task_store))
+
+    if not any(_contains_workflow_metadata(source) for source in sources):
+        context["review_dispatch"] = review_dispatch
+        return
+
+    _fill_missing(review_dispatch, "workflow_chain_id", sources, "workflow_chain_id", "workflowChainId")
+    _fill_missing(review_dispatch, "workflow_family", sources, "workflow_family", "workflowFamily")
+    _fill_missing(review_dispatch, "workflow_step", sources, "workflow_step", "workflowStep", "current_workflow_step", "currentWorkflowStep")
+    _fill_missing(review_dispatch, "current_workflow_step", sources, "current_workflow_step", "currentWorkflowStep", "workflow_step", "workflowStep")
+    _fill_missing(review_dispatch, "workflow_steps", sources, "workflow_steps", "workflowSteps", "workflow_sequence", "workflowSequence")
+    _fill_missing(review_dispatch, "workflow_sequence", sources, "workflow_sequence", "workflowSequence", "workflow_steps", "workflowSteps")
+    _fill_missing(review_dispatch, "next_workflow_step", sources, "next_workflow_step", "nextWorkflowStep")
+    _fill_missing(review_dispatch, "final_workflow_step", sources, "final_workflow_step", "finalWorkflowStep")
+    _fill_missing(review_dispatch, "continuation_mode", sources, "continuation_mode", "continuationMode")
+    _fill_missing(review_dispatch, "merge_gate", sources, "merge_gate", "mergeGate")
+    _fill_missing(review_dispatch, "repository", sources, "repository", "repo", "repo_full_name", "repoFullName")
+    _fill_missing(review_dispatch, "repo", sources, "repo", "repository", "repo_full_name", "repoFullName")
+    _fill_missing(review_dispatch, "pr_number", sources, "pr_number", "prNumber")
+    _fill_missing(review_dispatch, "branch", sources, "branch", "head_ref", "headRef")
+    _fill_missing(review_dispatch, "base_branch", sources, "base_branch", "baseBranch")
+    _fill_missing(review_dispatch, "previous_work_item_id", sources, "previous_work_item_id", "previousWorkItemId", "work_item_id", "workItemId", "agent_bus_work_item_id")
+    _fill_missing(review_dispatch, "work_item_id", sources, "work_item_id", "workItemId", "agent_bus_work_item_id", "previous_work_item_id")
+
+    review_dispatch.setdefault("repository", result.repo)
+    review_dispatch.setdefault("repo", result.repo)
+    if result.pr_number is not None:
+        review_dispatch.setdefault("pr_number", result.pr_number)
+    if result.branch:
+        review_dispatch.setdefault("branch", result.branch)
+    if result.base_branch:
+        review_dispatch.setdefault("base_branch", result.base_branch)
+    if result.work_item_id:
+        review_dispatch.setdefault("work_item_id", result.work_item_id)
+        review_dispatch.setdefault("previous_work_item_id", result.work_item_id)
+    if result.workflow_id:
+        review_dispatch.setdefault("workflow_id", result.workflow_id)
+
+    for key in _WORKFLOW_CHAIN_KEYS:
+        if key in review_dispatch and _value_present(review_dispatch.get(key)):
+            context.setdefault(key, review_dispatch[key])
+    context["review_dispatch"] = review_dispatch
+    log_event(
+        "runtime_validation_workflow_metadata_normalized",
+        runtime_validation_id=result.validation_id,
+        workflow_id=result.workflow_id,
+        work_item_id=result.work_item_id,
+        repository=result.repo,
+        pr_number=result.pr_number,
+        branch=result.branch,
+        workflow_chain_id=review_dispatch.get("workflow_chain_id"),
+        workflow_step=review_dispatch.get("workflow_step"),
+        next_workflow_step=review_dispatch.get("next_workflow_step"),
+    )
+
+
+def _agent_bus_work_item_sources(agent_bus_work_item: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(agent_bus_work_item, dict):
+        return []
+    sources = [agent_bus_work_item]
+    metadata = agent_bus_work_item.get("metadata")
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+        review_dispatch = metadata.get("review_dispatch")
+        if isinstance(review_dispatch, dict):
+            sources.append(review_dispatch)
+    return sources
+
+
+def _agent_bus_runtime_validation_sources(review_dispatch: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for key in ("agent_bus_runtime_validation", "agent_bus_work_item", "work_item"):
+        value = review_dispatch.get(key)
+        if isinstance(value, dict):
+            sources.extend(_agent_bus_work_item_sources(value))
+            history = value.get("history")
+            if isinstance(history, list):
+                for entry in history:
+                    if isinstance(entry, dict):
+                        sources.append(entry)
+                        metadata = entry.get("metadata")
+                        if isinstance(metadata, dict):
+                            sources.append(metadata)
+    return sources
+
+
+def _agent_task_sources(result: RuntimeValidationResult, *, item: ReviewWorkItem, agent_task_store: Any | None) -> list[dict[str, Any]]:
+    if agent_task_store is None or not hasattr(agent_task_store, "list_agent_tasks"):
+        return []
+    try:
+        tasks = agent_task_store.list_agent_tasks()
+    except Exception:
+        return []
+    matched: list[dict[str, Any]] = []
+    for task in tasks:
+        if not _agent_task_matches(task, result, item=item):
+            continue
+        task_context = {
+            "workflow_chain_id": getattr(task, "correlation_id", None),
+            "workflow_id": getattr(task, "correlation_id", None),
+            "repository": getattr(task, "repo_full_name", None),
+            "repo": getattr(task, "repo_full_name", None),
+            "issue_number": getattr(task, "issue_number", None),
+            "branch": getattr(task, "branch", None),
+            "commit_sha": getattr(task, "commit_sha", None),
+            "work_item_id": getattr(task, "agent_bus_work_item_id", None),
+            "previous_work_item_id": getattr(task, "agent_bus_work_item_id", None),
+        }
+        matched.append(task_context)
+        evidence = getattr(task, "execution_evidence", None)
+        if isinstance(evidence, dict):
+            chain = evidence.get("_workflow_chain")
+            if isinstance(chain, dict):
+                matched.append(chain)
+            matched.append(evidence)
+    return matched
+
+
+def _agent_task_matches(task: Any, result: RuntimeValidationResult, *, item: ReviewWorkItem) -> bool:
+    task_work_item_id = _string_or_none(getattr(task, "agent_bus_work_item_id", None))
+    if result.work_item_id and task_work_item_id == result.work_item_id:
+        return True
+    task_id = _string_or_none(getattr(task, "task_id", None))
+    if task_id and task_id in {result.work_item_id, item.agent_bus_work_item_id}:
+        return True
+    task_workflow_id = _string_or_none(getattr(task, "correlation_id", None))
+    task_repo = _string_or_none(getattr(task, "repo_full_name", None))
+    if result.workflow_id and task_workflow_id == result.workflow_id and (not task_repo or task_repo == result.repo):
+        return True
+    return False
+
+
+def _contains_workflow_metadata(source: dict[str, Any]) -> bool:
+    if not isinstance(source, dict):
+        return False
+    if any(_value_present(source.get(key)) for key in _WORKFLOW_CHAIN_KEYS):
+        return True
+    metadata = source.get("metadata")
+    return isinstance(metadata, dict) and any(_value_present(metadata.get(key)) for key in _WORKFLOW_CHAIN_KEYS)
+
+
+def _fill_missing(target: dict[str, Any], key: str, sources: list[dict[str, Any]], *aliases: str) -> None:
+    if _value_present(target.get(key)):
+        return
+    value = _first_present_from_sources(sources, *aliases)
+    if _value_present(value):
+        target[key] = value
+
+
+def _first_present_from_sources(sources: list[dict[str, Any]], *aliases: str) -> Any:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for alias in aliases:
+            value = source.get(alias)
+            if _value_present(value):
+                return value
+        metadata = source.get("metadata")
+        if isinstance(metadata, dict):
+            for alias in aliases:
+                value = metadata.get(alias)
+                if _value_present(value):
+                    return value
+    return None
+
+
+def _value_present(value: Any) -> bool:
+    return value is not None and value != ""
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _find_existing_runtime_item(item: ReviewWorkItem, *, storage: Any | None = None) -> ReviewWorkItem | None:
