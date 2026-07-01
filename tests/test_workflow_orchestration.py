@@ -38,13 +38,21 @@ def _linear_workflow_request() -> WorkflowCreateRequest:
 
 
 def _wf21_to_wf29_request() -> WorkflowCreateRequest:
+    tasks = []
+    for step in range(21, 30):
+        previous = f"WF{step - 1}" if step > 21 else None
+        tasks.append(
+            WorkflowTask(
+                task_key=f"WF{step}",
+                title=f"WF{step}",
+                objective=f"Complete WF{step}.",
+                depends_on=[previous] if previous else [],
+            )
+        )
     return WorkflowCreateRequest(
         repo_full_name="marcus937/jarvis-mission-control",
         title="WF21-WF29 frontend chain",
-        tasks=[
-            WorkflowTask(task_key=f"WF{step}", title=f"WF{step}", objective=f"Complete WF{step}.")
-            for step in range(21, 30)
-        ],
+        tasks=tasks,
     )
 
 
@@ -135,7 +143,7 @@ def test_wf21_submission_dispatch_payload_carries_full_continuation_sequence() -
 
     released = run(release_runnable_agent_tasks(agent_store, client, review_agent="bb2"))
 
-    assert [task.title for task in released] == [f"WF{step}" for step in range(21, 30)]
+    assert [task.title for task in released] == ["WF21"]
     first_payload = client.payloads[0]
     metadata = first_payload["metadata"]
     assert metadata["workflow_id"] == workflow.workflow_id
