@@ -76,13 +76,15 @@ def enqueue_review_from_runtime_validation(
         return duplicate
 
     item = existing_item or _find_pending_runtime_result(result, storage=storage) or _review_work_item_from_runtime_validation(result)
-    _attach_runtime_validation_context(
-        item,
+    _attach_runtime_validation_context(item, result, digest=digest)
+    _normalize_workflow_chain_metadata(
+        item.runtime_validation_context,
         result,
-        digest=digest,
+        item=item,
         agent_task_store=agent_task_store,
         agent_bus_work_item=agent_bus_work_item,
     )
+    result.review_dispatch = _dict_value(item.runtime_validation_context.get("review_dispatch"))
 
     terminal_stage = ReviewLifecycleStage.RUNTIME_VALIDATION_COMPLETED if result.status == "completed" else ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED
     record_lifecycle_stage(item, terminal_stage, error=result.error)
@@ -171,14 +173,7 @@ def _review_work_item_from_runtime_validation(result: RuntimeValidationResult) -
     )
 
 
-def _attach_runtime_validation_context(
-    item: ReviewWorkItem,
-    result: RuntimeValidationResult,
-    *,
-    digest: str,
-    agent_task_store: Any | None = None,
-    agent_bus_work_item: dict[str, Any] | None = None,
-) -> None:
+def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeValidationResult, *, digest: str) -> None:
     item.repo_full_name = item.repo_full_name or result.repo
     item.branch = item.branch or result.branch
     item.base_branch = item.base_branch or result.base_branch
@@ -190,16 +185,7 @@ def _attach_runtime_validation_context(
     item.runtime_validation_status = result.status
     item.runtime_validation_digest = digest
     item.runtime_validation_completed_at = result.completed_at
-    context = runtime_validation_context_from_result(result)
-    _normalize_workflow_chain_metadata(
-        context,
-        result,
-        item=item,
-        agent_task_store=agent_task_store,
-        agent_bus_work_item=agent_bus_work_item,
-    )
-    result.review_dispatch = _dict_value(context.get("review_dispatch"))
-    item.runtime_validation_context = context
+    item.runtime_validation_context = runtime_validation_context_from_result(result)
 
 
 def _normalize_workflow_chain_metadata(
