@@ -70,6 +70,8 @@ def _client(monkeypatch) -> TestClient:
     monkeypatch.setenv("HERMES_M2_TOKEN", "hermes-secret")
     monkeypatch.setenv("HERMES_M2_ENABLE_DISPATCH", "true")
     monkeypatch.setenv("HERMES_DEFAULT_TARGET", "https://jarvis-mission-control-gules.vercel.app")
+    monkeypatch.setenv("ENABLE_RUNTIME_VALIDATION_REVIEW_BRIDGE", "true")
+    monkeypatch.setenv("ENABLE_AUTO_REVIEW_PROCESSING", "true")
     monkeypatch.delenv("ENABLE_AGENT_BUS_DISPATCH", raising=False)
     monkeypatch.setattr(
         "app.circuit_runtime_validation.socket.getaddrinfo",
