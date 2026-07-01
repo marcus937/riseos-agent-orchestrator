@@ -1,16 +1,21 @@
+import asyncio
 import json
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.agent_tasks import AgentTaskCreateRequest, InMemoryAgentTaskStore, create_agent_task, mark_agent_task_assigned
 from app.circuit_runtime_validation import runtime_validation_store as base_runtime_validation_store
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
 from app.main import app, runtime_validation_store as canonical_runtime_validation_store
 from app.review_queue import review_queue
+from app.reviewer.decision import ReviewDecisionType
+from app.task_dispatch import dispatch_workflow_chain_continuation
 from app.wf20_runtime_validation import AgentBusRuntimeValidationStore
+from app.workflow_continuation import SQLiteWorkflowContinuationStore
 
 
 class FakeRuntimeHermesClient:
@@ -62,6 +67,15 @@ class FakeRuntimeHermesClient:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class FakeContinuationAgentBusClient:
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, Any]] = []
+
+    async def create_work_item(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.payloads.append(payload)
+        return {"work_item_id": "wi-wf22"}
 
 
 def _client(monkeypatch) -> TestClient:
@@ -266,6 +280,104 @@ def test_frontend_runtime_validation_route_reaches_hermes_dispatch_with_verified
     assert fake.closed is True
 
 
+def test_runtime_validation_recovers_workflow_step_from_agent_task_metadata_and_dispatches_next_step(monkeypatch, tmp_path) -> None:
+    client = _client(monkeypatch)
+    fake = FakeRuntimeHermesClient()
+    monkeypatch.setattr(canonical_runtime_validation_store, "_hermes_client_factory", lambda: fake)
+    app.state.agent_task_store = _agent_task_store_with_wf21_metadata()
+
+    async def fake_review_processor(item: Any, settings: Any) -> Any:
+        return None
+
+    app.state.review_processor = fake_review_processor
+
+    payload = _request("https://jarvis-mission-control-gules.vercel.app") | {
+        "branch": "codex-m2/wf21-chain",
+        "base_branch": "agent-integration",
+        "work_item_id": "wi-wf21",
+        "workflow_id": "wf-chain-123",
+        "review_dispatch": {
+            "title": "BB2 review for WF21",
+            "repository": "marcus937/jarvis-mission-control",
+            "pr_number": 38,
+            "branch": "codex-m2/wf21-chain",
+        },
+    }
+
+    response = client.post(
+        "/api/v1/runtime-validations",
+        headers={"X-Orchestrator-Admin-Token": "admin-secret"},
+        json=payload,
+    )
+
+    assert response.status_code == 201
+    item = review_queue.list_items()[0]
+    context = item.runtime_validation_context
+    review_dispatch = context["review_dispatch"]
+    assert review_dispatch["workflow_step"] == "WF21"
+    assert review_dispatch["current_workflow_step"] == "WF21"
+    assert review_dispatch["workflow_chain_id"] == "wf-chain-123"
+    assert review_dispatch["workflow_steps"] == ["WF21", "WF22", "WF23"]
+    assert review_dispatch["next_workflow_step"] == "WF22"
+
+    agent_bus = FakeContinuationAgentBusClient()
+    continuation_store = SQLiteWorkflowContinuationStore(str(tmp_path / "continuations.db"))
+    first = asyncio.run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=continuation_store,
+            base_branch="agent-integration",
+        )
+    )
+    second = asyncio.run(
+        dispatch_workflow_chain_continuation(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            enabled=True,
+            agent_bus_client=agent_bus,
+            agent_bus_enabled=True,
+            continuation_store=continuation_store,
+            base_branch="agent-integration",
+        )
+    )
+
+    assert first is not None and first.success is True
+    assert second is not None and second.success is True
+    assert len(agent_bus.payloads) == 1
+    next_payload = agent_bus.payloads[0]
+    assert next_payload["pr_number"] == 38
+    assert next_payload["metadata"]["workflow_step"] == "WF22"
+    assert next_payload["metadata"]["previous_workflow_step"] == "WF21"
+    assert next_payload["metadata"]["branch"] == "codex-m2/wf21-chain"
+    continuations = continuation_store.list_workflow_continuations("wf-chain-123")
+    assert len(continuations) == 1
+    assert continuations[0].current_workflow_step == "WF21"
+    assert continuations[0].current_workflow_step != "UNKNOWN"
+    assert continuations[0].next_workflow_step == "WF22"
+
+
+def test_runtime_validation_non_workflow_context_is_unchanged(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    fake = FakeRuntimeHermesClient()
+    monkeypatch.setattr(canonical_runtime_validation_store, "_hermes_client_factory", lambda: fake)
+
+    response = client.post(
+        "/api/v1/runtime-validations",
+        headers={"X-Orchestrator-Admin-Token": "admin-secret"},
+        json=_request(),
+    )
+
+    assert response.status_code == 201
+    item = review_queue.list_items()[0]
+    review_dispatch = item.runtime_validation_context["review_dispatch"]
+    assert "workflow_step" not in review_dispatch
+    assert "workflow_chain_id" not in review_dispatch
+
+
 def test_runtime_validation_completion_schedules_bb2_review_processing(monkeypatch) -> None:
     client = _client(monkeypatch)
     fake = FakeRuntimeHermesClient()
@@ -305,3 +417,36 @@ def test_runtime_validation_missing_id_returns_404(monkeypatch) -> None:
     )
 
     assert response.status_code == 404
+
+
+def _agent_task_store_with_wf21_metadata() -> InMemoryAgentTaskStore:
+    store = InMemoryAgentTaskStore()
+    task = create_agent_task(
+        AgentTaskCreateRequest(
+            repo_full_name="marcus937/jarvis-mission-control",
+            title="WF21 implementation",
+            objective="Implement WF21.",
+            target_agent="codex-m2",
+            correlation_id="wf-chain-123",
+        )
+    )
+    task.branch = "codex-m2/wf21-chain"
+    task.commit_sha = "abc123"
+    task.execution_evidence = {
+        "_workflow_chain": {
+            "workflow_chain_id": "wf-chain-123",
+            "workflow_family": "WF21-WF23",
+            "workflow_steps": ["WF21", "WF22", "WF23"],
+            "workflow_sequence": ["WF21", "WF22", "WF23"],
+            "current_workflow_step": "WF21",
+            "next_workflow_step": "WF22",
+            "final_workflow_step": "WF23",
+            "continuation_mode": "same_pr_branch",
+            "merge_gate": "final_step_only",
+            "repository": "marcus937/jarvis-mission-control",
+            "base_branch": "agent-integration",
+        }
+    }
+    mark_agent_task_assigned(task, work_item_id="wi-wf21")
+    store.save_agent_task(task)
+    return store
