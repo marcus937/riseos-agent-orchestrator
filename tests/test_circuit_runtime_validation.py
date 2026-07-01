@@ -284,12 +284,12 @@ def test_runtime_validation_recovers_workflow_step_from_agent_task_metadata_and_
     client = _client(monkeypatch)
     fake = FakeRuntimeHermesClient()
     monkeypatch.setattr(canonical_runtime_validation_store, "_hermes_client_factory", lambda: fake)
-    app.state.agent_task_store = _agent_task_store_with_wf21_metadata()
+    monkeypatch.setattr(app.state, "agent_task_store", _agent_task_store_with_wf21_metadata(), raising=False)
 
     async def fake_review_processor(item: Any, settings: Any) -> Any:
         return None
 
-    app.state.review_processor = fake_review_processor
+    monkeypatch.setattr(app.state, "review_processor", fake_review_processor, raising=False)
 
     payload = _request("https://jarvis-mission-control-gules.vercel.app") | {
         "branch": "codex-m2/wf21-chain",
@@ -394,7 +394,7 @@ def test_runtime_validation_completion_schedules_bb2_review_processing(monkeypat
         "app.circuit_runtime_validation_routes.process_queued_review_item",
         fake_process_queued_review_item,
     )
-    app.state.review_processor = fake_review_processor
+    monkeypatch.setattr(app.state, "review_processor", fake_review_processor, raising=False)
 
     response = client.post(
         "/api/v1/runtime-validations",
