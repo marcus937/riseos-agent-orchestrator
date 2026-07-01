@@ -257,6 +257,8 @@ def create_workflow(request: WorkflowCreateRequest, *, workflow_store: WorkflowS
     )
 
     created_tasks: dict[str, AgentTask] = {}
+    workflow_steps = [task.task_key for task in request.tasks]
+    workflow_sequence = [_workflow_sequence_entry(task) for task in request.tasks]
     for workflow_task in request.tasks:
         agent_task = create_agent_task(
             AgentTaskCreateRequest(
@@ -275,7 +277,16 @@ def create_workflow(request: WorkflowCreateRequest, *, workflow_store: WorkflowS
             )
         )
         agent_task.source = "workflow_api"
-        agent_task.execution_evidence = {"_routing": _workflow_routing(workflow)}
+        agent_task.execution_evidence = {
+            "_routing": _workflow_routing(workflow),
+            "_workflow_chain": _workflow_chain_metadata(
+                workflow,
+                workflow_task,
+                workflow_steps=workflow_steps,
+                workflow_sequence=workflow_sequence,
+                request=request,
+            ),
+        }
         created_tasks[workflow_task.task_key] = agent_task
         workflow.task_key_to_task_id[workflow_task.task_key] = agent_task.task_id
         workflow.task_dependencies[workflow_task.task_key] = _unique_keys(workflow_task.depends_on)
@@ -441,6 +452,50 @@ def _workflow_routing(workflow: StoredWorkflow) -> dict[str, Any]:
     if workflow.shared_pr_number:
         routing["source_pr_number"] = workflow.shared_pr_number
     return routing
+
+
+def _workflow_sequence_entry(task: WorkflowTask) -> dict[str, Any]:
+    return {
+        "task_key": task.task_key,
+        "title": task.title,
+        "objective": task.objective,
+        "body": task.body,
+        "repo_full_name": task.repo_full_name,
+        "issue_number": task.issue_number,
+        "labels": list(task.labels),
+        "instructions": list(task.instructions),
+        "acceptance_criteria": list(task.acceptance_criteria),
+        "target_agent": task.target_agent,
+        "priority": task.priority.value,
+        "depends_on": list(task.depends_on),
+    }
+
+
+def _workflow_chain_metadata(
+    workflow: StoredWorkflow,
+    task: WorkflowTask,
+    *,
+    workflow_steps: list[str],
+    workflow_sequence: list[dict[str, Any]],
+    request: WorkflowCreateRequest,
+) -> dict[str, Any]:
+    current_index = workflow_steps.index(task.task_key)
+    next_step = workflow_steps[current_index + 1] if current_index < len(workflow_steps) - 1 else None
+    final_step = workflow_steps[-1] if workflow_steps else task.task_key
+    return {
+        "workflow_chain_id": workflow.workflow_id,
+        "workflow_family": request.title,
+        "workflow_sequence": workflow_sequence,
+        "workflow_steps": workflow_steps,
+        "workflow_step": task.task_key,
+        "current_workflow_step": task.task_key,
+        "next_workflow_step": next_step,
+        "final_workflow_step": final_step,
+        "continuation_mode": "same_pr_branch",
+        "merge_gate": "final_step_only",
+        "repository": task.repo_full_name or request.repo_full_name,
+        "base_branch": workflow.base_branch,
+    }
 
 
 def _shared_branch_for_workflow(workflow_id: str) -> str:
