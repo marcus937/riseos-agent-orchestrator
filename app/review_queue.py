@@ -1,6 +1,7 @@
 from collections import Counter, deque
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -74,6 +75,44 @@ class ReviewWorkItem(BaseModel):
     failure_count: int = 0
     last_failure_at: datetime | None = None
     last_error: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        log_review_work_item_identity(
+            "wf_chain_review_item_constructed_or_model_validated",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_post_init"),
+        )
+
+    def model_copy(self, *args: Any, **kwargs: Any) -> "ReviewWorkItem":
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_copy",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_copy"),
+        )
+        copied = super().model_copy(*args, **kwargs)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_model_copy",
+            copied,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_copy"),
+            source_id_review_item=id(self),
+        )
+        return copied
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_dump",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_dump"),
+        )
+        return super().model_dump(*args, **kwargs)
+
+    def dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_dict",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.dict"),
+        )
+        return super().dict(*args, **kwargs)
 
 
 class ReviewProcessResponse(BaseModel):
@@ -590,6 +629,16 @@ def _newest_item_age_seconds(items: list[ReviewWorkItem], now: datetime) -> floa
 
 def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
     return _newest_item_age_seconds(items, now)
+
+
+def _review_item_diagnostic_caller(default: str) -> str:
+    import inspect
+
+    for frame_info in inspect.stack()[2:10]:
+        module = frame_info.frame.f_globals.get("__name__", "")
+        if module not in {"app.review_queue", "app.workflow_chain_diagnostics"}:
+            return f"{module}.{frame_info.function}"
+    return default
 
 
 _UNFINISHED_STATUSES = {
