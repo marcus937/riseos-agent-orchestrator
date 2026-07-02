@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.event_store import EventRecord
 from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
-from app.workflow_chain_diagnostics import log_workflow_chain_availability
+from app.workflow_chain_diagnostics import log_review_work_item_identity, log_workflow_chain_availability
 
 
 class SQLiteStateStore:
@@ -147,6 +147,11 @@ class SQLiteStateStore:
         return int(row["count"])
 
     def save_review_work_item(self, item: ReviewWorkItem) -> None:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_sqlite_save",
+            item,
+            caller="SQLiteStateStore.save_review_work_item",
+        )
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_save_review_work_item_input",
             item,
@@ -420,11 +425,21 @@ class SQLiteStateStore:
         if data.get("agent_bus_dispatch_success") is not None:
             data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
         data["runtime_validation_context"] = _load_json(data.get("runtime_validation_context"))
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_validate",
+            data,
+            caller="SQLiteStateStore._review_work_item_from_row.ReviewWorkItem.model_validate",
+        )
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_deserialize_review_work_item_row",
             data,
         )
         item = ReviewWorkItem.model_validate(data)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_model_validate",
+            item,
+            caller="SQLiteStateStore._review_work_item_from_row.ReviewWorkItem.model_validate",
+        )
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_deserialize_review_work_item_model",
             item,
