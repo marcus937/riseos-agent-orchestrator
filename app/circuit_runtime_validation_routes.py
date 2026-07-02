@@ -14,6 +14,7 @@ from app.circuit_runtime_validation import (
     RuntimeValidationResult,
     runtime_validation_store,
 )
+from app.clients.agent_bus import AgentBusClient
 from app.config import Settings, get_settings
 from app.operational_logging import log_event
 from app.runtime_validation_agent_bus_bridge import advance_agent_bus_from_runtime_validation
@@ -74,10 +75,14 @@ async def create_runtime_validation(
     result = await store.trigger(request, settings)
     _ensure_created_response_has_handoff_outcome(result, store)
     storage = getattr(http_request.app.state, "storage", None)
+    agent_task_store = getattr(http_request.app.state, "agent_task_store", None)
+    agent_bus_work_item = await _agent_bus_work_item_for_runtime_result(result, http_request, settings)
     review_item = enqueue_review_from_runtime_validation(
         result,
         settings,
         storage=storage,
+        agent_task_store=agent_task_store,
+        agent_bus_work_item=agent_bus_work_item,
     )
     _schedule_runtime_review_processing(review_item, http_request, settings, storage, background_tasks)
     await advance_agent_bus_from_runtime_validation(result, settings)
@@ -134,6 +139,54 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
 
 def _runtime_validation_store(request: Request) -> Any:
     return getattr(request.app.state, "runtime_validation_store", runtime_validation_store)
+
+
+async def _agent_bus_work_item_for_runtime_result(
+    result: RuntimeValidationResult,
+    request: Request,
+    settings: Settings,
+) -> dict[str, Any] | None:
+    if not result.work_item_id or not settings.enable_agent_bus_dispatch:
+        return None
+    client = getattr(request.app.state, "agent_bus_client", None)
+    owns_client = client is None
+    if client is None:
+        client = AgentBusClient(
+            base_url=settings.agent_bus_base_url,
+            token=settings.agent_bus_token,
+            runtime_validation_token=settings.agent_bus_runtime_validation_token,
+            timeout_seconds=settings.agent_bus_timeout_seconds,
+        )
+    try:
+        work_item = await client.get_work_item(result.work_item_id)
+        if isinstance(work_item, dict):
+            log_event(
+                "runtime_validation_agent_bus_work_item_metadata_loaded",
+                runtime_validation_id=result.validation_id,
+                workflow_id=result.workflow_id,
+                work_item_id=result.work_item_id,
+                repository=result.repo,
+                pr_number=result.pr_number,
+                branch=result.branch,
+                metadata_keys=sorted(str(key) for key in (work_item.get("metadata") or {}).keys()) if isinstance(work_item.get("metadata"), dict) else [],
+            )
+            return work_item
+    except Exception as exc:
+        log_event(
+            "runtime_validation_agent_bus_work_item_metadata_unavailable",
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+            repository=result.repo,
+            pr_number=result.pr_number,
+            branch=result.branch,
+            error=str(exc),
+            exception_type=exc.__class__.__name__,
+        )
+    finally:
+        if owns_client and hasattr(client, "aclose"):
+            await client.aclose()
+    return None
 
 
 def _schedule_runtime_review_processing(
