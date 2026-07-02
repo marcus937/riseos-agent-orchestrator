@@ -152,7 +152,7 @@ async def list_agent_ready_issues(repo_full_name: str, client: TaskDispatchClien
                 body=body,
                 labels=sorted(labels),
                 created_at=_parse_datetime(raw_issue.get("created_at")),
-                url=raw_issue.get("html_url") if isinstance(raw_issue.get("html_url"), str) else None,
+                url=raw_issue.get("html_url") if isinstance(raw_issue.get("html_url", None), str) else None,
                 dependency_count=dependency_state.dependency_count,
                 dependencies_satisfied=dependency_state.dependencies_satisfied,
                 blocked_by=dependency_state.blocked_by,
@@ -441,9 +441,27 @@ def build_agent_bus_work_item_payload(
 
 
 def build_workflow_chain_work_item_payload(continuation: dict[str, Any]) -> dict[str, Any]:
+    workflow_chain = _compact_payload(
+        {
+            "workflow_chain_id": continuation.get("workflow_chain_id"),
+            "workflow_step": continuation["next_workflow_step"],
+            "current_workflow_step": continuation["next_workflow_step"],
+            "previous_workflow_step": continuation["previous_workflow_step"],
+            "workflow_steps": continuation.get("workflow_steps"),
+            "workflow_sequence": continuation.get("workflow_steps"),
+            "next_workflow_step": continuation.get("following_workflow_step"),
+            "repository": continuation["repository"],
+            "pr_number": continuation["pr_number"],
+            "branch": continuation["branch"],
+            "base_branch": continuation["base_branch"],
+            "continuation_mode": "same_pr_branch",
+            "merge_gate": "final_step_only",
+        }
+    )
     metadata = {
         "source": "riseos-agent-orchestrator",
         "dispatch_reason": continuation["dispatch_reason"],
+        "workflow_chain": workflow_chain,
         "workflow_chain_id": continuation.get("workflow_chain_id"),
         "workflow_step": continuation["next_workflow_step"],
         "previous_workflow_step": continuation["previous_workflow_step"],
@@ -520,8 +538,11 @@ def workflow_chain_continuation_for_decision(
 def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_BASE_BRANCH) -> dict[str, Any] | None:
     runtime_context = _dict_value(getattr(item, "runtime_validation_context", None))
     review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
+    workflow_chain = _canonical_workflow_chain_from_context(review_dispatch, runtime_context)
     workflow_step = _normalize_workflow_step(
         _first_present(
+            workflow_chain.get("workflow_step"),
+            workflow_chain.get("current_workflow_step"),
             review_dispatch.get("workflow_step"),
             review_dispatch.get("workflowStep"),
             runtime_context.get("workflow_step"),
@@ -530,14 +551,18 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
     )
     workflow_chain_id = _string_or_none(
         _first_present(
+            workflow_chain.get("workflow_chain_id"),
+            workflow_chain.get("workflowChainId"),
             review_dispatch.get("workflow_chain_id"),
             review_dispatch.get("workflowChainId"),
             runtime_context.get("workflow_chain_id"),
         )
     )
-    workflow_steps = _workflow_steps_from_context(review_dispatch, runtime_context)
+    workflow_steps = _workflow_steps_from_context(workflow_chain, review_dispatch, runtime_context)
     explicit_next = _normalize_workflow_step(
         _first_present(
+            workflow_chain.get("next_workflow_step"),
+            workflow_chain.get("nextWorkflowStep"),
             review_dispatch.get("next_workflow_step"),
             review_dispatch.get("nextWorkflowStep"),
             runtime_context.get("next_workflow_step"),
@@ -550,13 +575,30 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
         return None
 
     repo = _string_or_none(getattr(item, "repo_full_name", None)) or _string_or_none(
-        _first_present(review_dispatch.get("repository"), runtime_context.get("repo"), runtime_context.get("repository"))
+        _first_present(
+            workflow_chain.get("repository"),
+            workflow_chain.get("repo"),
+            review_dispatch.get("repository"),
+            runtime_context.get("repo"),
+            runtime_context.get("repository"),
+        )
     )
     pr_number = _int_or_none(
-        _first_present(getattr(item, "pr_number", None), review_dispatch.get("pr_number"), runtime_context.get("pr_number"))
+        _first_present(
+            getattr(item, "pr_number", None),
+            workflow_chain.get("pr_number"),
+            workflow_chain.get("prNumber"),
+            review_dispatch.get("pr_number"),
+            runtime_context.get("pr_number"),
+        )
     )
     branch = _string_or_none(
-        _first_present(getattr(item, "branch", None), review_dispatch.get("branch"), runtime_context.get("branch"))
+        _first_present(
+            getattr(item, "branch", None),
+            workflow_chain.get("branch"),
+            review_dispatch.get("branch"),
+            runtime_context.get("branch"),
+        )
     )
     if not repo or pr_number is None or not branch:
         return None
@@ -564,12 +606,24 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
     return {
         "repository": repo,
         "issue_number": _int_or_none(
-            _first_present(getattr(item, "issue_number", None), review_dispatch.get("issue_number"), runtime_context.get("issue_number"))
+            _first_present(
+                getattr(item, "issue_number", None),
+                workflow_chain.get("issue_number"),
+                workflow_chain.get("issueNumber"),
+                review_dispatch.get("issue_number"),
+                runtime_context.get("issue_number"),
+            )
         ),
         "pr_number": pr_number,
         "branch": branch,
         "base_branch": _string_or_none(
-            _first_present(getattr(item, "base_branch", None), review_dispatch.get("base_branch"), runtime_context.get("base_branch"))
+            _first_present(
+                getattr(item, "base_branch", None),
+                workflow_chain.get("base_branch"),
+                workflow_chain.get("baseBranch"),
+                review_dispatch.get("base_branch"),
+                runtime_context.get("base_branch"),
+            )
         )
         or base_branch,
         "commit_sha": _string_or_none(
@@ -583,6 +637,8 @@ def workflow_chain_context_from_item(item: Any, *, base_branch: str = WF_CHAIN_B
         "previous_work_item_id": _string_or_none(
             _first_present(
                 getattr(item, "agent_bus_work_item_id", None),
+                workflow_chain.get("previous_work_item_id"),
+                workflow_chain.get("work_item_id"),
                 runtime_context.get("agent_bus_work_item_id"),
                 runtime_context.get("work_item_id"),
                 getattr(item, "id", None),
@@ -623,32 +679,62 @@ def workflow_chain_context_from_continuation(continuation: WorkflowContinuation)
 def workflow_chain_missing_metadata_reason(item: Any) -> str | None:
     runtime_context = _dict_value(getattr(item, "runtime_validation_context", None))
     review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
-    if not runtime_context or not review_dispatch:
+    workflow_chain = _canonical_workflow_chain_from_context(review_dispatch, runtime_context)
+    if not runtime_context or (not review_dispatch and not workflow_chain):
         return None
     fields = {
         "workflow_step": _first_present(
+            workflow_chain.get("workflow_step"),
+            workflow_chain.get("current_workflow_step"),
             review_dispatch.get("workflow_step"),
             review_dispatch.get("workflowStep"),
             runtime_context.get("workflow_step"),
             runtime_context.get("workflowStep"),
         ),
         "workflow_chain_id": _first_present(
+            workflow_chain.get("workflow_chain_id"),
+            workflow_chain.get("workflowChainId"),
             review_dispatch.get("workflow_chain_id"),
             review_dispatch.get("workflowChainId"),
             runtime_context.get("workflow_chain_id"),
         ),
-        "repository": _first_present(getattr(item, "repo_full_name", None), review_dispatch.get("repository"), runtime_context.get("repository"), runtime_context.get("repo")),
-        "pr_number": _first_present(getattr(item, "pr_number", None), review_dispatch.get("pr_number"), runtime_context.get("pr_number")),
-        "branch": _first_present(getattr(item, "branch", None), review_dispatch.get("branch"), runtime_context.get("branch")),
+        "repository": _first_present(
+            getattr(item, "repo_full_name", None),
+            workflow_chain.get("repository"),
+            workflow_chain.get("repo"),
+            review_dispatch.get("repository"),
+            runtime_context.get("repository"),
+            runtime_context.get("repo"),
+        ),
+        "pr_number": _first_present(
+            getattr(item, "pr_number", None),
+            workflow_chain.get("pr_number"),
+            workflow_chain.get("prNumber"),
+            review_dispatch.get("pr_number"),
+            runtime_context.get("pr_number"),
+        ),
+        "branch": _first_present(
+            getattr(item, "branch", None),
+            workflow_chain.get("branch"),
+            review_dispatch.get("branch"),
+            runtime_context.get("branch"),
+        ),
     }
-    chain_like = any(fields.values()) or runtime_context.get("source") == "runtime_validation_bb2_packet"
+    chain_like = any(fields.values()) or bool(workflow_chain) or runtime_context.get("source") == "runtime_validation_bb2_packet"
     if not chain_like:
         return None
     missing = [name for name, value in fields.items() if value in (None, "")]
     if missing:
         return "MISSING_WORKFLOW_METADATA"
-    workflow_steps = _workflow_steps_from_context(review_dispatch, runtime_context)
-    explicit_next = _first_present(review_dispatch.get("next_workflow_step"), review_dispatch.get("nextWorkflowStep"), runtime_context.get("next_workflow_step"), runtime_context.get("nextWorkflowStep"))
+    workflow_steps = _workflow_steps_from_context(workflow_chain, review_dispatch, runtime_context)
+    explicit_next = _first_present(
+        workflow_chain.get("next_workflow_step"),
+        workflow_chain.get("nextWorkflowStep"),
+        review_dispatch.get("next_workflow_step"),
+        review_dispatch.get("nextWorkflowStep"),
+        runtime_context.get("next_workflow_step"),
+        runtime_context.get("nextWorkflowStep"),
+    )
     workflow_step = _normalize_workflow_step(fields["workflow_step"])
     if not workflow_steps and not explicit_next and workflow_step not in WF_CHAIN_STEPS:
         return "MISSING_WORKFLOW_METADATA"
@@ -819,6 +905,17 @@ def _workflow_chain_log_context(item: Any) -> dict[str, Any]:
     }
 
 
+def _canonical_workflow_chain_from_context(*contexts: dict[str, Any]) -> dict[str, Any]:
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        for key in ("workflow_chain", "workflowChain", "_workflow_chain"):
+            value = context.get(key)
+            if isinstance(value, dict) and value:
+                return value
+    return {}
+
+
 def _workflow_steps_from_context(*contexts: dict[str, Any]) -> list[str] | None:
     for context in contexts:
         steps = _normalize_workflow_sequence(
@@ -837,10 +934,15 @@ def _workflow_steps_from_context(*contexts: dict[str, Any]) -> list[str] | None:
 def _normalize_workflow_sequence(value: Any) -> list[str] | None:
     if value is None or value == "":
         return None
+    raw_steps: list[str] = []
     if isinstance(value, str):
         raw_steps = [part.strip() for part in value.split(",")]
     elif isinstance(value, (list, tuple)):
-        raw_steps = [str(part).strip() for part in value]
+        for part in value:
+            if isinstance(part, dict):
+                raw_steps.append(str(_first_present(part.get("task_key"), part.get("workflow_step"), part.get("step_name"), part.get("name")) or "").strip())
+            else:
+                raw_steps.append(str(part).strip())
     else:
         return None
     steps = [_normalize_workflow_step(step) for step in raw_steps if step]
