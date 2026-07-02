@@ -130,16 +130,6 @@ class WorkerStats(BaseModel):
 
 
 class ReviewQueueStats(BaseModel):
-    review_queue_count: int
-    pending_review_count: int
-    reviewing_count: int
-    needs_changes_count: int
-    approved_count: int
-    approved_for_human_review_count: int
-    blocked_count: int
-
-
-class ReviewQueueStats(BaseModel):
     counters: ReviewQueueCounters
     oldest_pending_age_seconds: float | None = None
     newest_item_age_seconds: float | None = None
