@@ -14,9 +14,11 @@ def log_review_work_item_identity(event_name: str, item: Any, *, caller: str, **
     from app.operational_logging import log_event
 
     context = workflow_chain_availability_context(item)
+    object_id = id(item)
     context.update(
         {
-            "review_item_object_id": id(item),
+            "id_review_item": object_id,
+            "review_item_object_id": object_id,
             "workflow_chain_length": _workflow_chain_length(item),
             "caller": caller,
         }
