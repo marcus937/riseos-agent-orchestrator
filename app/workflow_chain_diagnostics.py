@@ -10,6 +10,20 @@ def log_workflow_chain_availability(event_name: str, item: Any, **extra: Any) ->
     log_event(event_name, **workflow_chain_availability_context(item), **extra)
 
 
+def log_review_work_item_identity(event_name: str, item: Any, *, caller: str, **extra: Any) -> None:
+    from app.operational_logging import log_event
+
+    context = workflow_chain_availability_context(item)
+    context.update(
+        {
+            "review_item_object_id": id(item),
+            "workflow_chain_length": _workflow_chain_length(item),
+            "caller": caller,
+        }
+    )
+    log_event(event_name, **context, **extra)
+
+
 def workflow_chain_availability_context(item: Any) -> dict[str, Any]:
     runtime_context = _dict_value(_value_from(item, "runtime_validation_context"))
     review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
@@ -71,6 +85,15 @@ def _metadata_from(item: Any, *contexts: dict[str, Any]) -> dict[str, Any]:
         if metadata:
             return metadata
     return {}
+
+
+def _workflow_chain_length(item: Any) -> int:
+    context = workflow_chain_availability_context(item)
+    if context["workflow_chain_populated"]:
+        return len(context["workflow_chain_keys"])
+    if context["_workflow_chain_populated"]:
+        return len(context["_workflow_chain_keys"])
+    return 0
 
 
 def _object_keys(value: Any) -> list[str]:
