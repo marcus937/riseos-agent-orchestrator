@@ -7,22 +7,16 @@ def log_workflow_chain_availability(event_name: str, item: Any, **extra: Any) ->
     """Emit temporary diagnostics showing where workflow-chain metadata is present."""
     from app.operational_logging import log_event
 
-    log_event(event_name, **workflow_chain_availability_context(item), **extra)
+    context = workflow_chain_availability_context(item)
+    context.setdefault("caller", _diagnostic_caller("log_workflow_chain_availability"))
+    log_event(event_name, **context, **extra)
 
 
 def log_review_work_item_identity(event_name: str, item: Any, *, caller: str, **extra: Any) -> None:
     from app.operational_logging import log_event
 
     context = workflow_chain_availability_context(item)
-    object_id = id(item)
-    context.update(
-        {
-            "id_review_item": object_id,
-            "review_item_object_id": object_id,
-            "workflow_chain_length": _workflow_chain_length(item),
-            "caller": caller,
-        }
-    )
+    context["caller"] = caller
     log_event(event_name, **context, **extra)
 
 
@@ -53,8 +47,13 @@ def workflow_chain_availability_context(item: Any) -> dict[str, Any]:
         review_private_workflow_chain,
         metadata_private_workflow_chain,
     )
+    workflow_chain_keys = sorted(str(key) for key in workflow_chain.keys())
+    private_workflow_chain_keys = sorted(str(key) for key in private_workflow_chain.keys())
+    object_id = id(item)
 
     return {
+        "id_review_item": object_id,
+        "review_item_object_id": object_id,
         "object_type": type(item).__name__,
         "object_module": type(item).__module__,
         "object_keys": _object_keys(item),
@@ -67,11 +66,12 @@ def workflow_chain_availability_context(item: Any) -> dict[str, Any]:
         "branch": _string_or_none(_first_present(_value_from(item, "branch"), runtime_context.get("branch"), review_dispatch.get("branch"))),
         "workflow_chain_populated": bool(workflow_chain),
         "_workflow_chain_populated": bool(private_workflow_chain),
+        "workflow_chain_length": len(workflow_chain_keys or private_workflow_chain_keys),
         "review_dispatch_populated": bool(review_dispatch),
         "runtime_context_populated": bool(runtime_context),
         "metadata_workflow_chain_populated": bool(metadata_workflow_chain),
-        "workflow_chain_keys": sorted(str(key) for key in workflow_chain.keys()),
-        "_workflow_chain_keys": sorted(str(key) for key in private_workflow_chain.keys()),
+        "workflow_chain_keys": workflow_chain_keys,
+        "_workflow_chain_keys": private_workflow_chain_keys,
         "review_dispatch_keys": sorted(str(key) for key in review_dispatch.keys()),
         "runtime_context_keys": sorted(str(key) for key in runtime_context.keys()),
         "metadata_keys": sorted(str(key) for key in metadata.keys()),
@@ -87,15 +87,6 @@ def _metadata_from(item: Any, *contexts: dict[str, Any]) -> dict[str, Any]:
         if metadata:
             return metadata
     return {}
-
-
-def _workflow_chain_length(item: Any) -> int:
-    context = workflow_chain_availability_context(item)
-    if context["workflow_chain_populated"]:
-        return len(context["workflow_chain_keys"])
-    if context["_workflow_chain_populated"]:
-        return len(context["_workflow_chain_keys"])
-    return 0
 
 
 def _object_keys(value: Any) -> list[str]:
@@ -139,3 +130,13 @@ def _string_or_none(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _diagnostic_caller(default: str) -> str:
+    import inspect
+
+    for frame_info in inspect.stack()[2:10]:
+        module = frame_info.frame.f_globals.get("__name__", "")
+        if module != "app.workflow_chain_diagnostics":
+            return f"{module}.{frame_info.function}"
+    return default
