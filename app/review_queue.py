@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel
 from app.review_workflow import ReviewWorkflowResult
-from app.workflow_chain_diagnostics import log_workflow_chain_availability
+from app.workflow_chain_diagnostics import log_review_work_item_identity, log_workflow_chain_availability
 
 
 class ReviewWorkItemStatus(StrEnum):
@@ -193,10 +193,25 @@ class InMemoryReviewQueue:
         return self.add_if_absent(item)
 
     def add_if_absent(self, item: ReviewWorkItem) -> ReviewWorkItem:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_in_memory_add_if_absent",
+            item,
+            caller="InMemoryReviewQueue.add_if_absent",
+        )
         duplicate = self.find_pending_duplicate(item)
         if duplicate is not None:
+            log_review_work_item_identity(
+                "wf_chain_review_item_in_memory_duplicate_returned",
+                duplicate,
+                caller="InMemoryReviewQueue.add_if_absent",
+            )
             return duplicate
         self._items.append(item)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_in_memory_append",
+            item,
+            caller="InMemoryReviewQueue.add_if_absent",
+        )
         return item
 
     def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
@@ -261,7 +276,7 @@ class InMemoryReviewQueue:
 
 def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
     now = datetime.now(UTC)
-    return ReviewWorkItem(
+    item = ReviewWorkItem(
         id=str(uuid4()),
         created_at=now,
         updated_at=now,
@@ -274,6 +289,12 @@ def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
         pr_number=parsed.pull_request_number,
         labels=sorted(set(parsed.labels)),
     )
+    log_review_work_item_identity(
+        "wf_chain_review_item_constructed_from_parsed",
+        item,
+        caller="review_work_item_from_parsed.ReviewWorkItem",
+    )
+    return item
 
 
 def review_work_item_identity(item: ReviewWorkItem) -> tuple[str | None, str, str | None, int | None, int | None]:
