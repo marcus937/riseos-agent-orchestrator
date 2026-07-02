@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.operational_logging import log_event
-
 
 def log_workflow_chain_availability(event_name: str, item: Any, **extra: Any) -> None:
     """Emit temporary diagnostics showing where workflow-chain metadata is present."""
+    from app.operational_logging import log_event
+
     log_event(event_name, **workflow_chain_availability_context(item), **extra)
 
 
