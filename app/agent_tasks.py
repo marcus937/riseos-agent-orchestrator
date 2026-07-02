@@ -389,7 +389,7 @@ def apply_execution_result(task: AgentTask, result: AgentTaskExecutionResult) ->
     task.branch = result.branch
     task.commit_sha = result.commit_sha
     task.changed_files = result.changed_files
-    task.execution_evidence = result.evidence
+    task.execution_evidence = _execution_evidence_with_preserved_orchestration_metadata(task, result)
     if now_status == AgentTaskStatus.CLAIMED:
         task.claimed_at = task.updated_at
     elif now_status in {AgentTaskStatus.RUNNING, AgentTaskStatus.IN_PROGRESS}:
@@ -448,6 +448,18 @@ def _task_from_row(row: sqlite3.Row) -> AgentTask:
     data["execution_evidence"] = json.loads(data.get("execution_evidence") or "{}")
     data["lifecycle_events"] = json.loads(data["lifecycle_events"] or "[]")
     return AgentTask.model_validate(data)
+
+
+def _execution_evidence_with_preserved_orchestration_metadata(
+    task: AgentTask,
+    result: AgentTaskExecutionResult,
+) -> dict[str, Any]:
+    evidence = dict(result.evidence) if isinstance(result.evidence, dict) else {}
+    existing = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+    for key in ("_workflow_chain", "_routing"):
+        if key not in evidence and isinstance(existing.get(key), dict):
+            evidence[key] = existing[key]
+    return evidence
 
 
 def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
