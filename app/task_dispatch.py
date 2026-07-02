@@ -10,6 +10,7 @@ from app.config import Settings, get_settings
 from app.operational_logging import log_event
 from app.reviewer.decision import ReviewDecisionType
 from app.task_dependencies import dependency_state_for_issue
+from app.workflow_chain_diagnostics import log_workflow_chain_availability
 from app.workflow_continuation import (
     WorkflowContinuation,
     WorkflowContinuationStatus,
@@ -277,6 +278,11 @@ async def dispatch_workflow_chain_continuation(
     continuation_store: WorkflowContinuationStore | None = None,
     base_branch: str = WF_CHAIN_BASE_BRANCH,
 ) -> TaskDispatchResult | None:
+    log_workflow_chain_availability(
+        "wf_chain_metadata_dispatch_workflow_chain_continuation_input",
+        item,
+        decision=getattr(decision, "value", str(decision)),
+    )
     missing_reason = workflow_chain_missing_metadata_reason(item)
     if missing_reason is not None:
         return _record_missing_metadata_continuation(item, continuation_store, base_branch=base_branch, reason=missing_reason)
