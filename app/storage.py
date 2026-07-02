@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.event_store import EventRecord
 from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
+from app.workflow_chain_diagnostics import log_workflow_chain_availability
 
 
 class SQLiteStateStore:
@@ -146,6 +147,10 @@ class SQLiteStateStore:
         return int(row["count"])
 
     def save_review_work_item(self, item: ReviewWorkItem) -> None:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_storage_save_review_work_item_input",
+            item,
+        )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -415,7 +420,16 @@ class SQLiteStateStore:
         if data.get("agent_bus_dispatch_success") is not None:
             data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
         data["runtime_validation_context"] = _load_json(data.get("runtime_validation_context"))
-        return ReviewWorkItem.model_validate(data)
+        log_workflow_chain_availability(
+            "wf_chain_metadata_storage_deserialize_review_work_item_row",
+            data,
+        )
+        item = ReviewWorkItem.model_validate(data)
+        log_workflow_chain_availability(
+            "wf_chain_metadata_storage_deserialize_review_work_item_model",
+            item,
+        )
+        return item
 
 
 def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> SQLiteStateStore | None:

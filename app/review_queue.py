@@ -484,6 +484,10 @@ def process_review_work_item(
     openai_review_error: str | None = None,
     reviewer_model: str | None = None,
 ) -> ReviewProcessResponse:
+    log_workflow_chain_availability(
+        "wf_chain_metadata_process_review_work_item_entered",
+        item,
+    )
     if item.status == ReviewWorkItemStatus.PENDING_REVIEW:
         item.status = ReviewWorkItemStatus.REVIEWING
         record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_STARTED)
@@ -494,7 +498,7 @@ def process_review_work_item(
         item.last_error = github_context_error
     if github_writeback_error:
         record_lifecycle_stage(item, ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED, success=False, error=github_writeback_error)
-    return ReviewProcessResponse(
+    response = ReviewProcessResponse(
         work_item=item,
         decision=decision,
         intended_next_actions=_intended_next_actions(decision),
@@ -516,6 +520,11 @@ def process_review_work_item(
         reviewer_model=reviewer_model,
         dry_run=True,
     )
+    log_workflow_chain_availability(
+        "wf_chain_metadata_process_review_work_item_returning",
+        response.work_item,
+    )
+    return response
 
 
 def _blocked_reason(item: ReviewWorkItem) -> str | None:
