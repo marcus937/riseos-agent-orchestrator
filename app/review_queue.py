@@ -1,6 +1,7 @@
 from collections import Counter, deque
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -8,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel
 from app.review_workflow import ReviewWorkflowResult
-from app.workflow_chain_diagnostics import log_workflow_chain_availability
+from app.workflow_chain_diagnostics import log_review_work_item_identity, log_workflow_chain_availability
 
 
 class ReviewWorkItemStatus(StrEnum):
@@ -74,6 +75,44 @@ class ReviewWorkItem(BaseModel):
     failure_count: int = 0
     last_failure_at: datetime | None = None
     last_error: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        log_review_work_item_identity(
+            "wf_chain_review_item_constructed_or_model_validated",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_post_init"),
+        )
+
+    def model_copy(self, *args: Any, **kwargs: Any) -> "ReviewWorkItem":
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_copy",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_copy"),
+        )
+        copied = super().model_copy(*args, **kwargs)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_model_copy",
+            copied,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_copy"),
+            source_id_review_item=id(self),
+        )
+        return copied
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_dump",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_dump"),
+        )
+        return super().model_dump(*args, **kwargs)
+
+    def dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_dict",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.dict"),
+        )
+        return super().dict(*args, **kwargs)
 
 
 class ReviewProcessResponse(BaseModel):
@@ -193,10 +232,25 @@ class InMemoryReviewQueue:
         return self.add_if_absent(item)
 
     def add_if_absent(self, item: ReviewWorkItem) -> ReviewWorkItem:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_in_memory_add_if_absent",
+            item,
+            caller="InMemoryReviewQueue.add_if_absent",
+        )
         duplicate = self.find_pending_duplicate(item)
         if duplicate is not None:
+            log_review_work_item_identity(
+                "wf_chain_review_item_in_memory_duplicate_returned",
+                duplicate,
+                caller="InMemoryReviewQueue.add_if_absent",
+            )
             return duplicate
         self._items.append(item)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_in_memory_append",
+            item,
+            caller="InMemoryReviewQueue.add_if_absent",
+        )
         return item
 
     def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
@@ -261,7 +315,7 @@ class InMemoryReviewQueue:
 
 def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
     now = datetime.now(UTC)
-    return ReviewWorkItem(
+    item = ReviewWorkItem(
         id=str(uuid4()),
         created_at=now,
         updated_at=now,
@@ -274,6 +328,12 @@ def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
         pr_number=parsed.pull_request_number,
         labels=sorted(set(parsed.labels)),
     )
+    log_review_work_item_identity(
+        "wf_chain_review_item_constructed_from_parsed",
+        item,
+        caller="review_work_item_from_parsed.ReviewWorkItem",
+    )
+    return item
 
 
 def review_work_item_identity(item: ReviewWorkItem) -> tuple[str | None, str, str | None, int | None, int | None]:
@@ -569,6 +629,16 @@ def _newest_item_age_seconds(items: list[ReviewWorkItem], now: datetime) -> floa
 
 def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
     return _newest_item_age_seconds(items, now)
+
+
+def _review_item_diagnostic_caller(default: str) -> str:
+    import inspect
+
+    for frame_info in inspect.stack()[2:10]:
+        module = frame_info.frame.f_globals.get("__name__", "")
+        if module not in {"app.review_queue", "app.workflow_chain_diagnostics"}:
+            return f"{module}.{frame_info.function}"
+    return default
 
 
 _UNFINISHED_STATUSES = {
