@@ -85,6 +85,7 @@ def build_agent_bus_review_request_payload(
     issue_number = _first_int(review_dispatch, "issue_number") or task.issue_number
     evidence_id = _first_string(review_dispatch, "evidence_packet_id", "evidence_id")
     source_work_item_id = _first_string(review_dispatch, "work_item_id") or task.agent_bus_work_item_id
+    workflow_chain = review_dispatch.get("workflow_chain") if isinstance(review_dispatch.get("workflow_chain"), dict) else None
     title = _first_string(review_dispatch, "title") or (
         f"BB2 review for {repo} PR #{pr_number}" if pr_number else f"BB2 review for {task.title}"
     )
@@ -113,6 +114,7 @@ def build_agent_bus_review_request_payload(
         "base_branch": base_branch,
         "commit_sha": payload.commit_sha,
         "changed_files": list(payload.changed_files),
+        "workflow_chain": workflow_chain,
         "prompt": _first_string(review_dispatch, "prompt") or "Review Codex worker implementation evidence for this PR.",
         "review_dispatch": _sanitized_review_dispatch(review_dispatch),
     }
@@ -142,6 +144,7 @@ def _merge_workflow_chain_review_dispatch(task: AgentTask, review_dispatch: dict
     merged = dict(review_dispatch)
     for key, value in workflow_chain.items():
         merged.setdefault(key, value)
+    merged.setdefault("workflow_chain", dict(workflow_chain))
     if "workflow_step" not in merged and workflow_chain.get("current_workflow_step") is not None:
         merged["workflow_step"] = workflow_chain["current_workflow_step"]
     if "current_workflow_step" not in merged and workflow_chain.get("workflow_step") is not None:
