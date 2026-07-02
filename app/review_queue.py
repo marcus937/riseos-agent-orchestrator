@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel
 from app.review_workflow import ReviewWorkflowResult
+from app.workflow_chain_diagnostics import log_workflow_chain_availability
 
 
 class ReviewWorkItemStatus(StrEnum):
@@ -292,6 +293,11 @@ def record_lifecycle_stage(
     success: bool | None = None,
     error: str | None = None,
 ) -> ReviewWorkItem:
+    if stage == ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_before_github_writeback_started",
+            item,
+        )
     now = datetime.now(UTC)
     item.updated_at = now
     item.lifecycle_stage = stage
@@ -324,6 +330,13 @@ def record_lifecycle_stage(
         item.agent_bus_dispatch_error = error if stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED else item.agent_bus_dispatch_error
         if stage not in {ReviewLifecycleStage.REVIEW_FAILED, ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED}:
             item.failure_count += 1
+    if stage == ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_after_github_writeback_completed",
+            item,
+            github_writeback_success=success,
+            github_writeback_error=error,
+        )
     return item
 
 
