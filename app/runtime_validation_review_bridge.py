@@ -238,6 +238,11 @@ def _normalize_workflow_chain_metadata(
     if result.workflow_id:
         review_dispatch.setdefault("workflow_id", result.workflow_id)
 
+    workflow_chain = _workflow_chain_object(review_dispatch, sources)
+    if workflow_chain:
+        review_dispatch["workflow_chain"] = workflow_chain
+        context["workflow_chain"] = workflow_chain
+
     for key in _WORKFLOW_CHAIN_KEYS:
         if key in review_dispatch and _value_present(review_dispatch.get(key)):
             context.setdefault(key, review_dispatch[key])
@@ -263,9 +268,15 @@ def _agent_bus_work_item_sources(agent_bus_work_item: dict[str, Any] | None) -> 
     metadata = agent_bus_work_item.get("metadata")
     if isinstance(metadata, dict):
         sources.append(metadata)
+        workflow_chain = metadata.get("workflow_chain")
+        if isinstance(workflow_chain, dict):
+            sources.append(workflow_chain)
         review_dispatch = metadata.get("review_dispatch")
         if isinstance(review_dispatch, dict):
             sources.append(review_dispatch)
+            nested_chain = review_dispatch.get("workflow_chain")
+            if isinstance(nested_chain, dict):
+                sources.append(nested_chain)
     return sources
 
 
@@ -283,6 +294,9 @@ def _agent_bus_runtime_validation_sources(review_dispatch: dict[str, Any]) -> li
                         metadata = entry.get("metadata")
                         if isinstance(metadata, dict):
                             sources.append(metadata)
+                            workflow_chain = metadata.get("workflow_chain")
+                            if isinstance(workflow_chain, dict):
+                                sources.append(workflow_chain)
     return sources
 
 
@@ -314,6 +328,9 @@ def _agent_task_sources(result: RuntimeValidationResult, *, item: ReviewWorkItem
             chain = evidence.get("_workflow_chain")
             if isinstance(chain, dict):
                 matched.append(chain)
+            nested_chain = evidence.get("workflow_chain")
+            if isinstance(nested_chain, dict):
+                matched.append(nested_chain)
             matched.append(evidence)
     return matched
 
@@ -337,6 +354,9 @@ def _contains_workflow_metadata(source: dict[str, Any]) -> bool:
         return False
     if any(_value_present(source.get(key)) for key in _WORKFLOW_CHAIN_KEYS):
         return True
+    workflow_chain = source.get("workflow_chain") or source.get("workflowChain") or source.get("_workflow_chain")
+    if isinstance(workflow_chain, dict) and any(_value_present(workflow_chain.get(key)) for key in _WORKFLOW_CHAIN_KEYS):
+        return True
     metadata = source.get("metadata")
     return isinstance(metadata, dict) and any(_value_present(metadata.get(key)) for key in _WORKFLOW_CHAIN_KEYS)
 
@@ -347,6 +367,16 @@ def _fill_missing(target: dict[str, Any], key: str, sources: list[dict[str, Any]
     value = _first_present_from_sources(sources, *aliases)
     if _value_present(value):
         target[key] = value
+
+
+def _workflow_chain_object(review_dispatch: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    raw_chain = _first_present_from_sources(sources, "workflow_chain", "workflowChain", "_workflow_chain")
+    workflow_chain = dict(raw_chain) if isinstance(raw_chain, dict) else {}
+    for key in _WORKFLOW_CHAIN_KEYS:
+        value = review_dispatch.get(key)
+        if _value_present(value):
+            workflow_chain.setdefault(key, value)
+    return workflow_chain
 
 
 def _first_present_from_sources(sources: list[dict[str, Any]], *aliases: str) -> Any:
