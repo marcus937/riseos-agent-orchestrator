@@ -61,6 +61,8 @@ def build_agent_bus_work_item_payload(
     }
     metadata.update(routing)
     metadata.update(workflow_chain)
+    if workflow_chain:
+        metadata["workflow_chain"] = dict(workflow_chain)
     metadata.update(scheduler_metadata_from_task(task))
     payload: dict[str, Any] = {
         "title": task.title,
