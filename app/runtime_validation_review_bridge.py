@@ -17,6 +17,7 @@ from app.review_queue import (
     review_work_item_from_parsed,
     review_work_item_identity,
 )
+from app.workflow_chain_diagnostics import log_workflow_chain_availability
 
 TERMINAL_RUNTIME_VALIDATION_STATUSES = {"blocked", "completed", "failed"}
 RUNTIME_REVIEW_SOURCE = "runtime_validation_bb2_packet"
@@ -71,18 +72,30 @@ def enqueue_review_from_runtime_validation(
     digest = stable_validation_digest(result)
     duplicate = _find_exact_runtime_result(result, digest=digest, storage=storage)
     if duplicate is not None:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_runtime_bridge_duplicate_result",
+            duplicate,
+        )
         result.bb2.packet_created = True
         result.bb2.review_requested = True
         return duplicate
 
     item = existing_item or _find_pending_runtime_result(result, storage=storage) or _review_work_item_from_runtime_validation(result)
     _attach_runtime_validation_context(item, result, digest=digest)
+    log_workflow_chain_availability(
+        "wf_chain_metadata_runtime_bridge_after_context_attach",
+        item,
+    )
     _normalize_workflow_chain_metadata(
         item.runtime_validation_context,
         result,
         item=item,
         agent_task_store=agent_task_store,
         agent_bus_work_item=agent_bus_work_item,
+    )
+    log_workflow_chain_availability(
+        "wf_chain_metadata_runtime_bridge_after_metadata_normalize",
+        item,
     )
     result.review_dispatch = _dict_value(item.runtime_validation_context.get("review_dispatch"))
 
@@ -110,8 +123,18 @@ def enqueue_review_from_runtime_validation(
     )
 
     if storage is not None:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_runtime_bridge_before_persist",
+            item,
+            persistence="sqlite",
+        )
         storage.save_review_work_item(item)
         return item
+    log_workflow_chain_availability(
+        "wf_chain_metadata_runtime_bridge_before_queue_add",
+        item,
+        persistence="memory",
+    )
     queued = review_queue.add_if_absent(item)
     return queued
 
