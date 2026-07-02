@@ -130,7 +130,9 @@ def test_release_runnable_tasks_advances_dependency_chain() -> None:
     assert response.status == WorkflowStatus.RUNNING
     assert response.current_running_task.task_key == "B"
     assert response.completed_tasks == ["A"]
-    assert response.task_results["A"] == {"summary": "A complete"}
+    assert response.task_results["A"]["summary"] == "A complete"
+    assert response.task_results["A"]["_workflow_chain"]["workflow_step"] == "A"
+    assert response.task_results["A"]["_workflow_chain"]["next_workflow_step"] == "B"
     assert task_by_key["B"].blocked is False
     assert task_by_key["C"].blocked is True
 
