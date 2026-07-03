@@ -80,7 +80,13 @@ def enqueue_review_from_runtime_validation(
         result.bb2.review_requested = True
         return duplicate
 
-    item = existing_item or _find_pending_runtime_result(result, storage=storage) or _review_work_item_from_runtime_validation(result)
+    item = existing_item or _find_pending_runtime_result(result, storage=storage)
+    if item is None:
+        item = _review_work_item_from_runtime_validation(
+            result,
+            agent_task_store=agent_task_store,
+            agent_bus_work_item=agent_bus_work_item,
+        )
     _attach_runtime_validation_context(item, result, digest=digest)
     log_workflow_chain_availability(
         "wf_chain_metadata_runtime_bridge_after_context_attach",
@@ -180,8 +186,21 @@ def runtime_validation_context_from_result(result: RuntimeValidationResult) -> d
     }
 
 
-def _review_work_item_from_runtime_validation(result: RuntimeValidationResult) -> ReviewWorkItem:
+def _review_work_item_from_runtime_validation(
+    result: RuntimeValidationResult,
+    *,
+    agent_task_store: Any | None = None,
+    agent_bus_work_item: dict[str, Any] | None = None,
+) -> ReviewWorkItem:
     now = datetime.now(UTC)
+    runtime_context = runtime_validation_context_from_result(result)
+    _normalize_workflow_chain_metadata(
+        runtime_context,
+        result,
+        item=None,
+        agent_task_store=agent_task_store,
+        agent_bus_work_item=agent_bus_work_item,
+    )
     return ReviewWorkItem(
         id=str(uuid4()),
         created_at=now,
@@ -190,9 +209,15 @@ def _review_work_item_from_runtime_validation(result: RuntimeValidationResult) -
         event_type=GitHubEventType.PULL_REQUEST if result.pr_number is not None else GitHubEventType.ISSUES,
         branch=result.branch,
         base_branch=result.base_branch,
+        commit_sha=_commit_sha_from_result(result),
         issue_number=result.issue_number,
         pr_number=result.pr_number,
         labels=["bb-review-needed", "runtime-agent"],
+        agent_bus_work_item_id=result.work_item_id,
+        runtime_validation_id=result.validation_id,
+        runtime_validation_status=result.status,
+        runtime_validation_completed_at=result.completed_at,
+        runtime_validation_context=runtime_context,
     )
 
 
@@ -208,14 +233,44 @@ def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeVali
     item.runtime_validation_status = result.status
     item.runtime_validation_digest = digest
     item.runtime_validation_completed_at = result.completed_at
-    item.runtime_validation_context = runtime_validation_context_from_result(result)
+    existing_context = item.runtime_validation_context if isinstance(item.runtime_validation_context, dict) else {}
+    item.runtime_validation_context = _merge_runtime_validation_context(
+        runtime_validation_context_from_result(result),
+        existing_context,
+    )
+
+
+def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[str, object]) -> dict[str, object]:
+    if not hydrated:
+        return base
+    merged = dict(base)
+    for key in _WORKFLOW_CHAIN_KEYS:
+        value = hydrated.get(key)
+        if _value_present(value) and not _value_present(merged.get(key)):
+            merged[key] = value
+    for key in ("workflow_chain", "_workflow_chain"):
+        value = hydrated.get(key)
+        if isinstance(value, dict) and value:
+            merged.setdefault(key, value)
+    base_dispatch = dict(_dict_value(base.get("review_dispatch")))
+    hydrated_dispatch = _dict_value(hydrated.get("review_dispatch"))
+    for key, value in hydrated_dispatch.items():
+        if _value_present(value) and not _value_present(base_dispatch.get(key)):
+            base_dispatch[key] = value
+    for key in ("workflow_chain", "_workflow_chain"):
+        value = hydrated_dispatch.get(key)
+        if isinstance(value, dict) and value:
+            base_dispatch.setdefault(key, value)
+    if base_dispatch:
+        merged["review_dispatch"] = base_dispatch
+    return merged
 
 
 def _normalize_workflow_chain_metadata(
     context: dict[str, Any],
     result: RuntimeValidationResult,
     *,
-    item: ReviewWorkItem,
+    item: ReviewWorkItem | None,
     agent_task_store: Any | None,
     agent_bus_work_item: dict[str, Any] | None,
 ) -> None:
@@ -323,7 +378,7 @@ def _agent_bus_runtime_validation_sources(review_dispatch: dict[str, Any]) -> li
     return sources
 
 
-def _agent_task_sources(result: RuntimeValidationResult, *, item: ReviewWorkItem, agent_task_store: Any | None) -> list[dict[str, Any]]:
+def _agent_task_sources(result: RuntimeValidationResult, *, item: ReviewWorkItem | None, agent_task_store: Any | None) -> list[dict[str, Any]]:
     if agent_task_store is None or not hasattr(agent_task_store, "list_agent_tasks"):
         return []
     try:
@@ -358,12 +413,15 @@ def _agent_task_sources(result: RuntimeValidationResult, *, item: ReviewWorkItem
     return matched
 
 
-def _agent_task_matches(task: Any, result: RuntimeValidationResult, *, item: ReviewWorkItem) -> bool:
+def _agent_task_matches(task: Any, result: RuntimeValidationResult, *, item: ReviewWorkItem | None) -> bool:
     task_work_item_id = _string_or_none(getattr(task, "agent_bus_work_item_id", None))
     if result.work_item_id and task_work_item_id == result.work_item_id:
         return True
     task_id = _string_or_none(getattr(task, "task_id", None))
-    if task_id and task_id in {result.work_item_id, item.agent_bus_work_item_id}:
+    candidate_ids = {result.work_item_id}
+    if item is not None:
+        candidate_ids.add(item.agent_bus_work_item_id)
+    if task_id and task_id in candidate_ids:
         return True
     task_workflow_id = _string_or_none(getattr(task, "correlation_id", None))
     task_repo = _string_or_none(getattr(task, "repo_full_name", None))
