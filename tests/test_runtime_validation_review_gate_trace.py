@@ -96,6 +96,7 @@ def test_review_bridge_logs_lookup_and_context_attachment(caplog) -> None:
 
     assert item is not None
     assert item.runtime_validation_id == "rv-123"
+    assert item.agent_bus_work_item_id == "wi-123"
     assert item.runtime_validation_context["validation_id"] == "rv-123"
     events = _trace_events(caplog)
     stages = {str(event.get("stage")) for event in events}
@@ -105,7 +106,8 @@ def test_review_bridge_logs_lookup_and_context_attachment(caplog) -> None:
     assert "runtime_validation_context_attachment_completed" in stages
     attached = [event for event in events if event.get("stage") == "runtime_validation_context_attachment_completed"]
     assert attached[0]["runtime_validation_id"] == "rv-123"
-    assert attached[0]["work_item_id"] == item.id
+    assert attached[0]["work_item_id"] == "wi-123"
+    assert attached[0]["lookup_key"] == f"review_item_id={item.id}"
     assert attached[0]["repository"] == "marcus937/jarvis-mission-control"
     assert attached[0]["pr_number"] == 38
 
