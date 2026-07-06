@@ -342,8 +342,17 @@ def _normalize_workflow_chain_metadata(
 def _agent_bus_work_item_sources(agent_bus_work_item: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(agent_bus_work_item, dict):
         return []
-    sources = [agent_bus_work_item]
-    metadata = agent_bus_work_item.get("metadata")
+    sources: list[dict[str, Any]] = []
+    _append_agent_bus_work_item_sources(sources, agent_bus_work_item)
+    work_item = agent_bus_work_item.get("work_item")
+    if isinstance(work_item, dict):
+        _append_agent_bus_work_item_sources(sources, work_item)
+    return sources
+
+
+def _append_agent_bus_work_item_sources(sources: list[dict[str, Any]], work_item: dict[str, Any]) -> None:
+    sources.append(work_item)
+    metadata = work_item.get("metadata")
     if isinstance(metadata, dict):
         sources.append(metadata)
         workflow_chain = metadata.get("workflow_chain")
@@ -355,7 +364,6 @@ def _agent_bus_work_item_sources(agent_bus_work_item: dict[str, Any] | None) -> 
             nested_chain = review_dispatch.get("workflow_chain")
             if isinstance(nested_chain, dict):
                 sources.append(nested_chain)
-    return sources
 
 
 def _agent_bus_runtime_validation_sources(review_dispatch: dict[str, Any]) -> list[dict[str, Any]]:
