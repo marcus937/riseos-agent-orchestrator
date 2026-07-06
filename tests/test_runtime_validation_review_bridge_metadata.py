@@ -118,3 +118,66 @@ def test_new_review_item_is_constructed_with_agent_bus_workflow_chain_metadata()
     assert review_dispatch["workflow_step"] == "WF21"
     assert review_dispatch["next_workflow_step"] == "WF22"
     assert review_dispatch["workflow_chain"]["workflow_sequence"] == workflow_sequence
+
+
+def test_new_review_item_hydrates_workflow_chain_from_agent_bus_work_item_detail_envelope() -> None:
+    workflow_sequence = [f"WF{step}" for step in range(21, 30)]
+    workflow_chain = {
+        "workflow_chain_id": "workflow-chain-123",
+        "workflow_step": "WF21",
+        "current_workflow_step": "WF21",
+        "next_workflow_step": "WF22",
+        "final_workflow_step": "WF29",
+        "workflow_sequence": workflow_sequence,
+        "workflow_steps": workflow_sequence,
+        "continuation_mode": "same_pr_branch",
+        "merge_gate": "final_step_only",
+        "repository": "marcus937/jarvis-mission-control",
+        "pr_number": 42,
+        "branch": "circuit/wf21-chain",
+        "base_branch": "agent-integration",
+    }
+    agent_bus_work_item_detail = {
+        "work_item": {
+            "work_item_id": "agent-bus-work-item-21",
+            "metadata": {
+                "workflow_chain": workflow_chain,
+                "workflow_chain_id": "workflow-chain-123",
+                "workflow_step": "WF21",
+                "current_workflow_step": "WF21",
+                "next_workflow_step": "WF22",
+                "workflow_sequence": workflow_sequence,
+                "workflow_steps": workflow_sequence,
+                "repository": "marcus937/jarvis-mission-control",
+                "pr_number": 42,
+                "branch": "circuit/wf21-chain",
+                "base_branch": "agent-integration",
+            },
+        },
+        "history": [],
+    }
+
+    item = enqueue_review_from_runtime_validation(
+        _result(),
+        _settings(),
+        agent_bus_work_item=agent_bus_work_item_detail,
+    )
+
+    assert item is not None
+    assert item.status == ReviewWorkItemStatus.PENDING_REVIEW
+    assert item.runtime_validation_context["workflow_chain_id"] == "workflow-chain-123"
+    assert item.runtime_validation_context["workflow_step"] == "WF21"
+    assert item.runtime_validation_context["current_workflow_step"] == "WF21"
+    assert item.runtime_validation_context["next_workflow_step"] == "WF22"
+    assert item.runtime_validation_context["workflow_sequence"] == workflow_sequence
+    assert item.runtime_validation_context["workflow_steps"] == workflow_sequence
+
+    hydrated_chain = item.runtime_validation_context["workflow_chain"]
+    assert hydrated_chain["workflow_chain_id"] == "workflow-chain-123"
+    assert hydrated_chain["current_workflow_step"] == "WF21"
+    assert hydrated_chain["next_workflow_step"] == "WF22"
+    assert len(hydrated_chain["workflow_sequence"]) == 9
+
+    review_dispatch = item.runtime_validation_context["review_dispatch"]
+    assert review_dispatch["workflow_chain"]["workflow_step"] == "WF21"
+    assert review_dispatch["workflow_chain"]["next_workflow_step"] == "WF22"
