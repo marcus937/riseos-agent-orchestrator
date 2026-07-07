@@ -201,6 +201,7 @@ def _review_work_item_from_runtime_validation(
         agent_task_store=agent_task_store,
         agent_bus_work_item=agent_bus_work_item,
     )
+    _log_wf_chain_hydrated(runtime_context)
     return ReviewWorkItem(
         id=str(uuid4()),
         created_at=now,
@@ -218,6 +219,21 @@ def _review_work_item_from_runtime_validation(
         runtime_validation_status=result.status,
         runtime_validation_completed_at=result.completed_at,
         runtime_validation_context=runtime_context,
+    )
+
+
+def _log_wf_chain_hydrated(context: dict[str, Any]) -> None:
+    workflow_chain = _dict_value(context.get("workflow_chain"))
+    log_event(
+        "WF_CHAIN_HYDRATED",
+        workflow_chain_present=bool(workflow_chain),
+        workflow_chain_length=len(workflow_chain or []),
+        workflow_chain_id=context.get("workflow_chain_id"),
+        current_workflow_step=context.get("current_workflow_step"),
+        next_workflow_step=context.get("next_workflow_step"),
+        runtime_validation_id=context.get("runtime_validation_id") or context.get("validation_id"),
+        work_item_id=context.get("work_item_id"),
+        correlation_id=context.get("correlation_id"),
     )
 
 
