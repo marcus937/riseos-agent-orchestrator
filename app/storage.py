@@ -2,8 +2,10 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from app.event_store import EventRecord
+from app.operational_logging import log_event
 from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
 from app.workflow_chain_diagnostics import log_workflow_chain_availability
 
@@ -151,6 +153,13 @@ class SQLiteStateStore:
             "wf_chain_metadata_storage_save_review_work_item_input",
             item,
         )
+        runtime_validation_context_json = _json(item.runtime_validation_context)
+        _log_review_work_item_persistence_json(
+            "wf_chain_metadata_storage_before_save_json",
+            item_id=item.id,
+            runtime_validation_context=item.runtime_validation_context,
+            raw_json_stored=runtime_validation_context_json,
+        )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -220,12 +229,21 @@ class SQLiteStateStore:
                     item.runtime_validation_status,
                     item.runtime_validation_digest,
                     _dt(item.runtime_validation_completed_at),
-                    _json(item.runtime_validation_context),
+                    runtime_validation_context_json,
                     item.failure_count,
                     _dt(item.last_failure_at),
                     item.last_error,
                 ),
             )
+            raw_row = conn.execute(
+                "SELECT runtime_validation_context FROM review_work_items WHERE id = ?",
+                (item.id,),
+            ).fetchone()
+        _log_review_work_item_persistence_json(
+            "wf_chain_metadata_storage_after_save_json",
+            item_id=item.id,
+            raw_json_stored=raw_row["runtime_validation_context"] if raw_row is not None else None,
+        )
         self.prune_processed_review_items(self.max_review_items)
 
     def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
@@ -415,16 +433,34 @@ class SQLiteStateStore:
 
     def _review_work_item_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
         data = dict(row)
+        raw_runtime_validation_context = data.get("runtime_validation_context")
+        _log_review_work_item_persistence_json(
+            "wf_chain_metadata_storage_before_deserialize_json",
+            item_id=data.get("id"),
+            raw_json_loaded=raw_runtime_validation_context,
+        )
         if data.get("github_writeback_success") is not None:
             data["github_writeback_success"] = bool(data["github_writeback_success"])
         if data.get("agent_bus_dispatch_success") is not None:
             data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
-        data["runtime_validation_context"] = _load_json(data.get("runtime_validation_context"))
+        loaded_runtime_validation_context = _load_json(raw_runtime_validation_context)
+        _log_review_work_item_persistence_json(
+            "wf_chain_metadata_storage_after_load_json",
+            item_id=data.get("id"),
+            runtime_validation_context=loaded_runtime_validation_context,
+            raw_json_loaded=raw_runtime_validation_context,
+        )
+        data["runtime_validation_context"] = loaded_runtime_validation_context
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_deserialize_review_work_item_row",
             data,
         )
         item = ReviewWorkItem.model_validate(data)
+        _log_review_work_item_persistence_json(
+            "wf_chain_metadata_storage_after_model_validate",
+            item_id=item.id,
+            runtime_validation_context=item.runtime_validation_context,
+        )
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_deserialize_review_work_item_model",
             item,
@@ -478,6 +514,55 @@ def _load_json(value: object | None) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _log_review_work_item_persistence_json(
+    event: str,
+    *,
+    item_id: object | None,
+    runtime_validation_context: object | None = None,
+    raw_json_stored: object | None = None,
+    raw_json_loaded: object | None = None,
+) -> None:
+    context = runtime_validation_context if isinstance(runtime_validation_context, dict) else None
+    if context is None:
+        raw_json = raw_json_stored if raw_json_stored is not None else raw_json_loaded
+        context = _load_json(raw_json)
+    review_dispatch = context.get("review_dispatch") if isinstance(context.get("review_dispatch"), dict) else {}
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    if not metadata and isinstance(review_dispatch.get("metadata"), dict):
+        metadata = review_dispatch["metadata"]
+    workflow_chain = _first_dict(
+        context.get("workflow_chain"),
+        context.get("_workflow_chain"),
+        context.get("workflowChain"),
+        review_dispatch.get("workflow_chain"),
+        review_dispatch.get("_workflow_chain"),
+        review_dispatch.get("workflowChain"),
+        metadata.get("workflow_chain") if isinstance(metadata, dict) else None,
+        metadata.get("_workflow_chain") if isinstance(metadata, dict) else None,
+    )
+    log_event(
+        event,
+        item_id=item_id,
+        metadata_keys=sorted(str(key) for key in metadata.keys()) if isinstance(metadata, dict) else [],
+        runtime_context_keys=sorted(str(key) for key in context.keys()),
+        review_dispatch_keys=sorted(str(key) for key in review_dispatch.keys()),
+        workflow_chain_keys=sorted(str(key) for key in workflow_chain.keys()),
+        workflow_chain_populated=bool(workflow_chain),
+        runtime_context_populated=bool(context),
+        review_dispatch_populated=bool(review_dispatch),
+        raw_json_stored=raw_json_stored,
+        raw_json_loaded=raw_json_loaded,
+        _include_nulls=True,
+    )
+
+
+def _first_dict(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict) and value:
+            return value
+    return {}
 
 
 _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
