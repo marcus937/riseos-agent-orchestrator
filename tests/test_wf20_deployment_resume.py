@@ -1,18 +1,22 @@
 import asyncio
 from typing import Any
 
+from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
 from app.review_queue import ReviewWorkItemStatus, review_queue
 from app.runtime_validation_review_bridge import create_runtime_validation_pending_item, enqueue_review_from_runtime_validation, enqueue_runtime_pending_item
+from app.storage import SQLiteStateStore
 from app.wf20_deployment_resume import (
     claim_waiting_workflow_for_request,
     is_ready_deployment_request,
     is_waiting_for_deployment_request,
+    list_waiting_deployment_items,
     mark_waiting_workflow_failed_for_request,
     mark_waiting_workflow_resumed,
     persist_waiting_for_deployment,
+    select_waiting_workflow_for_request,
 )
 from app.wf20_runtime_validation import AgentBusRuntimeValidationStore, RuntimeValidationState
 from app.wf20_runtime_validation_safe import runtime_validation_request_from_parsed
@@ -144,14 +148,20 @@ def make_store(agent_bus: FakeAgentBusClient, github: FakeGitHubClient, hermes: 
     )
 
 
-def pr_payload(*, preview_url: str | None = None) -> dict[str, Any]:
+def pr_payload(
+    *,
+    preview_url: str | None = None,
+    branch: str = BRANCH,
+    sha: str = SHA,
+    pr_number: int = 134,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "action": "opened",
         "repository": {"full_name": REPO},
         "sender": {"login": "codex"},
         "pull_request": {
-            "number": 134,
-            "head": {"ref": BRANCH, "sha": SHA, "repo": {"full_name": REPO}},
+            "number": pr_number,
+            "head": {"ref": branch, "sha": sha, "repo": {"full_name": REPO}},
             "base": {"ref": "agent-integration", "repo": {"full_name": REPO}},
             "labels": [],
         },
@@ -161,9 +171,17 @@ def pr_payload(*, preview_url: str | None = None) -> dict[str, Any]:
     return payload
 
 
-def deployment_status_payload(*, state: str = "success", target_url: str | None = PREVIEW_URL) -> dict[str, Any]:
+def deployment_status_payload(
+    *,
+    state: str = "success",
+    target_url: str | None = PREVIEW_URL,
+    branch: str = BRANCH,
+    sha: str = SHA,
+    deployment_id: int = 111,
+    deployment_status_id: int = 222,
+) -> dict[str, Any]:
     deployment_status: dict[str, Any] = {
-        "id": 222,
+        "id": deployment_status_id,
         "state": state,
         "environment": "Preview",
         "created_at": "2026-06-25T17:00:00Z",
@@ -175,9 +193,52 @@ def deployment_status_payload(*, state: str = "success", target_url: str | None 
         "action": state,
         "repository": {"full_name": REPO},
         "sender": {"login": "vercel"},
-        "deployment": {"id": 111, "ref": BRANCH, "sha": SHA, "environment": "Preview"},
+        "deployment": {"id": deployment_id, "ref": branch, "sha": sha, "environment": "Preview"},
         "deployment_status": deployment_status,
     }
+
+
+def waiting_runtime_request(
+    *,
+    branch: str = BRANCH,
+    sha: str = SHA,
+    pr_number: int = 134,
+    workflow_id: str | None = None,
+) -> RuntimeValidationRequest:
+    workflow_id = workflow_id or f"wf20-{pr_number}-{sha[:8]}"
+    request = RuntimeValidationRequest(
+        repo=REPO,
+        pr_number=pr_number,
+        branch=branch,
+        base_branch="agent-integration",
+        target_url=None,
+        target_url_source="vercel_preview_pending",
+        target_url_pending_reason="Timed out waiting for verified Vercel preview deployment readiness.",
+        validation_type="playwright",
+        requested_by="orchestrator_wf20",
+        correlation_id=f"correlation-{workflow_id}",
+        workflow_id=workflow_id,
+    )
+    object.__setattr__(request, "commit_sha", sha)
+    return request
+
+
+def ready_runtime_request(
+    *,
+    branch: str = BRANCH,
+    sha: str = SHA,
+    pr_number: int = 134,
+    workflow_id: str | None = None,
+) -> RuntimeValidationRequest:
+    request = waiting_runtime_request(branch=branch, sha=sha, pr_number=pr_number, workflow_id=workflow_id).model_copy(
+        update={
+            "target_url": PREVIEW_URL,
+            "target_url_source": "github_verified_deployment_status_preview_url",
+            "target_url_pending_reason": None,
+        }
+    )
+    object.__setattr__(request, "commit_sha", sha)
+    return request
 
 
 def create_waiting_item() -> tuple[Any, Any]:
@@ -187,6 +248,15 @@ def create_waiting_item() -> tuple[Any, Any]:
     item = enqueue_runtime_pending_item(create_runtime_validation_pending_item(parsed))
     item = persist_waiting_for_deployment(request, item)
     return request, item
+
+
+def create_registry_waiting_item(request: RuntimeValidationRequest, *, storage: SQLiteStateStore | None = None) -> Any:
+    parsed = parse_github_event(
+        "pull_request",
+        pr_payload(branch=request.branch or BRANCH, sha=getattr(request, "commit_sha", SHA), pr_number=request.pr_number or 134),
+    )
+    item = create_runtime_validation_pending_item(parsed)
+    return persist_waiting_for_deployment(request, item, storage=storage)
 
 
 def test_initial_pr_without_ready_vercel_deployment_persists_waiting_without_hermes_or_bb2() -> None:
@@ -278,3 +348,110 @@ def test_existing_happy_path_with_immediate_verified_url_still_dispatches_hermes
 
     assert result.status == "completed"
     assert hermes.payloads[0]["payload"]["targetUrl"] == PREVIEW_URL
+
+
+def test_waiting_workflow_enters_registry_and_matches_ready_deployment() -> None:
+    review_queue.reset()
+    waiting = create_registry_waiting_item(waiting_runtime_request())
+    parsed = parse_github_event("deployment_status", deployment_status_payload())
+    selected = select_waiting_workflow_for_request(ready_runtime_request(), parsed)
+
+    assert list_waiting_deployment_items() == [waiting]
+    assert selected is not None
+    assert selected.id == waiting.id
+
+
+def test_registry_survives_unrelated_workflow_additions_and_selects_active_pr() -> None:
+    review_queue.reset()
+    create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/old", sha="oldsha123", pr_number=120, workflow_id="old"))
+    active = create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/active", sha="activesha123", pr_number=183, workflow_id="active"))
+    create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/other", sha="othersha123", pr_number=184, workflow_id="other"))
+    parsed = parse_github_event("deployment_status", deployment_status_payload(branch="codex-m2/active", sha="activesha123"))
+
+    selected = select_waiting_workflow_for_request(
+        ready_runtime_request(branch="codex-m2/active", sha="activesha123", pr_number=183, workflow_id="active"),
+        parsed,
+    )
+
+    assert len(list_waiting_deployment_items()) == 3
+    assert selected is not None
+    assert selected.id == active.id
+
+
+def test_multiple_prs_same_repository_and_branch_reuse_match_by_sha_first() -> None:
+    review_queue.reset()
+    create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/reused", sha="sha-one", pr_number=183, workflow_id="wf-one"))
+    target = create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/reused", sha="sha-two", pr_number=184, workflow_id="wf-two"))
+    parsed = parse_github_event("deployment_status", deployment_status_payload(branch="codex-m2/reused", sha="sha-two"))
+
+    selected = select_waiting_workflow_for_request(
+        ready_runtime_request(branch="codex-m2/reused", sha="sha-two", pr_number=184, workflow_id="wf-two"),
+        parsed,
+    )
+
+    assert selected is not None
+    assert selected.id == target.id
+
+
+def test_identical_sha_on_different_prs_uses_pr_when_workflow_id_differs() -> None:
+    review_queue.reset()
+    create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/one", sha="sharedsha", pr_number=183, workflow_id="wf-one"))
+    target = create_registry_waiting_item(waiting_runtime_request(branch="codex-m2/two", sha="sharedsha", pr_number=184, workflow_id="wf-two"))
+    parsed = parse_github_event("deployment_status", deployment_status_payload(branch="codex-m2/two", sha="sharedsha"))
+
+    selected = select_waiting_workflow_for_request(
+        ready_runtime_request(branch="codex-m2/two", sha="sharedsha", pr_number=184, workflow_id="wf-two"),
+        parsed,
+    )
+
+    assert selected is not None
+    assert selected.id == target.id
+
+
+def test_stale_workflow_leaves_waiting_registry_after_resume() -> None:
+    review_queue.reset()
+    waiting = create_registry_waiting_item(waiting_runtime_request())
+
+    mark_waiting_workflow_resumed(waiting)
+
+    assert list_waiting_deployment_items() == []
+
+
+def test_deployment_before_persistence_then_after_persistence() -> None:
+    review_queue.reset()
+    parsed = parse_github_event("deployment_status", deployment_status_payload())
+    request = ready_runtime_request()
+
+    assert select_waiting_workflow_for_request(request, parsed) is None
+    waiting = create_registry_waiting_item(waiting_runtime_request())
+
+    selected = select_waiting_workflow_for_request(request, parsed)
+    assert selected is not None
+    assert selected.id == waiting.id
+
+
+def test_duplicate_deployment_webhook_and_replay_do_not_rematch_after_claim() -> None:
+    review_queue.reset()
+    waiting = create_registry_waiting_item(waiting_runtime_request())
+    parsed = parse_github_event("deployment_status", deployment_status_payload())
+    request = ready_runtime_request()
+
+    first = claim_waiting_workflow_for_request(request, parsed)
+    second = claim_waiting_workflow_for_request(request, parsed)
+
+    assert first is not None
+    assert first.id == waiting.id
+    assert second is None
+
+
+def test_registry_reload_after_restart_uses_persisted_waiting_items(tmp_path) -> None:
+    storage = SQLiteStateStore(str(tmp_path / "orchestrator.db"))
+    waiting = create_registry_waiting_item(waiting_runtime_request(), storage=storage)
+    reloaded_storage = SQLiteStateStore(str(tmp_path / "orchestrator.db"))
+    parsed = parse_github_event("deployment_status", deployment_status_payload())
+
+    selected = select_waiting_workflow_for_request(ready_runtime_request(), parsed, storage=reloaded_storage)
+
+    assert len(list_waiting_deployment_items(storage=reloaded_storage)) == 1
+    assert selected is not None
+    assert selected.id == waiting.id
