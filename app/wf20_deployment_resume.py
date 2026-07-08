@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.github_events import ParsedGitHubEvent
+from app.operational_logging import log_event
 from app.review_queue import (
     ReviewLifecycleStage,
     ReviewWorkItem,
@@ -78,8 +79,27 @@ def persist_waiting_for_deployment(
     item.runtime_validation_status = WAITING_RUNTIME_STATUS
     item.runtime_validation_context = _waiting_context(request, item, commit_sha=commit_sha)
     record_lifecycle_stage(item, ReviewLifecycleStage.RUNTIME_VALIDATION_PENDING)
+    _log_waiting_registry_transition(
+        "registry_before_add",
+        request=request,
+        item=item,
+        storage=storage,
+        reason="persist_waiting_for_deployment",
+        call_site="persist_waiting_for_deployment",
+    )
     _save_item(item, storage)
     waiting = list_waiting_deployment_items(storage=storage)
+    _log_waiting_registry_transition(
+        "registry_after_add",
+        request=request,
+        item=item,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(item),
+        matched_review_item=item.id,
+        matched_runtime_validation=item.runtime_validation_id,
+        reason="persist_waiting_for_deployment",
+        call_site="persist_waiting_for_deployment",
+    )
     log_waiting_for_deployment(
         request,
         reason=request.target_url_pending_reason or "Waiting for verified Vercel preview deployment.",
@@ -103,22 +123,70 @@ def claim_waiting_workflow_for_request(
     if context.get("resume_status") in {"resuming", "resumed"} or match.runtime_validation_status in {RESUMING_RUNTIME_STATUS, RESUMED_RUNTIME_STATUS}:
         log_hermes_not_launched(TERMINAL_ALREADY_RESUMED, request)
         return None
+    _log_waiting_registry_transition(
+        "registry_before_remove",
+        request=request,
+        parsed=parsed,
+        item=match,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(match),
+        matched_review_item=match.id,
+        matched_runtime_validation=match.runtime_validation_id,
+        removed_by="claim_waiting_workflow_for_request",
+        reason="deployment_ready_resuming",
+        call_site="claim_waiting_workflow_for_request",
+    )
     context["resume_status"] = "resuming"
     context["resumed_at"] = datetime.now(UTC).isoformat()
     context["selected_preview_url"] = request.target_url
     match.runtime_validation_context = context
     match.runtime_validation_status = RESUMING_RUNTIME_STATUS
     _save_item(match, storage)
+    _log_waiting_registry_transition(
+        "registry_after_remove",
+        request=request,
+        parsed=parsed,
+        item=match,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(match),
+        matched_review_item=match.id,
+        matched_runtime_validation=match.runtime_validation_id,
+        removed_by="claim_waiting_workflow_for_request",
+        reason="deployment_ready_resuming",
+        call_site="claim_waiting_workflow_for_request",
+    )
     return match
 
 
 def mark_waiting_workflow_resumed(item: ReviewWorkItem, *, storage: Any | None = None) -> ReviewWorkItem:
     context = dict(item.runtime_validation_context or {})
+    _log_waiting_registry_transition(
+        "registry_before_remove",
+        item=item,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(item),
+        matched_review_item=item.id,
+        matched_runtime_validation=item.runtime_validation_id,
+        removed_by="mark_waiting_workflow_resumed",
+        reason="deployment_ready_resumed",
+        call_site="mark_waiting_workflow_resumed",
+    )
     context["resume_status"] = "resumed"
     context["resumed_at"] = context.get("resumed_at") or datetime.now(UTC).isoformat()
     item.runtime_validation_context = context
     item.runtime_validation_status = RESUMED_RUNTIME_STATUS
     _save_item(item, storage)
+    _log_waiting_registry_transition(
+        "registry_after_remove",
+        item=item,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(item),
+        matched_review_item=item.id,
+        matched_runtime_validation=item.runtime_validation_id,
+        removed_by="mark_waiting_workflow_resumed",
+        reason="deployment_ready_resumed",
+        call_site="mark_waiting_workflow_resumed",
+    )
     return item
 
 
@@ -136,6 +204,19 @@ def mark_waiting_workflow_failed_for_request(
     if context.get("resume_status") in {"resuming", "resumed"} or match.runtime_validation_status in {RESUMING_RUNTIME_STATUS, RESUMED_RUNTIME_STATUS}:
         log_hermes_not_launched(TERMINAL_ALREADY_RESUMED, request)
         return match
+    _log_waiting_registry_transition(
+        "registry_before_remove",
+        request=request,
+        parsed=parsed,
+        item=match,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(match),
+        matched_review_item=match.id,
+        matched_runtime_validation=match.runtime_validation_id,
+        removed_by="mark_waiting_workflow_failed_for_request",
+        reason="deployment_failed",
+        call_site="mark_waiting_workflow_failed_for_request",
+    )
     context["resume_status"] = "deployment_failed"
     context["failed_at"] = datetime.now(UTC).isoformat()
     context["failure_reason"] = request.target_url_pending_reason or "Vercel preview deployment failed."
@@ -144,6 +225,19 @@ def mark_waiting_workflow_failed_for_request(
     match.status = ReviewWorkItemStatus.BLOCKED
     record_lifecycle_stage(match, ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED, error=str(context["failure_reason"]))
     _save_item(match, storage)
+    _log_waiting_registry_transition(
+        "registry_after_remove",
+        request=request,
+        parsed=parsed,
+        item=match,
+        storage=storage,
+        matched_workflow_id=_candidate_workflow_id(match),
+        matched_review_item=match.id,
+        matched_runtime_validation=match.runtime_validation_id,
+        removed_by="mark_waiting_workflow_failed_for_request",
+        reason="deployment_failed",
+        call_site="mark_waiting_workflow_failed_for_request",
+    )
     log_hermes_not_launched(TERMINAL_NO_READY_DEPLOYMENT, request, deployment_failed=True)
     return match
 
@@ -154,6 +248,15 @@ def select_waiting_workflow_for_request(
     *,
     storage: Any | None = None,
 ) -> ReviewWorkItem | None:
+    _log_waiting_registry_transition(
+        "registry_before_lookup",
+        request=request,
+        parsed=parsed,
+        storage=storage,
+        correlation_lookup_key=_lookup_key(request, parsed, "START"),
+        reason="select_waiting_workflow_for_request",
+        call_site="select_waiting_workflow_for_request",
+    )
     waiting_items = list_waiting_deployment_items(storage=storage)
     waiting_workflows = [_candidate_log_payload(item) for item in waiting_items]
     log_correlation_candidates(waiting_workflows=waiting_workflows)
@@ -222,9 +325,31 @@ def select_waiting_workflow_for_request(
         selected = _select_by(selectable, request, "BRANCH", parsed=parsed)
     if selected is None:
         _log_match_rejections(selectable, request, parsed, reason=REJECTION_REASON_BRANCH_MISMATCH)
+        _log_waiting_registry_transition(
+            "registry_after_lookup",
+            request=request,
+            parsed=parsed,
+            storage=storage,
+            correlation_lookup_key=_lookup_key(request, parsed, "NO_MATCH"),
+            reason="NO_MATCHING_WAITING_WORKFLOW",
+            call_site="select_waiting_workflow_for_request",
+        )
         return None
 
     method = _selected_method(selected, request, parsed)
+    _log_waiting_registry_transition(
+        "registry_after_lookup",
+        request=request,
+        parsed=parsed,
+        item=selected,
+        storage=storage,
+        correlation_lookup_key=_lookup_key(request, parsed, method),
+        matched_workflow_id=_candidate_workflow_id(selected),
+        matched_review_item=selected.id,
+        matched_runtime_validation=selected.runtime_validation_id,
+        reason="MATCHED_WAITING_WORKFLOW",
+        call_site="select_waiting_workflow_for_request",
+    )
     log_matched_workflow(
         workflow_id=_candidate_workflow_id(selected) or request.workflow_id or "unknown",
         correlation_method=method,
@@ -252,6 +377,17 @@ def _select_by(
     *,
     parsed: ParsedGitHubEvent,
 ) -> ReviewWorkItem | None:
+    log_event(
+        "registry_lookup_method_started",
+        **_registry_log_fields(
+            request=request,
+            parsed=parsed,
+            waiting_items=items,
+            correlation_lookup_key=_lookup_key(request, parsed, method),
+            reason=f"lookup_by_{method}",
+            call_site="_select_by",
+        ),
+    )
     for item in items:
         context = item.runtime_validation_context or {}
         if method == "DEPLOYMENT_ID":
@@ -273,6 +409,21 @@ def _select_by(
             value = request.branch
             candidate = item.branch or str(context.get("branch") or "") or None
         if value is not None and candidate == value:
+            log_event(
+                "registry_lookup_method_matched",
+                **_registry_log_fields(
+                    request=request,
+                    parsed=parsed,
+                    item=item,
+                    waiting_items=items,
+                    correlation_lookup_key=_lookup_key(request, parsed, method),
+                    matched_workflow_id=_candidate_workflow_id(item),
+                    matched_review_item=item.id,
+                    matched_runtime_validation=item.runtime_validation_id,
+                    reason=f"lookup_by_{method}",
+                    call_site="_select_by",
+                ),
+            )
             return item
     return None
 
@@ -373,6 +524,163 @@ def _context_value(context: dict[str, Any], key: str) -> str | None:
 def _save_item(item: ReviewWorkItem, storage: Any | None) -> None:
     if storage is not None:
         storage.save_review_work_item(item)
+
+
+def _log_waiting_registry_transition(
+    event: str,
+    *,
+    request: RuntimeValidationRequest | None = None,
+    parsed: ParsedGitHubEvent | None = None,
+    item: ReviewWorkItem | None = None,
+    storage: Any | None = None,
+    correlation_lookup_key: str | None = None,
+    matched_workflow_id: str | None = None,
+    matched_review_item: str | None = None,
+    matched_runtime_validation: str | None = None,
+    removed_by: str | None = None,
+    reason: str | None = None,
+    call_site: str | None = None,
+) -> None:
+    log_event(
+        event,
+        **_registry_log_fields(
+            request=request,
+            parsed=parsed,
+            item=item,
+            waiting_items=list_waiting_deployment_items(storage=storage),
+            correlation_lookup_key=correlation_lookup_key,
+            matched_workflow_id=matched_workflow_id,
+            matched_review_item=matched_review_item,
+            matched_runtime_validation=matched_runtime_validation,
+            removed_by=removed_by,
+            reason=reason,
+            call_site=call_site,
+        ),
+    )
+
+
+def _registry_log_fields(
+    *,
+    request: RuntimeValidationRequest | None = None,
+    parsed: ParsedGitHubEvent | None = None,
+    item: ReviewWorkItem | None = None,
+    waiting_items: list[ReviewWorkItem] | None = None,
+    correlation_lookup_key: str | None = None,
+    matched_workflow_id: str | None = None,
+    matched_review_item: str | None = None,
+    matched_runtime_validation: str | None = None,
+    removed_by: str | None = None,
+    reason: str | None = None,
+    call_site: str | None = None,
+) -> dict[str, Any]:
+    waiting_items = waiting_items or []
+    deployment = _deployment_from_parsed(parsed)
+    context = item.runtime_validation_context if item is not None and isinstance(item.runtime_validation_context, dict) else {}
+    return {
+        "workflow_id": _first_text(
+            getattr(request, "workflow_id", None),
+            context.get("workflow_id"),
+            _candidate_workflow_id(item) if item is not None else None,
+        ),
+        "review_item_id": item.id if item is not None else None,
+        "work_item_id": _first_text(
+            getattr(request, "work_item_id", None),
+            context.get("work_item_id"),
+            getattr(item, "agent_bus_work_item_id", None) if item is not None else None,
+            item.id if item is not None else None,
+        ),
+        "runtime_validation_id": _first_text(
+            getattr(request, "workflow_id", None),
+            getattr(item, "runtime_validation_id", None) if item is not None else None,
+            context.get("runtime_validation_id"),
+        ),
+        "repository": _first_text(
+            getattr(request, "repo", None),
+            getattr(item, "repo_full_name", None) if item is not None else None,
+            context.get("repository"),
+        ),
+        "pr_number": _first_present(
+            getattr(request, "pr_number", None),
+            getattr(item, "pr_number", None) if item is not None else None,
+            context.get("pr_number"),
+        ),
+        "branch": _first_text(
+            getattr(request, "branch", None),
+            getattr(item, "branch", None) if item is not None else None,
+            context.get("branch"),
+        ),
+        "base_branch": _first_text(
+            getattr(request, "base_branch", None),
+            getattr(item, "base_branch", None) if item is not None else None,
+            context.get("base_branch"),
+        ),
+        "commit_sha": _first_text(
+            _request_commit_sha(request) if request is not None else None,
+            getattr(item, "commit_sha", None) if item is not None else None,
+            context.get("commit_sha"),
+        ),
+        "deployment_sha": deployment.get("sha"),
+        "deployment_branch": deployment.get("ref"),
+        "deployment_repository": parsed.repository if parsed is not None else None,
+        "waiting_registry_size": len(waiting_items),
+        "waiting_registry_keys": [_waiting_registry_key(waiting_item) for waiting_item in waiting_items],
+        "correlation_lookup_key": correlation_lookup_key,
+        "matched_workflow_id": matched_workflow_id,
+        "matched_review_item": matched_review_item,
+        "matched_runtime_validation": matched_runtime_validation,
+        "removed_by": removed_by,
+        "reason": reason,
+        "call_site": call_site,
+        "_include_nulls": True,
+    }
+
+
+def _lookup_key(request: RuntimeValidationRequest, parsed: ParsedGitHubEvent, method: str) -> str:
+    deployment_id = _deployment_id_from_parsed(parsed)
+    values = {
+        "deployment_id": deployment_id,
+        "workflow_id": request.workflow_id,
+        "correlation_id": request.correlation_id,
+        "sha": _request_commit_sha(request),
+        "pr": request.pr_number,
+        "branch": request.branch,
+    }
+    compact = ",".join(f"{key}={value}" for key, value in values.items() if value not in (None, ""))
+    return f"{method}:{compact}"
+
+
+def _waiting_registry_key(item: ReviewWorkItem) -> str:
+    context = item.runtime_validation_context or {}
+    repo = item.repo_full_name or context.get("repository") or "unknown-repo"
+    pr_number = item.pr_number or context.get("pr_number") or "unknown-pr"
+    branch = item.branch or context.get("branch") or "unknown-branch"
+    sha = item.commit_sha or context.get("commit_sha") or "unknown-sha"
+    workflow_id = _candidate_workflow_id(item) or "unknown-workflow"
+    status = item.runtime_validation_status or context.get("resume_status") or str(item.status)
+    return f"{repo}#PR{pr_number}:{branch}:{sha}:{workflow_id}:{status}"
+
+
+def _deployment_from_parsed(parsed: ParsedGitHubEvent | None) -> dict[str, Any]:
+    if parsed is None:
+        return {}
+    raw = parsed.raw or {}
+    deployment = raw.get("deployment") if isinstance(raw.get("deployment"), dict) else {}
+    return deployment
+
+
+def _first_text(*values: Any) -> str | None:
+    value = _first_present(*values)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_present(*values: Any) -> Any | None:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _int_or_none(value: object) -> int | None:
