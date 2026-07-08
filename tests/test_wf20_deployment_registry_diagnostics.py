@@ -166,13 +166,17 @@ def test_identical_sha_on_different_prs_uses_workflow_identity_before_sha() -> N
     assert selected.id == target.id
 
 
-def test_stale_workflow_cleanup_removes_resumed_item_from_waiting_registry() -> None:
+def test_resumed_workflow_remains_diagnostic_visible_but_is_not_matchable() -> None:
     review_queue.reset()
     waiting = create_waiting(waiting_request())
+    parsed = parse_github_event("deployment_status", deployment_payload())
 
     mark_waiting_workflow_resumed(waiting)
 
-    assert list_waiting_deployment_items() == []
+    diagnostic_items = list_waiting_deployment_items()
+    assert diagnostic_items == [waiting]
+    assert diagnostic_items[0].runtime_validation_status == "deployment_ready_resumed"
+    assert select_waiting_workflow_for_request(ready_request(), parsed) is None
 
 
 def test_deployment_before_persistence_does_not_match_then_matches_after_persistence() -> None:
