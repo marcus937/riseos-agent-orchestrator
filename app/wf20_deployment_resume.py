@@ -42,6 +42,49 @@ READY_SOURCE_PREFIX = "github_verified_"
 
 CorrelationMethod = Literal["DEPLOYMENT_ID", "WORKFLOW_ID", "CORRELATION_ID", "SHA", "PR", "BRANCH"]
 
+_WORKFLOW_CHAIN_CONTEXT_KEYS = {
+    "workflow_chain_id",
+    "workflow_family",
+    "workflow_sequence",
+    "workflow_steps",
+    "workflow_step",
+    "current_workflow_step",
+    "previous_workflow_step",
+    "next_workflow_step",
+    "final_workflow_step",
+    "continuation_mode",
+    "merge_gate",
+    "repository",
+    "repo",
+    "pr_number",
+    "pull_request",
+    "branch",
+    "base_branch",
+    "workflow_id",
+    "work_item_id",
+    "previous_work_item_id",
+    "agent_bus_work_item_id",
+    "commit_sha",
+}
+
+_WAITING_CONTEXT_AUTHORITATIVE_KEYS = {
+    "source",
+    "repository",
+    "branch",
+    "base_branch",
+    "pr_number",
+    "pull_request",
+    "commit_sha",
+    "workflow_id",
+    "work_item_id",
+    "runtime_validation_id",
+    "correlation_id",
+    "target_url_source",
+    "target_url_pending_reason",
+    "created_at",
+    "resume_status",
+}
+
 
 def is_wf20_deployment_status_payload(parsed: ParsedGitHubEvent) -> bool:
     raw = parsed.raw or {}
@@ -68,6 +111,7 @@ def persist_waiting_for_deployment(
     storage: Any | None = None,
 ) -> ReviewWorkItem:
     commit_sha = _request_commit_sha(request) or item.commit_sha
+    existing_runtime_context = item.runtime_validation_context if isinstance(item.runtime_validation_context, dict) else {}
     item.repo_full_name = request.repo or item.repo_full_name
     item.branch = request.branch or item.branch
     item.base_branch = request.base_branch or item.base_branch
@@ -77,7 +121,7 @@ def persist_waiting_for_deployment(
     item.status = ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING
     item.runtime_validation_id = request.workflow_id or request.correlation_id
     item.runtime_validation_status = WAITING_RUNTIME_STATUS
-    item.runtime_validation_context = _waiting_context(request, item, commit_sha=commit_sha)
+    item.runtime_validation_context = _waiting_context(request, item, commit_sha=commit_sha, existing_context=existing_runtime_context)
     record_lifecycle_stage(item, ReviewLifecycleStage.RUNTIME_VALIDATION_PENDING)
     _log_waiting_registry_transition(
         "registry_before_add",
@@ -460,9 +504,15 @@ def _log_match_rejections(items: list[ReviewWorkItem], request: RuntimeValidatio
         )
 
 
-def _waiting_context(request: RuntimeValidationRequest, item: ReviewWorkItem, *, commit_sha: str | None) -> dict[str, object]:
+def _waiting_context(
+    request: RuntimeValidationRequest,
+    item: ReviewWorkItem,
+    *,
+    commit_sha: str | None,
+    existing_context: dict[str, Any] | None = None,
+) -> dict[str, object]:
     now = datetime.now(UTC).isoformat()
-    return {
+    context: dict[str, object] = {
         "source": WAITING_CONTEXT_SOURCE,
         "repository": request.repo,
         "branch": request.branch,
@@ -479,6 +529,64 @@ def _waiting_context(request: RuntimeValidationRequest, item: ReviewWorkItem, *,
         "created_at": now,
         "resume_status": "waiting",
     }
+    _preserve_waiting_workflow_context(context, existing_context or {})
+    return context
+
+
+def _preserve_waiting_workflow_context(context: dict[str, object], existing_context: dict[str, Any]) -> None:
+    if not isinstance(existing_context, dict) or not existing_context:
+        return
+    for key, value in existing_context.items():
+        if key in _WAITING_CONTEXT_AUTHORITATIVE_KEYS:
+            continue
+        if _value_present(value) and key not in context:
+            context[key] = value
+
+    existing_dispatch = _dict_value(existing_context.get("review_dispatch"))
+    merged_dispatch = dict(_dict_value(context.get("review_dispatch")))
+    for key, value in existing_dispatch.items():
+        if _value_present(value) and not _value_present(merged_dispatch.get(key)):
+            merged_dispatch[key] = value
+
+    workflow_chain = _workflow_chain_from_context(existing_context, existing_dispatch)
+    metadata = _dict_value(existing_context.get("metadata"))
+    if workflow_chain:
+        context.setdefault("workflow_chain", workflow_chain)
+        merged_dispatch.setdefault("workflow_chain", workflow_chain)
+        metadata.setdefault("workflow_chain", workflow_chain)
+
+    for key in _WORKFLOW_CHAIN_CONTEXT_KEYS:
+        value = _first_present(
+            existing_context.get(key),
+            existing_dispatch.get(key),
+            metadata.get(key),
+            workflow_chain.get(key) if workflow_chain else None,
+        )
+        if _value_present(value):
+            if key not in _WAITING_CONTEXT_AUTHORITATIVE_KEYS:
+                context.setdefault(key, value)
+            merged_dispatch.setdefault(key, value)
+            metadata.setdefault(key, value)
+
+    if merged_dispatch:
+        context["review_dispatch"] = merged_dispatch
+    if metadata:
+        context["metadata"] = metadata
+
+
+def _workflow_chain_from_context(context: dict[str, Any], review_dispatch: dict[str, Any]) -> dict[str, Any]:
+    metadata = _dict_value(context.get("metadata"))
+    return _first_dict(
+        context.get("workflow_chain"),
+        context.get("_workflow_chain"),
+        context.get("workflowChain"),
+        review_dispatch.get("workflow_chain"),
+        review_dispatch.get("_workflow_chain"),
+        review_dispatch.get("workflowChain"),
+        metadata.get("workflow_chain"),
+        metadata.get("_workflow_chain"),
+        metadata.get("workflowChain"),
+    )
 
 
 def _candidate_log_payload(item: ReviewWorkItem) -> dict[str, Any]:
@@ -681,6 +789,21 @@ def _first_present(*values: Any) -> Any | None:
         if value is not None and value != "":
             return value
     return None
+
+
+def _first_dict(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict) and value:
+            return value
+    return {}
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _value_present(value: Any) -> bool:
+    return value is not None and value != ""
 
 
 def _int_or_none(value: object) -> int | None:
