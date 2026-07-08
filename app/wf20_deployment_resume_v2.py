@@ -36,15 +36,18 @@ def install_event_driven_wf20_runtime_validation() -> None:
         if is_waiting_for_deployment_request(request):
             result = _pending_waiting_result(request)
             _store_result(self, result)
+            _log_runtime_validation_completed(request, result, dispatch_path="waiting_for_deployment_pending")
             return result
         if request.target_url:
             existing = _find_resumed_runtime_validation(getattr(self, "_items", {}).values(), request)
             if existing is not None:
                 _log_workflow_already_resumed(request, existing)
+                _log_runtime_validation_completed(request, existing, dispatch_path="duplicate_ready_existing_result")
                 return existing
             _log_deployment_ready(request)
             _log_starting_hermes(request)
         result = await original_trigger(self, request, settings)
+        _log_runtime_validation_completed(request, result, dispatch_path="hermes_runtime_trigger_completed")
         if request.target_url:
             _store_result(self, result)
         return result
@@ -149,6 +152,29 @@ def _log_workflow_already_resumed(request: RuntimeValidationRequest, result: Run
         commit_sha=_commit_sha(request),
         preview_url=request.target_url,
         validation_id=result.validation_id,
+    )
+
+
+def _log_runtime_validation_completed(request: RuntimeValidationRequest, result: RuntimeValidationResult, *, dispatch_path: str) -> None:
+    log_event(
+        "post_runtime_validation_completed",
+        dispatch_path=dispatch_path,
+        workflow_id=result.workflow_id or request.workflow_id,
+        correlation_id=result.correlation_id or request.correlation_id,
+        work_item_id=result.work_item_id or request.work_item_id,
+        runtime_validation_id=result.validation_id,
+        evidence_packet_id=result.evidence_id,
+        repository=result.repo or request.repo,
+        pr_number=result.pr_number or request.pr_number,
+        branch=result.branch or request.branch,
+        base_branch=result.base_branch or request.base_branch,
+        commit_sha=_commit_sha(request),
+        target_url=result.hermes.target_url or request.target_url,
+        validation_status=result.status,
+        hermes_status=result.hermes.status,
+        hermes_job_id=result.hermes.job_id,
+        bb2_review_status=result.bb2.review_status,
+        error=result.error,
     )
 
 
