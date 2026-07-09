@@ -34,6 +34,19 @@ _WORKFLOW_CHAIN_KEYS = {
     "continuation_mode",
     "merge_gate",
 }
+_WORKFLOW_COMPANION_KEYS = {
+    *_WORKFLOW_CHAIN_KEYS,
+    "workflow_id",
+    "repository",
+    "repo",
+    "pr_number",
+    "branch",
+    "base_branch",
+    "commit_sha",
+    "work_item_id",
+    "previous_work_item_id",
+    "agent_bus_work_item_id",
+}
 
 
 def create_runtime_validation_pending_item(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
@@ -194,6 +207,7 @@ def _review_work_item_from_runtime_validation(
 ) -> ReviewWorkItem:
     now = datetime.now(UTC)
     runtime_context = runtime_validation_context_from_result(result)
+    _hydrate_runtime_context_from_agent_bus_work_item(runtime_context, agent_bus_work_item)
     _normalize_workflow_chain_metadata(
         runtime_context,
         result,
@@ -220,6 +234,46 @@ def _review_work_item_from_runtime_validation(
         runtime_validation_completed_at=result.completed_at,
         runtime_validation_context=runtime_context,
     )
+
+
+def _hydrate_runtime_context_from_agent_bus_work_item(
+    context: dict[str, Any],
+    agent_bus_work_item: dict[str, Any] | None,
+) -> None:
+    sources = _agent_bus_work_item_sources(agent_bus_work_item)
+    if not sources:
+        return
+
+    review_dispatch = dict(_dict_value(context.get("review_dispatch")))
+    metadata = dict(_dict_value(context.get("metadata")))
+    for source in sources:
+        source_metadata = _dict_value(source.get("metadata"))
+        if source_metadata:
+            for key, value in source_metadata.items():
+                if _value_present(value) and key not in metadata:
+                    metadata[key] = value
+        source_dispatch = _dict_value(source.get("review_dispatch")) or _dict_value(source_metadata.get("review_dispatch"))
+        for key, value in source_dispatch.items():
+            if _value_present(value) and not _value_present(review_dispatch.get(key)):
+                review_dispatch[key] = value
+
+    workflow_chain = _workflow_chain_object(review_dispatch, sources)
+    if workflow_chain:
+        context["workflow_chain"] = workflow_chain
+        review_dispatch.setdefault("workflow_chain", workflow_chain)
+        metadata.setdefault("workflow_chain", workflow_chain)
+
+    for key in _WORKFLOW_COMPANION_KEYS:
+        value = _first_present_from_sources(sources, key, _camelize(key))
+        if _value_present(value):
+            context.setdefault(key, value)
+            review_dispatch.setdefault(key, value)
+            metadata.setdefault(key, value)
+
+    if review_dispatch:
+        context["review_dispatch"] = review_dispatch
+    if metadata:
+        context["metadata"] = metadata
 
 
 def _log_wf_chain_hydrated(context: dict[str, Any]) -> None:
@@ -268,6 +322,16 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
         value = hydrated.get(key)
         if isinstance(value, dict) and value:
             merged.setdefault(key, value)
+
+    base_metadata = dict(_dict_value(base.get("metadata")))
+    hydrated_metadata = _dict_value(hydrated.get("metadata"))
+    for key, value in hydrated_metadata.items():
+        if _value_present(value) and not _value_present(base_metadata.get(key)):
+            base_metadata[key] = value
+    workflow_chain = _dict_value(merged.get("workflow_chain")) or _dict_value(merged.get("_workflow_chain"))
+    if workflow_chain:
+        base_metadata.setdefault("workflow_chain", workflow_chain)
+
     base_dispatch = dict(_dict_value(base.get("review_dispatch")))
     hydrated_dispatch = _dict_value(hydrated.get("review_dispatch"))
     for key, value in hydrated_dispatch.items():
@@ -277,8 +341,11 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
         value = hydrated_dispatch.get(key)
         if isinstance(value, dict) and value:
             base_dispatch.setdefault(key, value)
+            base_metadata.setdefault("workflow_chain", value)
     if base_dispatch:
         merged["review_dispatch"] = base_dispatch
+    if base_metadata:
+        merged["metadata"] = base_metadata
     return merged
 
 
@@ -371,13 +438,16 @@ def _append_agent_bus_work_item_sources(sources: list[dict[str, Any]], work_item
     metadata = work_item.get("metadata")
     if isinstance(metadata, dict):
         sources.append(metadata)
-        workflow_chain = metadata.get("workflow_chain")
+        workflow_chain = metadata.get("workflow_chain") or metadata.get("_workflow_chain") or metadata.get("workflowChain")
         if isinstance(workflow_chain, dict):
             sources.append(workflow_chain)
+        runtime_context = metadata.get("runtime_context") or metadata.get("runtime_validation_context")
+        if isinstance(runtime_context, dict):
+            sources.append(runtime_context)
         review_dispatch = metadata.get("review_dispatch")
         if isinstance(review_dispatch, dict):
             sources.append(review_dispatch)
-            nested_chain = review_dispatch.get("workflow_chain")
+            nested_chain = review_dispatch.get("workflow_chain") or review_dispatch.get("_workflow_chain") or review_dispatch.get("workflowChain")
             if isinstance(nested_chain, dict):
                 sources.append(nested_chain)
 
@@ -463,7 +533,12 @@ def _contains_workflow_metadata(source: dict[str, Any]) -> bool:
     if isinstance(workflow_chain, dict) and any(_value_present(workflow_chain.get(key)) for key in _WORKFLOW_CHAIN_KEYS):
         return True
     metadata = source.get("metadata")
-    return isinstance(metadata, dict) and any(_value_present(metadata.get(key)) for key in _WORKFLOW_CHAIN_KEYS)
+    if isinstance(metadata, dict):
+        nested_chain = metadata.get("workflow_chain") or metadata.get("workflowChain") or metadata.get("_workflow_chain")
+        if isinstance(nested_chain, dict) and any(_value_present(nested_chain.get(key)) for key in _WORKFLOW_CHAIN_KEYS):
+            return True
+        return any(_value_present(metadata.get(key)) for key in _WORKFLOW_CHAIN_KEYS)
+    return False
 
 
 def _fill_missing(target: dict[str, Any], key: str, sources: list[dict[str, Any]], *aliases: str) -> None:
@@ -498,7 +573,18 @@ def _first_present_from_sources(sources: list[dict[str, Any]], *aliases: str) ->
                 value = metadata.get(alias)
                 if _value_present(value):
                     return value
+            workflow_chain = metadata.get("workflow_chain") or metadata.get("workflowChain") or metadata.get("_workflow_chain")
+            if isinstance(workflow_chain, dict):
+                for alias in aliases:
+                    value = workflow_chain.get(alias)
+                    if _value_present(value):
+                        return value
     return None
+
+
+def _camelize(value: str) -> str:
+    parts = value.split("_")
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
 
 
 def _value_present(value: Any) -> bool:
