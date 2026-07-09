@@ -84,6 +84,27 @@ async def process_queued_review_item(
             agent_bus_dispatch_success=response.agent_bus_dispatch_success,
             continuation_id=getattr(response, "continuation_id", None),
         )
+        if response.work_item.runtime_validation_id and response.decision.decision.value == "approved_for_human_review" and not response.task_dispatch_attempted:
+            log_event(
+                "post_runtime_review_continuation_not_scheduled",
+                item_id=response.work_item.id,
+                workflow_id=_workflow_id_from_item(response.work_item),
+                runtime_validation_id=response.work_item.runtime_validation_id,
+                repository=response.work_item.repo_full_name,
+                pr_number=response.work_item.pr_number,
+                branch=response.work_item.branch,
+                decision=response.decision.decision.value,
+                github_writeback_attempted=response.github_writeback_attempted,
+                github_writeback_success=response.github_writeback_success,
+                github_writeback_error=response.github_writeback_error,
+                task_dispatch_attempted=response.task_dispatch_attempted,
+                task_dispatch_success=response.task_dispatch_success,
+                task_dispatch_error=response.task_dispatch_error,
+                agent_bus_dispatch_attempted=response.agent_bus_dispatch_attempted,
+                agent_bus_dispatch_success=response.agent_bus_dispatch_success,
+                agent_bus_dispatch_error=response.agent_bus_dispatch_error,
+                reason="approved_runtime_review_returned_without_task_dispatch",
+            )
         log_workflow_chain_availability(
             "wf_chain_metadata_review_worker_after_process_work_item",
             response.work_item,
