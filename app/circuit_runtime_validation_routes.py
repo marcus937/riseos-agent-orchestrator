@@ -32,6 +32,12 @@ _RUNTIME_VALIDATION_ROUTE_PATHS = {
     "/api/v1/runtime-validations/{validation_id}/evidence",
     "/api/v1/runtime-validations/{validation_id}/bb2-packet",
 }
+_IDENTIFIER_ALIASES = {
+    "work_item_id": ("work_item_id", "workItemId", "previous_work_item_id", "previousWorkItemId", "agent_bus_work_item_id"),
+    "workflow_id": ("workflow_id", "workflowId", "workflow_chain_id", "workflowChainId"),
+    "evidence_id": ("evidence_id", "evidenceId", "evidence_packet_id", "evidencePacketId"),
+    "review_agent": ("review_agent", "reviewAgent", "reviewer", "target_agent", "targetAgent"),
+}
 
 
 class _RoutePathMarker:
@@ -73,6 +79,7 @@ async def create_runtime_validation(
     store = _runtime_validation_store(http_request)
     _log_runtime_validation_store_selected(store, request, dispatch_path="runtime_validation_route")
     result = await store.trigger(request, settings)
+    _normalize_runtime_result_identifiers(result)
     _ensure_created_response_has_handoff_outcome(result, store)
     storage = getattr(http_request.app.state, "storage", None)
     agent_task_store = getattr(http_request.app.state, "agent_task_store", None)
@@ -146,6 +153,65 @@ def register_circuit_runtime_validation_routes(app: FastAPI) -> None:
 
 def _runtime_validation_store(request: Request) -> Any:
     return getattr(request.app.state, "runtime_validation_store", runtime_validation_store)
+
+
+def _normalize_runtime_result_identifiers(result: RuntimeValidationResult) -> RuntimeValidationResult:
+    sources = _runtime_result_identifier_sources(result)
+    applied: dict[str, Any] = {}
+    for field, aliases in _IDENTIFIER_ALIASES.items():
+        if getattr(result, field, None):
+            continue
+        value = _first_present_from_sources(sources, *aliases)
+        if value is not None and value != "":
+            setattr(result, field, str(value))
+            applied[field] = str(value)
+    if applied:
+        log_event(
+            "runtime_validation_result_identifiers_normalized",
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+            evidence_id=result.evidence_id,
+            review_agent=result.review_agent,
+            normalized_fields=sorted(applied.keys()),
+        )
+    return result
+
+
+def _runtime_result_identifier_sources(result: RuntimeValidationResult) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    review_dispatch = result.review_dispatch if isinstance(result.review_dispatch, dict) else {}
+    if review_dispatch:
+        sources.append(review_dispatch)
+    bb2_context = result.bb2.review_context if isinstance(result.bb2.review_context, dict) else {}
+    if bb2_context:
+        sources.append(bb2_context)
+        nested_dispatch = bb2_context.get("review_dispatch")
+        if isinstance(nested_dispatch, dict):
+            sources.append(nested_dispatch)
+    for source in list(sources):
+        for key in ("workflow_chain", "_workflow_chain", "workflowChain", "metadata", "runtime_context", "runtime_validation_context", "agent_bus_work_item", "work_item"):
+            value = source.get(key)
+            if isinstance(value, dict) and value:
+                sources.append(value)
+                nested_metadata = value.get("metadata")
+                if isinstance(nested_metadata, dict) and nested_metadata:
+                    sources.append(nested_metadata)
+                nested_chain = value.get("workflow_chain") or value.get("_workflow_chain") or value.get("workflowChain")
+                if isinstance(nested_chain, dict) and nested_chain:
+                    sources.append(nested_chain)
+    return sources
+
+
+def _first_present_from_sources(sources: list[dict[str, Any]], *aliases: str) -> Any:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for alias in aliases:
+            value = source.get(alias)
+            if value is not None and value != "":
+                return value
+    return None
 
 
 async def _agent_bus_work_item_for_runtime_result(
