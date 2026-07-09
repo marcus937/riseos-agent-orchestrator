@@ -34,10 +34,17 @@ def install_runtime_validation_handoff_trace() -> None:
 def _patch_runtime_validation_store(runtime_module: Any) -> None:
     original_trigger = runtime_module.RuntimeValidationStore.trigger
     original_build_runtime_payload = getattr(runtime_module, "_build_runtime_payload", None)
+    original_build_review_dispatch = getattr(runtime_module, "_build_review_dispatch_payload", None)
 
     @wraps(original_trigger)
     async def traced_trigger(self: Any, request: Any, settings: Any) -> Any:
         trace = _request_fields(request)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_runtime_trigger_request",
+            request,
+            source_object="RuntimeValidationRequest",
+            **trace,
+        )
         log_event(
             "runtime_validation_trigger_boundary_entered",
             **trace,
@@ -53,6 +60,12 @@ def _patch_runtime_validation_store(runtime_module: Any) -> None:
         result = await original_trigger(self, request, settings)
         result_trace = _result_fields(result)
         skip_block_reason = _result_skip_or_block_reason(result)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_runtime_trigger_result",
+            result,
+            source_object="RuntimeValidationResult",
+            **result_trace,
+        )
         log_event(
             "runtime_validation_created",
             **result_trace,
@@ -88,10 +101,41 @@ def _patch_runtime_validation_store(runtime_module: Any) -> None:
 
     runtime_module.RuntimeValidationStore.trigger = traced_trigger
 
+    if callable(original_build_review_dispatch):
+        @wraps(original_build_review_dispatch)
+        def traced_build_review_dispatch_payload(request: Any, correlation_id: str) -> dict[str, Any]:
+            log_workflow_chain_trace(
+                "workflow_chain_trace_before_review_dispatch_build",
+                request,
+                source_object="RuntimeValidationRequest",
+                correlation_id=correlation_id,
+                **_request_fields(request),
+            )
+            payload = original_build_review_dispatch(request, correlation_id)
+            log_workflow_chain_trace(
+                "workflow_chain_trace_after_review_dispatch_build",
+                payload,
+                source_object="review_dispatch_payload",
+                correlation_id=correlation_id,
+                **_request_fields(request),
+            )
+            return payload
+
+        runtime_module._build_review_dispatch_payload = traced_build_review_dispatch_payload
+
     if callable(original_build_runtime_payload):
         @wraps(original_build_runtime_payload)
         def traced_build_runtime_payload(request: Any, target_url: str, correlation_id: str, settings: Any, *, target_source: str) -> dict[str, Any]:
             payload = original_build_runtime_payload(request, target_url, correlation_id, settings, target_source=target_source)
+            log_workflow_chain_trace(
+                "workflow_chain_trace_runtime_payload_built",
+                payload,
+                source_object="Hermes runtime payload",
+                correlation_id=correlation_id,
+                target_url=target_url,
+                target_source=target_source,
+                **_payload_fields(payload),
+            )
             commit_sha = _request_fields(request).get("commit_sha")
             if commit_sha:
                 payload["commitSha"] = commit_sha
@@ -112,6 +156,12 @@ def _patch_agent_bus_runtime_validation_store(wf20_module: Any) -> None:
     @wraps(original_trigger)
     async def traced_agent_bus_trigger(self: Any, request: Any, settings: Any) -> Any:
         trace = _request_fields(request)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_agent_bus_runtime_trigger_request",
+            request,
+            source_object="AgentBusRuntimeValidationStore.trigger request",
+            **trace,
+        )
         log_event(
             "agent_bus_runtime_validation_store_entered",
             **trace,
@@ -125,6 +175,12 @@ def _patch_agent_bus_runtime_validation_store(wf20_module: Any) -> None:
             target_url=getattr(request, "target_url", None),
         )
         result = await original_trigger(self, request, settings)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_agent_bus_runtime_trigger_result",
+            result,
+            source_object="AgentBusRuntimeValidationStore.trigger result",
+            **_result_fields(result),
+        )
         log_event(
             "agent_bus_runtime_validation_store_completed",
             **_result_fields(result),
@@ -147,6 +203,12 @@ def _patch_agent_bus_runtime_validation_store(wf20_module: Any) -> None:
         trace = _request_fields(request)
         if runtime_result is not None:
             trace["runtime_validation_id"] = getattr(runtime_result, "validation_id", None)
+            log_workflow_chain_trace(
+                "workflow_chain_trace_agent_bus_state_write_result",
+                runtime_result,
+                source_object="runtime_result before Agent Bus state write",
+                **_result_fields(runtime_result),
+            )
         log_event(
             "agent_bus_runtime_validation_write_started",
             **trace,
@@ -175,6 +237,12 @@ def _patch_hermes_http_client(hermes_http_client_cls: Any) -> None:
     async def traced_post_job(self: Any, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         trace = _payload_fields(payload)
         endpoint_url = f"{base_url.rstrip('/')}{HERMES_JOB_ENDPOINT}"
+        log_workflow_chain_trace(
+            "workflow_chain_trace_hermes_post_job_payload",
+            payload,
+            source_object="HermesHTTPClient.post_job payload",
+            **trace,
+        )
         log_event(
             "hermes_dispatch_started",
             **trace,
@@ -298,6 +366,126 @@ def _payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "commit_sha": nested.get("commitSha") or nested.get("commit_sha") or review_dispatch.get("commit_sha"),
         "evidence_packet_id": payload.get("evidenceId") or payload.get("evidence_id") or nested.get("evidenceId") or nested.get("evidence_id") or review_dispatch.get("evidence_packet_id") or review_dispatch.get("evidence_id"),
     }
+
+
+def log_workflow_chain_trace(event: str, source: Any, *, source_object: str, **extra: Any) -> None:
+    summary = _workflow_chain_summary(source)
+    log_event(
+        event,
+        source_object=source_object,
+        workflow_chain_exists=summary["exists"],
+        workflow_chain_length=summary["length"],
+        workflow_chain_first_step=summary["first_step"],
+        workflow_chain_last_step=summary["last_step"],
+        workflow_chain_keys=summary["keys"],
+        workflow_chain_source_path=summary["source_path"],
+        **extra,
+        _include_nulls=True,
+    )
+
+
+def _workflow_chain_summary(source: Any) -> dict[str, Any]:
+    chain, source_path = _find_workflow_chain(source)
+    steps = _workflow_steps(chain)
+    return {
+        "exists": bool(chain),
+        "length": len(steps) if steps else len(chain),
+        "first_step": steps[0] if steps else _step_id(chain),
+        "last_step": steps[-1] if steps else _step_id(chain),
+        "keys": sorted(str(key) for key in chain.keys()) if isinstance(chain, dict) else [],
+        "source_path": source_path,
+    }
+
+
+def _find_workflow_chain(source: Any) -> tuple[dict[str, Any], str | None]:
+    candidates: list[tuple[Any, str]] = [(source, "source")]
+    seen: set[int] = set()
+    while candidates:
+        value, path = candidates.pop(0)
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        mapping = _as_dict(value)
+        if not mapping:
+            continue
+        for key in ("workflow_chain", "_workflow_chain", "workflowChain"):
+            nested = mapping.get(key)
+            if isinstance(nested, dict) and nested:
+                return nested, f"{path}.{key}"
+        if _looks_like_workflow_chain(mapping):
+            return mapping, path
+        for key in (
+            "review_dispatch",
+            "reviewDispatch",
+            "runtime_context",
+            "runtimeContext",
+            "runtime_validation_context",
+            "runtimeValidationContext",
+            "metadata",
+            "bb2_packet",
+            "bb2",
+            "review_context",
+            "reviewContext",
+            "payload",
+            "work_item",
+            "agent_bus_work_item",
+        ):
+            nested = mapping.get(key)
+            if isinstance(nested, dict) and nested:
+                candidates.append((nested, f"{path}.{key}"))
+    return {}, None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump(mode="json")
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            return dumped
+    data = getattr(value, "__dict__", None)
+    return data if isinstance(data, dict) else {}
+
+
+def _looks_like_workflow_chain(value: dict[str, Any]) -> bool:
+    return any(
+        key in value
+        for key in (
+            "workflow_chain_id",
+            "workflowChainId",
+            "workflow_step",
+            "workflowStep",
+            "current_workflow_step",
+            "currentWorkflowStep",
+            "workflow_steps",
+            "workflowSteps",
+            "workflow_sequence",
+            "workflowSequence",
+        )
+    )
+
+
+def _workflow_steps(chain: dict[str, Any]) -> list[str]:
+    raw_steps = chain.get("workflow_steps") or chain.get("workflowSteps") or chain.get("workflow_sequence") or chain.get("workflowSequence")
+    if not isinstance(raw_steps, list):
+        return []
+    steps: list[str] = []
+    for step in raw_steps:
+        if isinstance(step, str):
+            steps.append(step)
+        elif isinstance(step, dict):
+            step_id = step.get("id") or step.get("key") or step.get("workflow_step") or step.get("workflowStep") or step.get("name")
+            if step_id is not None:
+                steps.append(str(step_id))
+    return steps
+
+
+def _step_id(chain: dict[str, Any]) -> str | None:
+    value = chain.get("workflow_step") or chain.get("workflowStep") or chain.get("current_workflow_step") or chain.get("currentWorkflowStep")
+    return str(value) if value is not None else None
 
 
 def _result_skip_or_block_reason(result: Any) -> str | None:
