@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from app.config import Settings
 from app.operational_logging import log_event, log_review_failed, log_worker_claimed
@@ -44,6 +45,11 @@ async def process_queued_review_item(
         status=str(item.status),
         lifecycle_stage=str(item.lifecycle_stage),
     )
+    _log_review_worker_workflow_chain_trace(
+        "workflow_chain_trace_review_worker_after_claim",
+        item,
+        source_object="ReviewWorkItem after claim",
+    )
     log_workflow_chain_availability(
         "wf_chain_metadata_review_worker_after_claim",
         item,
@@ -59,6 +65,11 @@ async def process_queued_review_item(
             pr_number=item.pr_number,
             branch=item.branch,
             status=str(item.status),
+        )
+        _log_review_worker_workflow_chain_trace(
+            "workflow_chain_trace_review_worker_before_process_work_item",
+            item,
+            source_object="ReviewWorkItem before process_work_item",
         )
         log_workflow_chain_availability(
             "wf_chain_metadata_review_worker_before_process_work_item",
@@ -83,6 +94,11 @@ async def process_queued_review_item(
             agent_bus_dispatch_attempted=response.agent_bus_dispatch_attempted,
             agent_bus_dispatch_success=response.agent_bus_dispatch_success,
             continuation_id=getattr(response, "continuation_id", None),
+        )
+        _log_review_worker_workflow_chain_trace(
+            "workflow_chain_trace_review_worker_after_process_work_item",
+            response.work_item,
+            source_object="ReviewWorkItem after process_work_item",
         )
         if response.work_item.runtime_validation_id and response.decision.decision.value == "approved_for_human_review" and not response.task_dispatch_attempted:
             log_event(
@@ -134,6 +150,11 @@ async def process_queued_review_item(
             status=str(response.work_item.status),
             lifecycle_stage=str(response.work_item.lifecycle_stage),
         )
+        _log_review_worker_workflow_chain_trace(
+            "workflow_chain_trace_post_runtime_worker_before_persist_result",
+            response.work_item,
+            source_object="ReviewWorkItem before post-runtime persist",
+        )
         storage.save_review_work_item(response.work_item)
         log_event(
             "post_runtime_review_worker_after_persist_result",
@@ -142,6 +163,11 @@ async def process_queued_review_item(
             runtime_validation_id=response.work_item.runtime_validation_id,
             status=str(response.work_item.status),
             lifecycle_stage=str(response.work_item.lifecycle_stage),
+        )
+        _log_review_worker_workflow_chain_trace(
+            "workflow_chain_trace_post_runtime_worker_after_persist_result",
+            response.work_item,
+            source_object="ReviewWorkItem after post-runtime persist",
         )
     return response
 
@@ -167,3 +193,124 @@ def _workflow_id_from_item(item: ReviewWorkItem) -> str | None:
     context = item.runtime_validation_context if isinstance(item.runtime_validation_context, dict) else {}
     value = context.get("workflow_id") or context.get("correlation_id")
     return str(value) if value else None
+
+
+def _log_review_worker_workflow_chain_trace(event: str, item: ReviewWorkItem, *, source_object: str) -> None:
+    summary = _workflow_chain_summary(item)
+    log_event(
+        event,
+        source_object=source_object,
+        item_id=item.id,
+        workflow_id=_workflow_id_from_item(item),
+        runtime_validation_id=item.runtime_validation_id,
+        repository=item.repo_full_name,
+        pr_number=item.pr_number,
+        branch=item.branch,
+        workflow_chain_exists=summary["exists"],
+        workflow_chain_length=summary["length"],
+        workflow_chain_first_step=summary["first_step"],
+        workflow_chain_last_step=summary["last_step"],
+        workflow_chain_keys=summary["keys"],
+        workflow_chain_source_path=summary["source_path"],
+        _include_nulls=True,
+    )
+
+
+def _workflow_chain_summary(source: Any) -> dict[str, Any]:
+    chain, source_path = _find_workflow_chain(source)
+    steps = _workflow_steps(chain)
+    return {
+        "exists": bool(chain),
+        "length": len(steps) if steps else len(chain),
+        "first_step": steps[0] if steps else _step_id(chain),
+        "last_step": steps[-1] if steps else _step_id(chain),
+        "keys": sorted(str(key) for key in chain.keys()) if isinstance(chain, dict) else [],
+        "source_path": source_path,
+    }
+
+
+def _find_workflow_chain(source: Any) -> tuple[dict[str, Any], str | None]:
+    candidates: list[tuple[Any, str]] = [(source, "source")]
+    seen: set[int] = set()
+    while candidates:
+        value, path = candidates.pop(0)
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        mapping = _as_dict(value)
+        if not mapping:
+            continue
+        for key in ("workflow_chain", "_workflow_chain", "workflowChain"):
+            nested = mapping.get(key)
+            if isinstance(nested, dict) and nested:
+                return nested, f"{path}.{key}"
+        if _looks_like_workflow_chain(mapping):
+            return mapping, path
+        for key in (
+            "runtime_validation_context",
+            "runtimeValidationContext",
+            "review_dispatch",
+            "reviewDispatch",
+            "runtime_context",
+            "runtimeContext",
+            "metadata",
+            "bb2_packet",
+            "review_context",
+            "reviewContext",
+        ):
+            nested = mapping.get(key)
+            if isinstance(nested, dict) and nested:
+                candidates.append((nested, f"{path}.{key}"))
+    return {}, None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump(mode="json")
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            return dumped
+    data = getattr(value, "__dict__", None)
+    return data if isinstance(data, dict) else {}
+
+
+def _looks_like_workflow_chain(value: dict[str, Any]) -> bool:
+    return any(
+        key in value
+        for key in (
+            "workflow_chain_id",
+            "workflowChainId",
+            "workflow_step",
+            "workflowStep",
+            "current_workflow_step",
+            "currentWorkflowStep",
+            "workflow_steps",
+            "workflowSteps",
+            "workflow_sequence",
+            "workflowSequence",
+        )
+    )
+
+
+def _workflow_steps(chain: dict[str, Any]) -> list[str]:
+    raw_steps = chain.get("workflow_steps") or chain.get("workflowSteps") or chain.get("workflow_sequence") or chain.get("workflowSequence")
+    if not isinstance(raw_steps, list):
+        return []
+    steps: list[str] = []
+    for step in raw_steps:
+        if isinstance(step, str):
+            steps.append(step)
+        elif isinstance(step, dict):
+            step_id = step.get("id") or step.get("key") or step.get("workflow_step") or step.get("workflowStep") or step.get("name")
+            if step_id is not None:
+                steps.append(str(step_id))
+    return steps
+
+
+def _step_id(chain: dict[str, Any]) -> str | None:
+    value = chain.get("workflow_step") or chain.get("workflowStep") or chain.get("current_workflow_step") or chain.get("currentWorkflowStep")
+    return str(value) if value is not None else None
