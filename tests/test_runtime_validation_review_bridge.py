@@ -150,6 +150,71 @@ def test_successful_hermes_result_enqueues_bb2_review_with_evidence() -> None:
     assert result.bb2.review_requested is True
 
 
+def test_runtime_review_item_is_born_with_workflow_metadata_from_agent_bus_envelope() -> None:
+    workflow_chain = {
+        "workflow_chain_id": "wf-chain-21-29",
+        "workflow_step": "WF21",
+        "current_workflow_step": "WF21",
+        "next_workflow_step": "WF22",
+        "workflow_steps": ["WF21", "WF22", "WF23", "WF24", "WF25", "WF26", "WF27", "WF28", "WF29"],
+        "workflow_sequence": ["WF21", "WF22", "WF23", "WF24", "WF25", "WF26", "WF27", "WF28", "WF29"],
+        "repository": "marcus937/jarvis-mission-control",
+        "pr_number": 186,
+        "branch": "codex-m2/wf21",
+        "base_branch": "agent-integration",
+        "work_item_id": "agent-bus-wf21",
+        "previous_work_item_id": "agent-bus-wf21",
+        "continuation_mode": "same_pr_branch",
+        "merge_gate": "final_step_only",
+    }
+    result = _result("completed", validation_id="validation-chain").model_copy(
+        update={
+            "repo": "marcus937/jarvis-mission-control",
+            "pr_number": 186,
+            "branch": "codex-m2/wf21",
+            "base_branch": "agent-integration",
+            "work_item_id": "agent-bus-wf21",
+            "workflow_id": "wf-chain-21-29",
+            "review_dispatch": {},
+        }
+    )
+    agent_bus_work_item = {
+        "work_item": {
+            "id": "agent-bus-wf21",
+            "status": "APPROVED",
+            "metadata": {
+                "workflow_chain": workflow_chain,
+                "workflow_chain_id": "wf-chain-21-29",
+                "current_workflow_step": "WF21",
+                "next_workflow_step": "WF22",
+                "workflow_steps": workflow_chain["workflow_steps"],
+                "repository": "marcus937/jarvis-mission-control",
+                "pr_number": 186,
+                "branch": "codex-m2/wf21",
+                "base_branch": "agent-integration",
+            },
+        },
+        "history": [],
+    }
+
+    item = enqueue_review_from_runtime_validation(result, _settings(), agent_bus_work_item=agent_bus_work_item)
+
+    assert item is not None
+    context = item.runtime_validation_context
+    assert context["workflow_chain"] == workflow_chain
+    assert context["metadata"]["workflow_chain"] == workflow_chain
+    assert context["review_dispatch"]["workflow_chain"] == workflow_chain
+    assert context["workflow_chain_id"] == "wf-chain-21-29"
+    assert context["workflow_step"] == "WF21"
+    assert context["current_workflow_step"] == "WF21"
+    assert context["next_workflow_step"] == "WF22"
+    assert context["workflow_steps"] == workflow_chain["workflow_steps"]
+    assert item.agent_bus_work_item_id == "agent-bus-wf21"
+    assert item.repo_full_name == "marcus937/jarvis-mission-control"
+    assert item.pr_number == 186
+    assert item.branch == "codex-m2/wf21"
+
+
 def test_failed_hermes_result_enqueues_bb2_review_with_failure_context() -> None:
     item = enqueue_review_from_runtime_validation(_result("failed"), _settings())
 
