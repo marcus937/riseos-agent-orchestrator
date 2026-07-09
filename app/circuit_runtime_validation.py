@@ -17,6 +17,18 @@ from app.hermes_dispatch import HermesDispatchResult, HermesEvidenceSnapshot
 from app.operational_logging import log_event
 
 RuntimeValidationStatus = Literal["blocked", "completed", "failed", "pending"]
+_WORKFLOW_CHAIN_KEYS = {
+    "workflow_chain_id",
+    "workflow_family",
+    "workflow_sequence",
+    "workflow_steps",
+    "workflow_step",
+    "current_workflow_step",
+    "next_workflow_step",
+    "final_workflow_step",
+    "continuation_mode",
+    "merge_gate",
+}
 
 
 class RuntimeValidationRequest(BaseModel):
@@ -564,22 +576,79 @@ def _result_from_dispatch(result: RuntimeValidationResult, dispatch: HermesDispa
         error=dispatch.error,
     )
     result.evidence = evidence
+    review_context = {
+        "source": "circuit_runtime_validation_api",
+        "correlation_id": result.correlation_id,
+        "work_item_id": result.work_item_id,
+        "evidence_id": result.evidence_id,
+        "review_agent": result.review_agent,
+        "workflow_id": result.workflow_id,
+        "review_dispatch": result.review_dispatch,
+        "field_propagation_matrix": _field_matrix(evidence),
+    }
+    _attach_workflow_chain_to_review_context(review_context, result.review_dispatch)
     result.bb2 = RuntimeValidationBB2Packet(
         packet_created=True,
         review_requested=False,
         review_status=review_status,
-        review_context={
-            "source": "circuit_runtime_validation_api",
-            "correlation_id": result.correlation_id,
-            "work_item_id": result.work_item_id,
-            "evidence_id": result.evidence_id,
-            "review_agent": result.review_agent,
-            "workflow_id": result.workflow_id,
-            "review_dispatch": result.review_dispatch,
-            "field_propagation_matrix": _field_matrix(evidence),
-        },
+        review_context=review_context,
     )
     return result
+
+
+def _attach_workflow_chain_to_review_context(review_context: dict[str, Any], review_dispatch: dict[str, Any]) -> None:
+    workflow_chain = _workflow_chain_from_dispatch(review_dispatch)
+    if not workflow_chain:
+        return
+    review_context["workflow_chain"] = workflow_chain
+    metadata = dict(review_context.get("metadata") or {})
+    metadata.setdefault("workflow_chain", workflow_chain)
+    review_context["metadata"] = metadata
+    runtime_context = dict(review_context.get("runtime_context") or {})
+    runtime_context.setdefault("workflow_chain", workflow_chain)
+    for key in _WORKFLOW_CHAIN_KEYS:
+        if key in workflow_chain and workflow_chain[key] is not None and workflow_chain[key] != "":
+            runtime_context.setdefault(key, workflow_chain[key])
+            review_context.setdefault(key, workflow_chain[key])
+    review_context["runtime_context"] = runtime_context
+
+
+def _workflow_chain_from_dispatch(review_dispatch: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(review_dispatch, dict):
+        return {}
+    workflow_chain = _first_workflow_chain(
+        review_dispatch.get("workflow_chain"),
+        review_dispatch.get("_workflow_chain"),
+        review_dispatch.get("workflowChain"),
+        _nested_workflow_chain(review_dispatch.get("metadata")),
+        _nested_workflow_chain(review_dispatch.get("runtime_context")),
+        _nested_workflow_chain(review_dispatch.get("runtime_validation_context")),
+    )
+    if workflow_chain:
+        return dict(workflow_chain)
+    return {
+        key: review_dispatch[key]
+        for key in _WORKFLOW_CHAIN_KEYS
+        if review_dispatch.get(key) is not None and review_dispatch.get(key) != ""
+    }
+
+
+def _nested_workflow_chain(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return _first_workflow_chain(
+        value.get("workflow_chain"),
+        value.get("_workflow_chain"),
+        value.get("workflowChain"),
+        value if any(key in value for key in _WORKFLOW_CHAIN_KEYS) else None,
+    )
+
+
+def _first_workflow_chain(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict) and value:
+            return value
+    return {}
 
 
 def _evidence_summary(evidence: HermesEvidenceSnapshot | None, settings: Settings) -> RuntimeValidationEvidenceSummary:
