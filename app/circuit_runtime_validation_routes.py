@@ -84,8 +84,15 @@ async def create_runtime_validation(
         agent_task_store=agent_task_store,
         agent_bus_work_item=agent_bus_work_item,
     )
-    _schedule_runtime_review_processing(review_item, http_request, settings, storage, background_tasks)
+    review_processing_scheduled = _schedule_runtime_review_processing(review_item, http_request, settings, storage, background_tasks)
     await advance_agent_bus_from_runtime_validation(result, settings)
+    await _process_runtime_review_continuation_if_unscheduled(
+        review_item,
+        http_request,
+        settings,
+        storage,
+        scheduled=review_processing_scheduled,
+    )
     return result
 
 
@@ -195,10 +202,10 @@ def _schedule_runtime_review_processing(
     settings: Settings,
     storage: Any | None,
     background_tasks: BackgroundTasks,
-) -> None:
+) -> bool:
     if review_item is None:
         log_event("runtime_validation_review_processing_skipped", reason="no_review_item")
-        return
+        return False
     if not settings.enable_auto_review_processing:
         log_event(
             "runtime_validation_review_processing_skipped",
@@ -206,7 +213,7 @@ def _schedule_runtime_review_processing(
             work_item_id=getattr(review_item, "id", None),
             runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
         )
-        return
+        return False
     status_value = getattr(getattr(review_item, "status", None), "value", getattr(review_item, "status", None))
     if status_value != "pending_review":
         log_event(
@@ -216,7 +223,7 @@ def _schedule_runtime_review_processing(
             runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
             review_item_status=status_value,
         )
-        return
+        return False
     processor = _review_processor(request)
     if processor is None:
         log_event(
@@ -225,7 +232,7 @@ def _schedule_runtime_review_processing(
             work_item_id=getattr(review_item, "id", None),
             runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
         )
-        return
+        return False
     background_tasks.add_task(process_queued_review_item, review_item.id, settings, storage, processor)
     log_event(
         "runtime_validation_review_processing_scheduled",
@@ -234,6 +241,97 @@ def _schedule_runtime_review_processing(
         repository=getattr(review_item, "repo_full_name", None),
         pr_number=getattr(review_item, "pr_number", None),
         branch=getattr(review_item, "branch", None),
+    )
+    return True
+
+
+async def _process_runtime_review_continuation_if_unscheduled(
+    review_item: Any | None,
+    request: Request,
+    settings: Settings,
+    storage: Any | None,
+    *,
+    scheduled: bool,
+) -> bool:
+    if scheduled:
+        return False
+    if review_item is None:
+        return False
+    if not _review_item_has_workflow_chain(review_item):
+        log_event(
+            "runtime_validation_review_continuation_inline_skipped",
+            reason="workflow_chain_metadata_missing",
+            work_item_id=getattr(review_item, "id", None),
+            runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        )
+        return False
+    status_value = getattr(getattr(review_item, "status", None), "value", getattr(review_item, "status", None))
+    if status_value != "pending_review":
+        log_event(
+            "runtime_validation_review_continuation_inline_skipped",
+            reason="review_item_not_pending",
+            work_item_id=getattr(review_item, "id", None),
+            runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+            review_item_status=status_value,
+        )
+        return False
+    processor = _review_processor(request)
+    if processor is None:
+        log_event(
+            "runtime_validation_review_continuation_inline_skipped",
+            reason="review_processor_unavailable",
+            work_item_id=getattr(review_item, "id", None),
+            runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        )
+        return False
+    log_event(
+        "runtime_validation_review_continuation_inline_started",
+        work_item_id=getattr(review_item, "id", None),
+        runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        repository=getattr(review_item, "repo_full_name", None),
+        pr_number=getattr(review_item, "pr_number", None),
+        branch=getattr(review_item, "branch", None),
+    )
+    response = await process_queued_review_item(review_item.id, settings, storage, processor)
+    log_event(
+        "runtime_validation_review_continuation_inline_completed",
+        work_item_id=getattr(review_item, "id", None),
+        runtime_validation_id=getattr(review_item, "runtime_validation_id", None),
+        processed=response is not None,
+        task_dispatch_attempted=getattr(response, "task_dispatch_attempted", None) if response is not None else None,
+        task_dispatch_success=getattr(response, "task_dispatch_success", None) if response is not None else None,
+        agent_bus_dispatch_attempted=getattr(response, "agent_bus_dispatch_attempted", None) if response is not None else None,
+        agent_bus_dispatch_success=getattr(response, "agent_bus_dispatch_success", None) if response is not None else None,
+    )
+    return response is not None
+
+
+def _review_item_has_workflow_chain(review_item: Any) -> bool:
+    context = getattr(review_item, "runtime_validation_context", None)
+    if not isinstance(context, dict):
+        return False
+    review_dispatch = context.get("review_dispatch") if isinstance(context.get("review_dispatch"), dict) else {}
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    for value in (
+        context.get("workflow_chain"),
+        context.get("_workflow_chain"),
+        context.get("workflowChain"),
+        review_dispatch.get("workflow_chain"),
+        review_dispatch.get("_workflow_chain"),
+        review_dispatch.get("workflowChain"),
+        metadata.get("workflow_chain"),
+        metadata.get("_workflow_chain"),
+        metadata.get("workflowChain"),
+    ):
+        if isinstance(value, dict) and value:
+            return True
+    return bool(
+        context.get("workflow_chain_id")
+        or context.get("workflow_step")
+        or context.get("current_workflow_step")
+        or review_dispatch.get("workflow_chain_id")
+        or review_dispatch.get("workflow_step")
+        or review_dispatch.get("current_workflow_step")
     )
 
 
