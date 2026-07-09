@@ -597,6 +597,7 @@ def _dict_value(value: Any) -> dict[str, Any]:
 
 def _string_or_none(value: Any) -> str | None:
     if value is None:
+        return None
     text = str(value).strip()
     return text or None
 
