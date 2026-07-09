@@ -283,18 +283,48 @@ async def dispatch_workflow_chain_continuation(
         item,
         decision=getattr(decision, "value", str(decision)),
     )
+    log_event(
+        "workflow_chain_continuation_dispatch_entered",
+        **_workflow_chain_dispatch_log_context(
+            item,
+            decision=decision,
+            reason="entered",
+            enabled=enabled,
+            agent_bus_enabled=agent_bus_enabled,
+            continuation_store_configured=continuation_store is not None,
+        ),
+    )
     missing_reason = workflow_chain_missing_metadata_reason(item)
     if missing_reason is not None:
+        log_event(
+            "workflow_chain_continuation_dispatch_skipped",
+            **_workflow_chain_dispatch_log_context(item, decision=decision, reason=missing_reason),
+        )
         return _record_missing_metadata_continuation(item, continuation_store, base_branch=base_branch, reason=missing_reason)
 
     continuation_context = workflow_chain_continuation_for_decision(item, decision, base_branch=base_branch)
     if continuation_context is None:
-        if workflow_chain_context_from_item(item, base_branch=base_branch) is not None:
+        chain_context = workflow_chain_context_from_item(item, base_branch=base_branch)
+        reason = "no_workflow_chain_context"
+        if chain_context is not None:
+            reason = "final_step_or_no_next_workflow_step"
             log_event("CONTINUATION_SKIPPED_FINAL_STEP", **_workflow_chain_log_context(item))
+        log_event(
+            "workflow_chain_continuation_dispatch_skipped",
+            **_workflow_chain_dispatch_log_context(item, decision=decision, reason=reason),
+        )
         return None
     if not enabled:
+        log_event(
+            "workflow_chain_continuation_dispatch_skipped",
+            **_workflow_chain_dispatch_log_context(item, decision=decision, reason="task_dispatch_disabled"),
+        )
         return TaskDispatchResult()
     if continuation_store is None:
+        log_event(
+            "workflow_chain_continuation_dispatch_skipped",
+            **_workflow_chain_dispatch_log_context(item, decision=decision, reason="missing_continuation_store"),
+        )
         return TaskDispatchResult(
             attempted=True,
             success=False,
@@ -306,11 +336,48 @@ async def dispatch_workflow_chain_continuation(
     )
     existing_work_item_id = continuation.next_work_item_id or continuation.current_work_item_id
     if decision == ReviewDecisionType.NEEDS_CHANGES and existing_work_item_id:
+        log_event(
+            "workflow_chain_continuation_dispatch_skipped",
+            **_workflow_chain_dispatch_log_context(
+                item,
+                decision=decision,
+                reason="needs_changes_existing_work_item",
+                continuation_id=continuation.continuation_id,
+                continuation_status=continuation.status.value,
+                idempotency_key=continuation.idempotency_key,
+                existing_work_item_id=existing_work_item_id,
+            ),
+        )
         continuation = continuation_store.mark_workflow_continuation_changes_requested(continuation.continuation_id)
         return _continuation_result(continuation, success=True, agent_bus_attempted=False)
     if not created and continuation.status in _EXISTING_WORK_STATUSES and existing_work_item_id:
+        log_event(
+            "workflow_chain_continuation_dispatch_skipped",
+            **_workflow_chain_dispatch_log_context(
+                item,
+                decision=decision,
+                reason="existing_continuation_reused",
+                continuation_id=continuation.continuation_id,
+                continuation_status=continuation.status.value,
+                idempotency_key=continuation.idempotency_key,
+                existing_work_item_id=existing_work_item_id,
+            ),
+        )
         return _continuation_result(continuation, success=True, agent_bus_attempted=False)
 
+    log_event(
+        "workflow_chain_continuation_before_agent_bus_dispatch",
+        **_workflow_chain_dispatch_log_context(
+            item,
+            decision=decision,
+            reason="dispatching_agent_bus_work_item",
+            continuation_id=continuation.continuation_id,
+            continuation_status=continuation.status.value,
+            idempotency_key=continuation.idempotency_key,
+            continuation_created=created,
+            agent_bus_enabled=agent_bus_enabled,
+        ),
+    )
     return await _dispatch_existing_workflow_continuation(
         continuation,
         agent_bus_client=agent_bus_client,
@@ -908,6 +975,37 @@ def _workflow_chain_log_context(item: Any) -> dict[str, Any]:
         "pr_number": context.get("pr_number"),
         "branch": context.get("branch"),
         "status": "FINAL_STEP",
+    }
+
+
+def _workflow_chain_dispatch_log_context(
+    item: Any,
+    *,
+    decision: ReviewDecisionType,
+    reason: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    runtime_context = _dict_value(getattr(item, "runtime_validation_context", None))
+    review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
+    workflow_chain = _canonical_workflow_chain_from_context(review_dispatch, runtime_context)
+    context = workflow_chain_context_from_item(item) or {}
+    return {
+        "reason": reason,
+        "decision": getattr(decision, "value", str(decision)),
+        "workflow_chain_id": context.get("workflow_chain_id") or workflow_chain.get("workflow_chain_id"),
+        "current_workflow_step": context.get("workflow_step") or workflow_chain.get("workflow_step") or workflow_chain.get("current_workflow_step"),
+        "next_workflow_step": context.get("next_workflow_step") or workflow_chain.get("next_workflow_step"),
+        "work_item_id": context.get("previous_work_item_id") or _string_or_none(getattr(item, "agent_bus_work_item_id", None)),
+        "review_item_id": _string_or_none(getattr(item, "id", None)),
+        "pr_number": context.get("pr_number") or _int_or_none(getattr(item, "pr_number", None)),
+        "branch": context.get("branch") or _string_or_none(getattr(item, "branch", None)),
+        "repository": context.get("repository") or _string_or_none(getattr(item, "repo_full_name", None)),
+        "runtime_context_populated": bool(runtime_context),
+        "review_dispatch_populated": bool(review_dispatch),
+        "workflow_chain_populated": bool(workflow_chain),
+        "workflow_chain_length": len(workflow_chain or {}),
+        "workflow_chain_keys": sorted(workflow_chain.keys()) if workflow_chain else [],
+        **extra,
     }
 
 
