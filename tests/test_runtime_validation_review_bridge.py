@@ -11,6 +11,7 @@ from app.circuit_runtime_validation import (
     RuntimeValidationHermesSummary,
     RuntimeValidationResult,
 )
+from app.circuit_runtime_validation_routes import _normalize_runtime_result_identifiers
 from app.config import Settings, get_settings
 from app.event_store import event_store
 from app.hermes_contract import runtime_validation_request_from_parsed
@@ -134,6 +135,35 @@ def _result(status: str = "completed", *, validation_id: str = "validation-1") -
         bb2=RuntimeValidationBB2Packet(packet_created=True, review_status=review_status, review_context={"source": "test"}),
         error=error,
     )
+
+
+def test_runtime_result_identifiers_normalized_from_review_dispatch_workflow_chain() -> None:
+    result = _result("completed", validation_id="validation-chain").model_copy(
+        update={
+            "work_item_id": None,
+            "workflow_id": None,
+            "evidence_id": None,
+            "review_agent": None,
+            "review_dispatch": {
+                "workflow_chain": {
+                    "workflow_chain_id": "wf-chain-21-29",
+                    "workflow_step": "WF21",
+                    "current_workflow_step": "WF21",
+                    "next_workflow_step": "WF22",
+                    "work_item_id": "agent-bus-wf21",
+                },
+                "evidence_packet_id": "evidence-wf21",
+                "review_agent": "bb2",
+            },
+        }
+    )
+
+    _normalize_runtime_result_identifiers(result)
+
+    assert result.workflow_id == "wf-chain-21-29"
+    assert result.work_item_id == "agent-bus-wf21"
+    assert result.evidence_id == "evidence-wf21"
+    assert result.review_agent == "bb2"
 
 
 def test_successful_hermes_result_enqueues_bb2_review_with_evidence() -> None:
