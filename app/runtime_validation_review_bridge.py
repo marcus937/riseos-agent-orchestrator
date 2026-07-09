@@ -116,6 +116,7 @@ def enqueue_review_from_runtime_validation(
         "wf_chain_metadata_runtime_bridge_after_metadata_normalize",
         item,
     )
+    _log_review_item_chain_hydrated(item, result)
     result.review_dispatch = _dict_value(item.runtime_validation_context.get("review_dispatch"))
 
     terminal_stage = ReviewLifecycleStage.RUNTIME_VALIDATION_COMPLETED if result.status == "completed" else ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED
@@ -291,6 +292,27 @@ def _log_wf_chain_hydrated(context: dict[str, Any]) -> None:
     )
 
 
+def _log_review_item_chain_hydrated(item: ReviewWorkItem, result: RuntimeValidationResult) -> None:
+    context = item.runtime_validation_context if isinstance(item.runtime_validation_context, dict) else {}
+    review_dispatch = _dict_value(context.get("review_dispatch"))
+    workflow_chain = _workflow_chain_object(review_dispatch, [context, review_dispatch])
+    log_event(
+        "runtime_validation_review_item_workflow_chain_hydrated",
+        review_item_id=item.id,
+        runtime_validation_id=result.validation_id,
+        workflow_id=context.get("workflow_id") or result.workflow_id,
+        work_item_id=context.get("work_item_id") or result.work_item_id,
+        repository=item.repo_full_name or result.repo,
+        pr_number=item.pr_number or result.pr_number,
+        branch=item.branch or result.branch,
+        workflow_chain_present=bool(workflow_chain),
+        workflow_chain_length=len(workflow_chain),
+        workflow_chain_keys=sorted(str(key) for key in workflow_chain.keys()),
+        review_dispatch_workflow_chain_present=bool(_dict_value(review_dispatch.get("workflow_chain"))),
+        runtime_context_workflow_chain_present=bool(_dict_value(context.get("workflow_chain"))),
+    )
+
+
 def _attach_runtime_validation_context(item: ReviewWorkItem, result: RuntimeValidationResult, *, digest: str) -> None:
     item.repo_full_name = item.repo_full_name or result.repo
     item.branch = item.branch or result.branch
@@ -314,7 +336,7 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
     if not hydrated:
         return base
     merged = dict(base)
-    for key in _WORKFLOW_CHAIN_KEYS:
+    for key in _WORKFLOW_COMPANION_KEYS:
         value = hydrated.get(key)
         if _value_present(value) and not _value_present(merged.get(key)):
             merged[key] = value
@@ -359,6 +381,7 @@ def _normalize_workflow_chain_metadata(
 ) -> None:
     review_dispatch = dict(_dict_value(context.get("review_dispatch")))
     sources = [review_dispatch, context]
+    sources.extend(_runtime_result_sources(result))
     sources.extend(_agent_bus_work_item_sources(agent_bus_work_item))
     sources.extend(_agent_bus_runtime_validation_sources(review_dispatch))
     sources.extend(_agent_task_sources(result, item=item, agent_task_store=agent_task_store))
@@ -404,22 +427,69 @@ def _normalize_workflow_chain_metadata(
         review_dispatch["workflow_chain"] = workflow_chain
         context["workflow_chain"] = workflow_chain
 
-    for key in _WORKFLOW_CHAIN_KEYS:
-        if key in review_dispatch and _value_present(review_dispatch.get(key)):
-            context.setdefault(key, review_dispatch[key])
+    metadata = dict(_dict_value(context.get("metadata")))
+    if workflow_chain:
+        metadata.setdefault("workflow_chain", workflow_chain)
+    for key in _WORKFLOW_COMPANION_KEYS:
+        value = review_dispatch.get(key)
+        if _value_present(value):
+            context.setdefault(key, value)
+            metadata.setdefault(key, value)
     context["review_dispatch"] = review_dispatch
+    if metadata:
+        context["metadata"] = metadata
     log_event(
         "runtime_validation_workflow_metadata_normalized",
         runtime_validation_id=result.validation_id,
-        workflow_id=result.workflow_id,
-        work_item_id=result.work_item_id,
+        workflow_id=context.get("workflow_id") or result.workflow_id,
+        work_item_id=context.get("work_item_id") or result.work_item_id,
         repository=result.repo,
         pr_number=result.pr_number,
         branch=result.branch,
         workflow_chain_id=review_dispatch.get("workflow_chain_id"),
         workflow_step=review_dispatch.get("workflow_step"),
         next_workflow_step=review_dispatch.get("next_workflow_step"),
+        workflow_chain_present=bool(workflow_chain),
+        workflow_chain_length=len(workflow_chain),
     )
+
+
+def _runtime_result_sources(result: RuntimeValidationResult) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    _append_nested_runtime_sources(sources, result.review_dispatch)
+    try:
+        bb2 = result.bb2.model_dump(mode="json")
+    except Exception:
+        bb2 = {}
+    _append_nested_runtime_sources(sources, bb2)
+    _append_nested_runtime_sources(sources, getattr(result.bb2, "review_context", None))
+    return sources
+
+
+def _append_nested_runtime_sources(sources: list[dict[str, Any]], value: Any) -> None:
+    if not isinstance(value, dict) or value in sources:
+        return
+    sources.append(value)
+    for key in (
+        "metadata",
+        "workflow_chain",
+        "_workflow_chain",
+        "workflowChain",
+        "review_dispatch",
+        "reviewDispatch",
+        "runtime_context",
+        "runtimeContext",
+        "runtime_validation_context",
+        "runtimeValidationContext",
+        "bb2_packet",
+        "review_context",
+        "reviewContext",
+        "agent_bus_work_item",
+        "work_item",
+    ):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            _append_nested_runtime_sources(sources, nested)
 
 
 def _agent_bus_work_item_sources(agent_bus_work_item: dict[str, Any] | None) -> list[dict[str, Any]]:
