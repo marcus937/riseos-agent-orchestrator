@@ -131,6 +131,7 @@ def test_successful_runtime_validation_with_chain_metadata_processes_continuatio
                 risk_level=RiskLevel.LOW,
                 summary="Hermes runtime validation passed.",
                 required_changes=[],
+                next_task_prompt="Proceed with workflow-chain continuation after Hermes approval.",
                 human_review_required=True,
             ),
             intended_next_actions=[],
