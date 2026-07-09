@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 from app.circuit_runtime_validation import (
@@ -10,10 +12,11 @@ from app.circuit_runtime_validation import (
     RuntimeValidationRequest,
     RuntimeValidationResult,
 )
+from app.circuit_runtime_validation_routes import _process_runtime_review_continuation_if_unscheduled
 from app.config import Settings
 from app.github_events import GitHubEventType, parse_github_event
-from app.reviewer.decision import ReviewDecisionType
-from app.review_queue import ReviewWorkItem, ReviewWorkItemStatus
+from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel
+from app.review_queue import ReviewProcessResponse, ReviewWorkItem, ReviewWorkItemStatus, review_queue
 from app.runtime_validation_review_bridge import enqueue_review_from_runtime_validation
 from app.storage import SQLiteStateStore
 from app.task_dispatch import workflow_chain_continuation_for_decision
@@ -102,8 +105,63 @@ def test_wf20_resume_preserves_workflow_chain_until_continuation_selection(tmp_p
     assert continuation["previous_work_item_id"] == AGENT_BUS_WORK_ITEM_ID
 
 
-def _settings() -> Settings:
-    return Settings(enable_runtime_validation_review_bridge=True)
+def test_successful_runtime_validation_with_chain_metadata_processes_continuation_when_unscheduled() -> None:
+    review_queue.reset()
+    review_item = enqueue_review_from_runtime_validation(
+        _runtime_validation_result(),
+        _settings(enable_auto_review_processing=False),
+        existing_item=_waiting_review_item(),
+    )
+    assert review_item is not None
+    observed_continuations: list[dict[str, Any]] = []
+
+    async def processor(item: ReviewWorkItem, settings: Settings) -> ReviewProcessResponse:
+        continuation = workflow_chain_continuation_for_decision(
+            item,
+            ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+            base_branch=BASE_BRANCH,
+        )
+        assert continuation is not None
+        observed_continuations.append(continuation)
+        return ReviewProcessResponse(
+            work_item=item,
+            decision=ReviewDecision(
+                decision=ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW,
+                confidence=1.0,
+                risk_level=RiskLevel.LOW,
+                summary="Hermes runtime validation passed.",
+                required_changes=[],
+                human_review_required=True,
+            ),
+            intended_next_actions=[],
+            dry_run=False,
+        )
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(review_processor=processor)))
+
+    processed = asyncio.run(
+        _process_runtime_review_continuation_if_unscheduled(
+            review_item,
+            request,
+            _settings(enable_auto_review_processing=False),
+            None,
+            scheduled=False,
+        )
+    )
+
+    assert processed is True
+    assert observed_continuations[0]["previous_workflow_step"] == "WF21"
+    assert observed_continuations[0]["next_workflow_step"] == "WF22"
+    assert observed_continuations[0]["following_workflow_step"] == "WF23"
+    assert observed_continuations[0]["repository"] == REPO
+    assert observed_continuations[0]["pr_number"] == PR_NUMBER
+    assert observed_continuations[0]["branch"] == BRANCH
+
+
+def _settings(**overrides: Any) -> Settings:
+    data = {"enable_runtime_validation_review_bridge": True}
+    data.update(overrides)
+    return Settings(**data)
 
 
 def _workflow_chain() -> dict[str, Any]:
