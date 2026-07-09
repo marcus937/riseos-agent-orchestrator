@@ -322,6 +322,16 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
         value = hydrated.get(key)
         if isinstance(value, dict) and value:
             merged.setdefault(key, value)
+
+    base_metadata = dict(_dict_value(base.get("metadata")))
+    hydrated_metadata = _dict_value(hydrated.get("metadata"))
+    for key, value in hydrated_metadata.items():
+        if _value_present(value) and not _value_present(base_metadata.get(key)):
+            base_metadata[key] = value
+    workflow_chain = _dict_value(merged.get("workflow_chain")) or _dict_value(merged.get("_workflow_chain"))
+    if workflow_chain:
+        base_metadata.setdefault("workflow_chain", workflow_chain)
+
     base_dispatch = dict(_dict_value(base.get("review_dispatch")))
     hydrated_dispatch = _dict_value(hydrated.get("review_dispatch"))
     for key, value in hydrated_dispatch.items():
@@ -331,8 +341,11 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
         value = hydrated_dispatch.get(key)
         if isinstance(value, dict) and value:
             base_dispatch.setdefault(key, value)
+            base_metadata.setdefault("workflow_chain", value)
     if base_dispatch:
         merged["review_dispatch"] = base_dispatch
+    if base_metadata:
+        merged["metadata"] = base_metadata
     return merged
 
 
@@ -584,7 +597,6 @@ def _dict_value(value: Any) -> dict[str, Any]:
 
 def _string_or_none(value: Any) -> str | None:
     if value is None:
-        return None
     text = str(value).strip()
     return text or None
 
