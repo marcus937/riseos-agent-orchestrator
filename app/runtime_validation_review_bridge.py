@@ -119,7 +119,33 @@ def enqueue_review_from_runtime_validation(
         item,
     )
     _log_review_item_chain_hydrated(item, result)
-    result.review_dispatch = _dict_value(item.runtime_validation_context.get("review_dispatch"))
+    before_result_dispatch = _dict_value(result.review_dispatch)
+    assigned_dispatch = _dict_value(item.runtime_validation_context.get("review_dispatch"))
+    _log_workflow_chain_assignment(
+        event="workflow_chain_assignment_before",
+        assignment="result.review_dispatch",
+        source_object=item.runtime_validation_context,
+        source_object_label="ReviewWorkItem.runtime_validation_context",
+        target_object=result,
+        before_value=before_result_dispatch,
+        after_value=assigned_dispatch,
+        runtime_validation_id=result.validation_id,
+        workflow_id=result.workflow_id,
+        work_item_id=result.work_item_id,
+    )
+    result.review_dispatch = assigned_dispatch
+    _log_workflow_chain_assignment(
+        event="workflow_chain_assignment_after",
+        assignment="result.review_dispatch",
+        source_object=item.runtime_validation_context,
+        source_object_label="ReviewWorkItem.runtime_validation_context",
+        target_object=result,
+        before_value=before_result_dispatch,
+        after_value=result.review_dispatch,
+        runtime_validation_id=result.validation_id,
+        workflow_id=result.workflow_id,
+        work_item_id=result.work_item_id,
+    )
 
     terminal_stage = ReviewLifecycleStage.RUNTIME_VALIDATION_COMPLETED if result.status == "completed" else ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED
     record_lifecycle_stage(item, terminal_stage, error=result.error)
@@ -165,7 +191,7 @@ def runtime_validation_context_from_result(result: RuntimeValidationResult) -> d
     evidence = result.evidence.model_dump(mode="json")
     hermes = result.hermes.model_dump(mode="json")
     bb2 = result.bb2.model_dump(mode="json")
-    return {
+    context = {
         "source": RUNTIME_REVIEW_SOURCE,
         "validation_id": result.validation_id,
         "validation_status": result.status,
@@ -200,6 +226,19 @@ def runtime_validation_context_from_result(result: RuntimeValidationResult) -> d
         "evidence": evidence,
         "bb2_packet": bb2,
     }
+    _log_workflow_chain_assignment(
+        event="workflow_chain_assignment_after",
+        assignment="runtime_context.review_dispatch",
+        source_object=result,
+        source_object_label="RuntimeValidationResult",
+        target_object=context,
+        before_value=None,
+        after_value=context.get("review_dispatch"),
+        runtime_validation_id=result.validation_id,
+        workflow_id=result.workflow_id,
+        work_item_id=result.work_item_id,
+    )
+    return context
 
 
 def _review_work_item_from_runtime_validation(
@@ -252,6 +291,11 @@ def _hydrate_runtime_context_from_agent_bus_work_item(
 ) -> None:
     sources = _agent_bus_work_item_sources(agent_bus_work_item)
     if not sources:
+        _log_workflow_chain_missing_source(
+            source_object=agent_bus_work_item,
+            source_object_label="agent_bus_work_item",
+            reason="agent_bus_work_item_sources_empty",
+        )
         return
 
     review_dispatch = dict(_dict_value(context.get("review_dispatch")))
@@ -269,9 +313,72 @@ def _hydrate_runtime_context_from_agent_bus_work_item(
 
     workflow_chain = _workflow_chain_object(review_dispatch, sources)
     if workflow_chain:
+        before_context = context.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="runtime_context.workflow_chain",
+            source_object=sources,
+            source_object_label="agent_bus_work_item_sources",
+            target_object=context,
+            before_value=before_context,
+            after_value=workflow_chain,
+        )
         context["workflow_chain"] = workflow_chain
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="runtime_context.workflow_chain",
+            source_object=sources,
+            source_object_label="agent_bus_work_item_sources",
+            target_object=context,
+            before_value=before_context,
+            after_value=context.get("workflow_chain"),
+        )
+        before_dispatch = review_dispatch.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="review_dispatch.workflow_chain",
+            source_object=context,
+            source_object_label="runtime_context",
+            target_object=review_dispatch,
+            before_value=before_dispatch,
+            after_value=workflow_chain,
+        )
         review_dispatch.setdefault("workflow_chain", workflow_chain)
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="review_dispatch.workflow_chain",
+            source_object=context,
+            source_object_label="runtime_context",
+            target_object=review_dispatch,
+            before_value=before_dispatch,
+            after_value=review_dispatch.get("workflow_chain"),
+        )
+        before_metadata = metadata.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="metadata.workflow_chain",
+            source_object=review_dispatch,
+            source_object_label="review_dispatch",
+            target_object=metadata,
+            before_value=before_metadata,
+            after_value=workflow_chain,
+        )
         metadata.setdefault("workflow_chain", workflow_chain)
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="metadata.workflow_chain",
+            source_object=review_dispatch,
+            source_object_label="review_dispatch",
+            target_object=metadata,
+            before_value=before_metadata,
+            after_value=metadata.get("workflow_chain"),
+        )
+    else:
+        _log_workflow_chain_missing_source(
+            source_object=sources,
+            source_object_label="agent_bus_work_item_sources",
+            reason="workflow_chain_not_found",
+        )
 
     for key in _WORKFLOW_COMPANION_KEYS:
         value = _first_present_from_sources(sources, key, _camelize(key))
@@ -368,6 +475,117 @@ def _log_existing_review_work_item_constructor_bypassed(item: ReviewWorkItem, re
     )
 
 
+def _log_workflow_chain_assignment(
+    *,
+    event: str,
+    assignment: str,
+    source_object: Any,
+    source_object_label: str,
+    target_object: Any,
+    before_value: Any,
+    after_value: Any,
+    runtime_validation_id: str | None = None,
+    workflow_id: str | None = None,
+    work_item_id: str | None = None,
+) -> None:
+    before_chain = _chain_or_self(before_value)
+    after_chain = _chain_or_self(after_value)
+    source_chain = _chain_from_any(source_object)
+    log_event(
+        event,
+        assignment=assignment,
+        source_object=source_object_label,
+        source_object_type=type(source_object).__name__,
+        target_object_type=type(target_object).__name__,
+        runtime_validation_id=runtime_validation_id,
+        workflow_id=workflow_id,
+        work_item_id=work_item_id,
+        source_workflow_chain_present=bool(source_chain),
+        source_workflow_chain=source_chain or None,
+        before_workflow_chain_present=bool(before_chain),
+        before_workflow_chain=before_chain or None,
+        after_workflow_chain_present=bool(after_chain),
+        after_workflow_chain=after_chain or None,
+        current_workflow_step=_first_present_from_sources([after_chain, before_chain, source_chain], "current_workflow_step", "currentWorkflowStep", "workflow_step", "workflowStep"),
+        next_workflow_step=_first_present_from_sources([after_chain, before_chain, source_chain], "next_workflow_step", "nextWorkflowStep"),
+        _include_nulls=True,
+    )
+    if not source_chain:
+        _log_workflow_chain_missing_source(
+            source_object=source_object,
+            source_object_label=source_object_label,
+            reason=f"source_lacks_workflow_chain_for_{assignment}",
+            runtime_validation_id=runtime_validation_id,
+            workflow_id=workflow_id,
+            work_item_id=work_item_id,
+        )
+
+
+def _log_workflow_chain_missing_source(
+    *,
+    source_object: Any,
+    source_object_label: str,
+    reason: str,
+    runtime_validation_id: str | None = None,
+    workflow_id: str | None = None,
+    work_item_id: str | None = None,
+) -> None:
+    log_event(
+        "workflow_chain_source_missing",
+        source_object=source_object_label,
+        source_object_type=type(source_object).__name__,
+        reason=reason,
+        runtime_validation_id=runtime_validation_id,
+        workflow_id=workflow_id,
+        work_item_id=work_item_id,
+        _include_nulls=True,
+    )
+
+
+def _chain_or_self(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and any(key in value for key in _WORKFLOW_CHAIN_KEYS | {"workflow_chain", "_workflow_chain", "workflowChain"}):
+        return _chain_from_any(value) or value
+    return _chain_from_any(value)
+
+
+def _chain_from_any(value: Any) -> dict[str, Any]:
+    if isinstance(value, list):
+        for entry in value:
+            chain = _chain_from_any(entry)
+            if chain:
+                return chain
+        return {}
+    if hasattr(value, "model_dump"):
+        try:
+            value = value.model_dump(mode="json")
+        except Exception:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    for key in ("workflow_chain", "_workflow_chain", "workflowChain"):
+        nested = value.get(key)
+        if isinstance(nested, dict) and nested:
+            return nested
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict):
+        chain = _chain_from_any(metadata)
+        if chain:
+            return chain
+    review_dispatch = value.get("review_dispatch") or value.get("reviewDispatch")
+    if isinstance(review_dispatch, dict):
+        chain = _chain_from_any(review_dispatch)
+        if chain:
+            return chain
+    runtime_context = value.get("runtime_context") or value.get("runtimeContext") or value.get("runtime_validation_context") or value.get("runtimeValidationContext")
+    if isinstance(runtime_context, dict):
+        chain = _chain_from_any(runtime_context)
+        if chain:
+            return chain
+    if any(key in value for key in _WORKFLOW_CHAIN_KEYS):
+        return {key: value[key] for key in _WORKFLOW_CHAIN_KEYS if key in value and _value_present(value.get(key))}
+    return {}
+
+
 def _log_review_item_chain_hydrated(item: ReviewWorkItem, result: RuntimeValidationResult) -> None:
     context = item.runtime_validation_context if isinstance(item.runtime_validation_context, dict) else {}
     review_dispatch = _dict_value(context.get("review_dispatch"))
@@ -419,7 +637,26 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
     for key in ("workflow_chain", "_workflow_chain"):
         value = hydrated.get(key)
         if isinstance(value, dict) and value:
+            before_merged = merged.get(key)
+            _log_workflow_chain_assignment(
+                event="workflow_chain_assignment_before",
+                assignment=f"merged.{key}",
+                source_object=hydrated,
+                source_object_label="hydrated runtime context",
+                target_object=merged,
+                before_value=before_merged,
+                after_value=value,
+            )
             merged.setdefault(key, value)
+            _log_workflow_chain_assignment(
+                event="workflow_chain_assignment_after",
+                assignment=f"merged.{key}",
+                source_object=hydrated,
+                source_object_label="hydrated runtime context",
+                target_object=merged,
+                before_value=before_merged,
+                after_value=merged.get(key),
+            )
 
     base_metadata = dict(_dict_value(base.get("metadata")))
     hydrated_metadata = _dict_value(hydrated.get("metadata"))
@@ -428,7 +665,26 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
             base_metadata[key] = value
     workflow_chain = _dict_value(merged.get("workflow_chain")) or _dict_value(merged.get("_workflow_chain"))
     if workflow_chain:
+        before_metadata = base_metadata.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="metadata.workflow_chain",
+            source_object=merged,
+            source_object_label="merged runtime context",
+            target_object=base_metadata,
+            before_value=before_metadata,
+            after_value=workflow_chain,
+        )
         base_metadata.setdefault("workflow_chain", workflow_chain)
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="metadata.workflow_chain",
+            source_object=merged,
+            source_object_label="merged runtime context",
+            target_object=base_metadata,
+            before_value=before_metadata,
+            after_value=base_metadata.get("workflow_chain"),
+        )
 
     base_dispatch = dict(_dict_value(base.get("review_dispatch")))
     hydrated_dispatch = _dict_value(hydrated.get("review_dispatch"))
@@ -438,8 +694,27 @@ def _merge_runtime_validation_context(base: dict[str, object], hydrated: dict[st
     for key in ("workflow_chain", "_workflow_chain"):
         value = hydrated_dispatch.get(key)
         if isinstance(value, dict) and value:
+            before_dispatch = base_dispatch.get(key)
+            _log_workflow_chain_assignment(
+                event="workflow_chain_assignment_before",
+                assignment=f"review_dispatch.{key}",
+                source_object=hydrated_dispatch,
+                source_object_label="hydrated review_dispatch",
+                target_object=base_dispatch,
+                before_value=before_dispatch,
+                after_value=value,
+            )
             base_dispatch.setdefault(key, value)
             base_metadata.setdefault("workflow_chain", value)
+            _log_workflow_chain_assignment(
+                event="workflow_chain_assignment_after",
+                assignment=f"review_dispatch.{key}",
+                source_object=hydrated_dispatch,
+                source_object_label="hydrated review_dispatch",
+                target_object=base_dispatch,
+                before_value=before_dispatch,
+                after_value=base_dispatch.get(key),
+            )
     if base_dispatch:
         merged["review_dispatch"] = base_dispatch
     if base_metadata:
@@ -463,6 +738,14 @@ def _normalize_workflow_chain_metadata(
     sources.extend(_agent_task_sources(result, item=item, agent_task_store=agent_task_store))
 
     if not any(_contains_workflow_metadata(source) for source in sources):
+        _log_workflow_chain_missing_source(
+            source_object=sources,
+            source_object_label="runtime normalization sources",
+            reason="no_source_contains_workflow_metadata",
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
         context["review_dispatch"] = review_dispatch
         return
 
@@ -500,12 +783,96 @@ def _normalize_workflow_chain_metadata(
 
     workflow_chain = _workflow_chain_object(review_dispatch, sources)
     if workflow_chain:
+        before_dispatch = review_dispatch.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="review_dispatch.workflow_chain",
+            source_object=sources,
+            source_object_label="runtime normalization sources",
+            target_object=review_dispatch,
+            before_value=before_dispatch,
+            after_value=workflow_chain,
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
         review_dispatch["workflow_chain"] = workflow_chain
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="review_dispatch.workflow_chain",
+            source_object=sources,
+            source_object_label="runtime normalization sources",
+            target_object=review_dispatch,
+            before_value=before_dispatch,
+            after_value=review_dispatch.get("workflow_chain"),
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
+        before_context = context.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="runtime_context.workflow_chain",
+            source_object=review_dispatch,
+            source_object_label="review_dispatch",
+            target_object=context,
+            before_value=before_context,
+            after_value=workflow_chain,
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
         context["workflow_chain"] = workflow_chain
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="runtime_context.workflow_chain",
+            source_object=review_dispatch,
+            source_object_label="review_dispatch",
+            target_object=context,
+            before_value=before_context,
+            after_value=context.get("workflow_chain"),
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
+    else:
+        _log_workflow_chain_missing_source(
+            source_object=sources,
+            source_object_label="runtime normalization sources",
+            reason="workflow_chain_object_empty",
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
 
     metadata = dict(_dict_value(context.get("metadata")))
     if workflow_chain:
+        before_metadata = metadata.get("workflow_chain")
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_before",
+            assignment="metadata.workflow_chain",
+            source_object=context,
+            source_object_label="runtime_context",
+            target_object=metadata,
+            before_value=before_metadata,
+            after_value=workflow_chain,
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
         metadata.setdefault("workflow_chain", workflow_chain)
+        _log_workflow_chain_assignment(
+            event="workflow_chain_assignment_after",
+            assignment="metadata.workflow_chain",
+            source_object=context,
+            source_object_label="runtime_context",
+            target_object=metadata,
+            before_value=before_metadata,
+            after_value=metadata.get("workflow_chain"),
+            runtime_validation_id=result.validation_id,
+            workflow_id=result.workflow_id,
+            work_item_id=result.work_item_id,
+        )
     for key in _WORKFLOW_COMPANION_KEYS:
         value = review_dispatch.get(key)
         if _value_present(value):
