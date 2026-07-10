@@ -100,6 +100,8 @@ def enqueue_review_from_runtime_validation(
             agent_task_store=agent_task_store,
             agent_bus_work_item=agent_bus_work_item,
         )
+    else:
+        _log_existing_review_work_item_constructor_bypassed(item, result)
     _attach_runtime_validation_context(item, result, digest=digest)
     log_workflow_chain_availability(
         "wf_chain_metadata_runtime_bridge_after_context_attach",
@@ -217,24 +219,31 @@ def _review_work_item_from_runtime_validation(
         agent_bus_work_item=agent_bus_work_item,
     )
     _log_wf_chain_hydrated(runtime_context)
-    return ReviewWorkItem(
-        id=str(uuid4()),
-        created_at=now,
-        updated_at=now,
-        repo_full_name=result.repo,
-        event_type=GitHubEventType.PULL_REQUEST if result.pr_number is not None else GitHubEventType.ISSUES,
-        branch=result.branch,
-        base_branch=result.base_branch,
-        commit_sha=_commit_sha_from_result(result),
-        issue_number=result.issue_number,
-        pr_number=result.pr_number,
-        labels=["bb-review-needed", "runtime-agent"],
-        agent_bus_work_item_id=result.work_item_id,
-        runtime_validation_id=result.validation_id,
-        runtime_validation_status=result.status,
-        runtime_validation_completed_at=result.completed_at,
-        runtime_validation_context=runtime_context,
+    constructor_args = {
+        "id": str(uuid4()),
+        "created_at": now,
+        "updated_at": now,
+        "repo_full_name": result.repo,
+        "event_type": GitHubEventType.PULL_REQUEST if result.pr_number is not None else GitHubEventType.ISSUES,
+        "branch": result.branch,
+        "base_branch": result.base_branch,
+        "commit_sha": _commit_sha_from_result(result),
+        "issue_number": result.issue_number,
+        "pr_number": result.pr_number,
+        "labels": ["bb-review-needed", "runtime-agent"],
+        "agent_bus_work_item_id": result.work_item_id,
+        "runtime_validation_id": result.validation_id,
+        "runtime_validation_status": result.status,
+        "runtime_validation_completed_at": result.completed_at,
+        "runtime_validation_context": runtime_context,
+    }
+    _log_review_work_item_constructor_input(
+        result=result,
+        runtime_context=runtime_context,
+        constructor_args=constructor_args,
+        source_object="RuntimeValidationResult",
     )
+    return ReviewWorkItem(**constructor_args)
 
 
 def _hydrate_runtime_context_from_agent_bus_work_item(
@@ -289,6 +298,73 @@ def _log_wf_chain_hydrated(context: dict[str, Any]) -> None:
         runtime_validation_id=context.get("runtime_validation_id") or context.get("validation_id"),
         work_item_id=context.get("work_item_id"),
         correlation_id=context.get("correlation_id"),
+    )
+
+
+def _log_review_work_item_constructor_input(
+    *,
+    result: RuntimeValidationResult,
+    runtime_context: dict[str, Any],
+    constructor_args: dict[str, Any],
+    source_object: str,
+) -> None:
+    review_dispatch = _dict_value(runtime_context.get("review_dispatch"))
+    metadata = _dict_value(runtime_context.get("metadata"))
+    bb2_context = result.bb2.review_context if isinstance(result.bb2.review_context, dict) else {}
+    workflow_chain = _workflow_chain_object(review_dispatch, [runtime_context, review_dispatch, metadata, bb2_context])
+    log_event(
+        "review_work_item_constructor_input",
+        source_object=source_object,
+        source_object_type=type(result).__name__,
+        source_object_module=type(result).__module__,
+        runtime_validation_id=result.validation_id,
+        workflow_id=runtime_context.get("workflow_id") or result.workflow_id,
+        work_item_id=runtime_context.get("work_item_id") or result.work_item_id,
+        repository=result.repo,
+        pr_number=result.pr_number,
+        branch=result.branch,
+        constructor_arg_keys=sorted(str(key) for key in constructor_args.keys()),
+        constructor_runtime_context_keys=sorted(str(key) for key in _dict_value(constructor_args.get("runtime_validation_context")).keys()),
+        review_dispatch_keys=sorted(str(key) for key in review_dispatch.keys()),
+        runtime_context_keys=sorted(str(key) for key in runtime_context.keys()),
+        metadata_keys=sorted(str(key) for key in metadata.keys()),
+        bb2_review_context_keys=sorted(str(key) for key in bb2_context.keys()),
+        workflow_chain=workflow_chain or None,
+        workflow_chain_populated=bool(workflow_chain),
+        workflow_chain_length=len(workflow_chain),
+        current_workflow_step=_first_present_from_sources([workflow_chain, runtime_context, review_dispatch, metadata, bb2_context], "current_workflow_step", "currentWorkflowStep", "workflow_step", "workflowStep"),
+        next_workflow_step=_first_present_from_sources([workflow_chain, runtime_context, review_dispatch, metadata, bb2_context], "next_workflow_step", "nextWorkflowStep"),
+        source_review_dispatch_keys=sorted(str(key) for key in _dict_value(result.review_dispatch).keys()),
+        source_bb2_packet_keys=sorted(str(key) for key in result.bb2.model_dump(mode="json").keys()),
+        _include_nulls=True,
+    )
+
+
+def _log_existing_review_work_item_constructor_bypassed(item: ReviewWorkItem, result: RuntimeValidationResult) -> None:
+    context = item.runtime_validation_context if isinstance(item.runtime_validation_context, dict) else {}
+    review_dispatch = _dict_value(context.get("review_dispatch"))
+    metadata = _dict_value(context.get("metadata"))
+    workflow_chain = _workflow_chain_object(review_dispatch, [context, review_dispatch, metadata])
+    log_event(
+        "review_work_item_constructor_bypassed_existing_item",
+        source_object="existing ReviewWorkItem",
+        source_object_type=type(item).__name__,
+        runtime_validation_id=result.validation_id,
+        review_item_id=item.id,
+        workflow_id=context.get("workflow_id") or result.workflow_id,
+        work_item_id=context.get("work_item_id") or result.work_item_id,
+        repository=item.repo_full_name or result.repo,
+        pr_number=item.pr_number or result.pr_number,
+        branch=item.branch or result.branch,
+        review_dispatch_keys=sorted(str(key) for key in review_dispatch.keys()),
+        runtime_context_keys=sorted(str(key) for key in context.keys()),
+        metadata_keys=sorted(str(key) for key in metadata.keys()),
+        workflow_chain=workflow_chain or None,
+        workflow_chain_populated=bool(workflow_chain),
+        workflow_chain_length=len(workflow_chain),
+        current_workflow_step=_first_present_from_sources([workflow_chain, context, review_dispatch, metadata], "current_workflow_step", "currentWorkflowStep", "workflow_step", "workflowStep"),
+        next_workflow_step=_first_present_from_sources([workflow_chain, context, review_dispatch, metadata], "next_workflow_step", "nextWorkflowStep"),
+        _include_nulls=True,
     )
 
 
