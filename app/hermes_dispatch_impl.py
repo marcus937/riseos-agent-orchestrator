@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.correlation import branch_from_parsed, correlation_id_from_parsed
+from app.frontend_validation import HermesValidationState, requires_runtime_validation, validation_profile_for_work
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.slack_issue_dispatch import SlackClient, SlackIssueDispatchClient, _sanitize_slack_text
 
@@ -20,13 +21,14 @@ CANONICAL_HERMES_TRIGGER_LABELS = ("runtime-agent", "playwright", "bb-review-nee
 CIRCUIT_HERMES_PR_ACTIONS = {"opened", "synchronize", "ready_for_review"}
 CIRCUIT_WORK_BRANCH = "agent-integration"
 CIRCUIT_BASE_BRANCH = "main"
+CODEX_M2_BRANCH_PREFIX = "codex-m2/"
 HERMES_COMMANDS = {"/hermes validate", "run hermes validation", "needs hermes validation", "hermes validate", "runtime validation requested"}
 TERMINAL_LABELS = {"wontfix", "duplicate", "invalid", "agent-blocked", "agent-merged"}
 BB2_BLOCK_LABEL = "bb2-blocked"
 DGX_LABELS = {"dgx", "runtime-agent", "evidence", "mission-control", "frontend", "playwright"}
 EVIDENCE_FILES = ["summary.json", "logs.json", "console.json", "network.json", "page.json", "screenshot.png"]
 PLACEHOLDER_TARGETS = {"https://example.com", "http://example.com"}
-PREVIEW_URL_FIELD_NAMES = {"preview_url", "previewurl", "preview", "target_url", "targeturl", "environment_url", "environmenturl", "deployment_url", "deploymenturl", "details_url", "detailsurl"}
+PREVIEW_URL_FIELD_NAMES = {"preview_url", "previewurl", "preview", "target_url", "targeturl", "environment_url", "environmenturl", "deployment_url", "deploymenturl", "details_url", "detailsurl", "target_url", "targeturl"}
 URL_PATTERN = re.compile(r"https?://[^\s\]>)\"'}]+")
 SECRET_REDACTION = "[REDACTED]"
 SECRET_PATTERNS = (
@@ -82,6 +84,8 @@ class HermesDispatchResult(BaseModel):
     attempted: bool = False
     success: bool = False
     status: Literal["PASSED", "FAILED", "BLOCKED", "SKIPPED"] = "SKIPPED"
+    validation_state: HermesValidationState | None = None
+    validation_profile: str | None = None
     hermes_node: Literal["M2", "DGX"] = "M2"
     dispatch_key: str | None = None
     correlation_id: str | None = None
@@ -141,49 +145,53 @@ async def dispatch_hermes_runtime_validation(parsed: ParsedGitHubEvent, settings
     explicit = _explicit_hermes_command(parsed.comment_body)
     route = _route_reason(parsed)
     node = _hermes_node(parsed.labels)
-    _log_hermes_decision(parsed, settings, "hermes_route_evaluated", node=node, route=route, explicit_command=explicit, labels_request_hermes=_labels_request_hermes(parsed.labels, explicit=explicit), runtime_label_match=bool(set(parsed.labels) & HERMES_RUNTIME_LABELS), lifecycle_label_match=bool(set(parsed.labels) & HERMES_LIFECYCLE_LABELS), terminal_label_match=bool(set(parsed.labels) & TERMINAL_LABELS), bb2_blocked=BB2_BLOCK_LABEL in set(parsed.labels))
+    validation_profile = validation_profile_for_work(parsed.repository)
+    _log_hermes_decision(parsed, settings, "hermes_route_evaluated", node=node, route=route, explicit_command=explicit, validation_profile=validation_profile, labels_request_hermes=_labels_request_hermes(parsed.labels, explicit=explicit), runtime_label_match=bool(set(parsed.labels) & HERMES_RUNTIME_LABELS), lifecycle_label_match=bool(set(parsed.labels) & HERMES_LIFECYCLE_LABELS), terminal_label_match=bool(set(parsed.labels) & TERMINAL_LABELS), bb2_blocked=BB2_BLOCK_LABEL in set(parsed.labels))
     if route is None:
-        return HermesDispatchResult(hermes_node=node, skipped_reason="Event does not require Hermes runtime validation.")
-    target_url, target_source = await _resolve_hermes_target_url(parsed, settings, github_client=github_client)
+        return HermesDispatchResult(hermes_node=node, validation_profile=validation_profile, skipped_reason="Event does not require Hermes runtime validation.")
+    target_url, target_source, target_blocker = await _resolve_hermes_target_url(parsed, settings, github_client=github_client)
     preview_url = target_url if _is_vercel_preview_url(target_url) else None
     correlation_id = _hermes_correlation_id(parsed, node=node)
-    dispatch_key = _dispatch_key(parsed, target_url, node=node)
+    dispatch_key = _dispatch_key(parsed, target_url or "not-ready", node=node)
     disabled = _dispatch_disabled(settings, node=node)
     missing_config = _missing_config(settings, node=node)
-    target_error = _target_url_error(target_url)
-    eligibility_blocker = _eligibility_blocker(dispatch_key=dispatch_key, disabled=disabled, missing_config=missing_config, target_error=target_error)
-    _log_hermes_decision(parsed, settings, "hermes_dispatch_eligibility_evaluated", node=node, route=route, dispatch_key=dispatch_key, dispatch_key_available=dispatch_key is not None, dispatch_enabled=eligibility_blocker is None, disabled_reason=disabled, missing_config=missing_config, target_error=target_error, eligibility_blocker=eligibility_blocker, hermes_target=target_url, hermes_target_source=target_source, preview_url=preview_url)
+    target_error = _target_url_error(target_url) if target_url else None
+    eligibility_blocker = _eligibility_blocker(dispatch_key=dispatch_key, disabled=disabled, missing_config=missing_config, target_error=target_blocker or target_error)
+    _log_hermes_decision(parsed, settings, "hermes_dispatch_eligibility_evaluated", node=node, route=route, dispatch_key=dispatch_key, dispatch_key_available=dispatch_key is not None, dispatch_enabled=eligibility_blocker is None, disabled_reason=disabled, missing_config=missing_config, target_error=target_error, target_blocker=target_blocker, eligibility_blocker=eligibility_blocker, hermes_target=target_url, hermes_target_source=target_source, preview_url=preview_url)
     if dispatch_key is None:
-        return HermesDispatchResult(hermes_node=node, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, skipped_reason="Hermes dispatch key could not be determined.")
+        return HermesDispatchResult(hermes_node=node, validation_profile=validation_profile, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, skipped_reason="Hermes dispatch key could not be determined.")
+    if target_blocker == "No successful Vercel preview deployment is available for this PR head SHA yet.":
+        return HermesDispatchResult(hermes_node=node, validation_profile=validation_profile, validation_state=HermesValidationState.HERMES_VALIDATION_REQUESTED, dispatch_key=dispatch_key, correlation_id=correlation_id, target_source=target_source, skipped_reason=target_blocker)
     if disabled:
-        return HermesDispatchResult(hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, skipped_reason=disabled)
+        return HermesDispatchResult(hermes_node=node, validation_profile=validation_profile, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, skipped_reason=disabled)
     if node == "DGX":
-        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error="Hermes DGX dispatch is not supported yet.", label="agent-blocked")
+        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", validation_state=HermesValidationState.HERMES_VALIDATION_BLOCKED, validation_profile=validation_profile, hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error="Hermes DGX dispatch is not supported yet.", label="agent-blocked")
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
     if missing_config:
-        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error=missing_config, label="agent-blocked")
+        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", validation_state=HermesValidationState.HERMES_VALIDATION_BLOCKED, validation_profile=validation_profile, hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error=missing_config, label="agent-blocked")
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
-    if target_error:
-        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error=target_error, label="agent-blocked")
+    if target_blocker or target_error:
+        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", validation_state=HermesValidationState.HERMES_VALIDATION_BLOCKED, validation_profile=validation_profile, hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error=target_blocker or target_error, label="agent-blocked")
         return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
     if not registry.claim_hermes_dispatch(dispatch_key):
-        return HermesDispatchResult(hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, skipped_reason=f"Hermes validation was already dispatched for this {_duplicate_subject_label(parsed)} commit and target.")
+        return HermesDispatchResult(hermes_node=node, validation_profile=validation_profile, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, skipped_reason=f"Hermes validation was already dispatched for this {_duplicate_subject_label(parsed)} commit and target.")
     trigger_label_error = await _apply_canonical_hermes_trigger_labels(parsed, settings, route=route, github_client=github_client)
     owns_client = hermes_client is None
     hermes_client = hermes_client or HermesHTTPClient()
-    payload = build_hermes_job_payload(parsed, settings, node=node, correlation_id=correlation_id, route=route, target_url=target_url, target_source=target_source)
+    payload = build_hermes_job_payload(parsed, settings, node=node, correlation_id=correlation_id, route=route, target_url=target_url, target_source=target_source, validation_profile=validation_profile)
     base_url = _node_base_url(settings, node)
     token = _node_token(settings, node)
-    _log_hermes_decision(parsed, settings, "hermes_post_attempted", node=node, route=route, dispatch_key=dispatch_key, hermes_base_url=base_url, hermes_target=target_url, hermes_target_source=target_source, preview_url=preview_url, payload_correlation_id=payload["correlationId"], payload_type=payload["type"])
+    _log_hermes_decision(parsed, settings, "hermes_post_attempted", node=node, route=route, dispatch_key=dispatch_key, hermes_base_url=base_url, hermes_target=target_url, hermes_target_source=target_source, preview_url=preview_url, payload_correlation_id=payload["correlationId"], payload_type=payload["type"], validation_state=HermesValidationState.HERMES_VALIDATION_RUNNING)
     try:
         response = await hermes_client.post_job(base_url, token, payload)
         result = _result_from_hermes_response(response, node=node, dispatch_key=dispatch_key, correlation_id=correlation_id)
+        result.validation_profile = validation_profile
         result.target_url = target_url
         result.target_source = target_source
         result.preview_url = preview_url
         if result.job_id and result.status in {"PASSED", "FAILED"}:
             result.evidence = await _collect_hermes_evidence(hermes_client, base_url, token, result.job_id, settings)
-        _log_hermes_decision(parsed, settings, "hermes_post_completed", node=node, route=route, dispatch_key=dispatch_key, status=result.status, success=result.success, job_id=result.job_id, evidence_manifest_fetched=result.evidence.manifest_fetched if result.evidence else None, evidence_bundle_fetched=result.evidence.bundle_fetched if result.evidence else None, hermes_target=target_url, preview_url=preview_url)
+        _log_hermes_decision(parsed, settings, "hermes_post_completed", node=node, route=route, dispatch_key=dispatch_key, status=result.status, validation_state=result.validation_state, success=result.success, job_id=result.job_id, evidence_manifest_fetched=result.evidence.manifest_fetched if result.evidence else None, evidence_bundle_fetched=result.evidence.bundle_fetched if result.evidence else None, hermes_target=target_url, preview_url=preview_url)
         if trigger_label_error and not result.error:
             result.error = trigger_label_error
         if result.evidence and result.evidence.error and not result.error:
@@ -194,14 +202,14 @@ async def dispatch_hermes_runtime_validation(parsed: ParsedGitHubEvent, settings
     except Exception as exc:
         error = _redact_sensitive_text(str(exc), settings)
         _log_hermes_decision(parsed, settings, "hermes_post_failed", node=node, route=route, dispatch_key=dispatch_key, error=error)
-        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error=error, label="agent-blocked")
+        result = HermesDispatchResult(attempted=True, success=False, status="BLOCKED", validation_state=HermesValidationState.HERMES_VALIDATION_BLOCKED, validation_profile=validation_profile, hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, target_url=target_url, target_source=target_source, preview_url=preview_url, error=error, label="agent-blocked")
     finally:
         if owns_client and hasattr(hermes_client, "aclose"):
             await hermes_client.aclose()
     return await _notify_and_writeback(parsed, settings, result, slack_client=slack_client, github_client=github_client)
 
 
-def build_hermes_job_payload(parsed: ParsedGitHubEvent, settings: Settings, *, node: Literal["M2", "DGX"] = "M2", correlation_id: str | None = None, route: str | None = None, target_url: str | None = None, target_source: str | None = None) -> dict[str, Any]:
+def build_hermes_job_payload(parsed: ParsedGitHubEvent, settings: Settings, *, node: Literal["M2", "DGX"] = "M2", correlation_id: str | None = None, route: str | None = None, target_url: str | None = None, target_source: str | None = None, validation_profile: str | None = None) -> dict[str, Any]:
     commit_sha = parsed.head_sha or "unknown"
     subject_kind = _subject_kind(parsed)
     subject_number = _subject_number(parsed)
@@ -209,15 +217,23 @@ def build_hermes_job_payload(parsed: ParsedGitHubEvent, settings: Settings, *, n
     resolved_target_url = target_url or _preview_url_from_payload(parsed.raw) or settings.hermes_default_target
     preview_url = resolved_target_url if _is_vercel_preview_url(resolved_target_url) else None
     labels = set(parsed.labels)
-    if _is_circuit_pr(parsed):
+    if _is_auto_hermes_pr(parsed):
         labels.update(CANONICAL_HERMES_TRIGGER_LABELS)
-    payload: dict[str, Any] = {"source": "riseos-agent-orchestrator", "repo": parsed.repository, "subjectType": subject_kind, "commitSha": commit_sha, "branch": branch, "targetUrl": resolved_target_url, "previewUrl": preview_url, "preview_url": preview_url, "validationType": "playwright", "validation_type": "playwright", "targetSource": target_source or ("vercel_preview" if preview_url else "hermes_default_target"), "screenshotName": f"{subject_kind}-{subject_number}-validation.png", "labels": sorted(labels), "hermesNode": node, "trigger": route}
+    profile = validation_profile or validation_profile_for_work(parsed.repository) or "frontend_playwright"
+    payload: dict[str, Any] = {"source": "riseos-agent-orchestrator", "repo": parsed.repository, "subjectType": subject_kind, "commitSha": commit_sha, "branch": branch, "targetUrl": resolved_target_url, "previewUrl": preview_url, "preview_url": preview_url, "validationType": "playwright", "validation_type": "playwright", "validationProfile": profile, "validation_profile": profile, "targetSource": target_source or ("vercel_preview" if preview_url else "hermes_default_target"), "screenshotName": f"{subject_kind}-{subject_number}-validation.png", "labels": sorted(labels), "hermesNode": node, "trigger": route, "requiredAssertions": _required_assertions(profile)}
     if subject_kind == "issue":
         payload["issueNumber"] = subject_number
     else:
         payload["prNumber"] = subject_number
         payload["pr_number"] = subject_number
-    return {"type": "playwright", "dryRun": False, "targetUrl": resolved_target_url, "preview_url": preview_url, "validation_type": "playwright", "correlationId": correlation_id or _hermes_correlation_id(parsed, node=node), "payload": payload}
+    return {"type": "playwright", "dryRun": False, "targetUrl": resolved_target_url, "preview_url": preview_url, "validation_type": "playwright", "validation_profile": profile, "correlationId": correlation_id or _hermes_correlation_id(parsed, node=node), "payload": payload}
+
+
+def _required_assertions(profile: str) -> list[str]:
+    base = ["page_loads", "screenshot_captured", "no_fatal_console_errors", "network_summary_generated"]
+    if profile == "jmc_frontend_preview_v1":
+        return [*base, "no_repeated_404_polling_failures", "no_repeated_422_polling_failures", "overview_renders", "node_fleet_renders", "route_summary_renders", "workforce_renders", "debug_panel_loads"]
+    return base
 
 
 def build_hermes_slack_message(parsed: ParsedGitHubEvent, result: HermesDispatchResult, settings: Settings) -> str:
@@ -228,11 +244,11 @@ def build_hermes_slack_message(parsed: ParsedGitHubEvent, result: HermesDispatch
     target = _sanitize_slack_text(_redact_sensitive_text(result.target_url or settings.hermes_default_target, settings) or "unknown")
     if result.status == "BLOCKED":
         reason = _sanitize_slack_text(_redact_sensitive_text(result.error or result.skipped_reason or "Hermes validation could not run.", settings))
-        return f"Hermes validation blocked\nReason: {reason}\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nNode: {result.hermes_node}\nCorrelation ID: {_sanitize_slack_text(result.correlation_id or 'unknown')}"
+        return f"Hermes validation blocked\nReason: {reason}\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nProfile: {result.validation_profile or 'unknown'}\nNode: {result.hermes_node}\nCorrelation ID: {_sanitize_slack_text(result.correlation_id or 'unknown')}"
     if result.status in {"PASSED", "FAILED"}:
         evidence_status = "manifest fetched" if result.evidence and result.evidence.manifest_fetched else "manifest unavailable"
-        return f"Hermes validation complete\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nStatus: {result.status}\nJob ID: {_sanitize_slack_text(result.job_id or 'unknown')}\nEvidence: {evidence_status}; {', '.join(EVIDENCE_FILES)}"
-    return f"Hermes validation requested\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nLabels: {labels}\nNode: {result.hermes_node}\nCorrelation ID: {_sanitize_slack_text(result.correlation_id or 'unknown')}"
+        return f"Hermes validation complete\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nProfile: {result.validation_profile or 'unknown'}\nStatus: {result.status}\nJob ID: {_sanitize_slack_text(result.job_id or 'unknown')}\nEvidence: {evidence_status}; {', '.join(EVIDENCE_FILES)}"
+    return f"Hermes validation requested\nRepo: {repo}\n{subject_label}: #{subject_number}\nTarget: {target}\nProfile: {result.validation_profile or 'unknown'}\nLabels: {labels}\nNode: {result.hermes_node}\nCorrelation ID: {_sanitize_slack_text(result.correlation_id or 'unknown')}"
 
 
 def build_hermes_pr_comment(parsed: ParsedGitHubEvent, result: HermesDispatchResult, settings: Settings) -> str:
@@ -242,12 +258,12 @@ def build_hermes_pr_comment(parsed: ParsedGitHubEvent, result: HermesDispatchRes
     verified = "Orchestrator detected that Hermes validation could not run." if result.status == "BLOCKED" else "Hermes dispatch routing completed and produced this validation status."
     return (
         "## Hermes Runtime Validation\n\n"
-        f"Status: {result.status}\nHermes node: {result.hermes_node}\nRepository: {parsed.repository or 'unknown'}\n{_github_subject_label(parsed)}: #{_subject_number(parsed) or 'unknown'}\nTarget: {target_url}\nPreview URL: {preview_url}\nTarget source: {result.target_source or 'hermes_default_target'}\nJob ID: {result.job_id or 'not-created'}\nCorrelation ID: {result.correlation_id or 'unknown'}\nCommit: {commit_sha}\n\n"
+        f"Status: {result.status}\nValidation state: {result.validation_state or 'unknown'}\nValidation profile: {result.validation_profile or 'unknown'}\nHermes node: {result.hermes_node}\nRepository: {parsed.repository or 'unknown'}\n{_github_subject_label(parsed)}: #{_subject_number(parsed) or 'unknown'}\nTarget: {target_url}\nPreview URL: {preview_url}\nTarget source: {result.target_source or 'hermes_default_target'}\nJob ID: {result.job_id or 'not-created'}\nCorrelation ID: {result.correlation_id or 'unknown'}\nCommit: {commit_sha}\n\n"
         f"{_build_evidence_packet_section(result, settings)}\n"
         "### VERIFIED\n"
         f"- {verified}\n- This label is runtime evidence only and is not merge approval.\n\n"
         "### ASSUMED\n"
-        "- Runtime target is the resolved PR preview URL when available, otherwise the configured Hermes default target.\n"
+        "- Runtime target is the resolved PR preview URL when available.\n"
         "- Phase 1 keeps raw artifacts retrievable through the authenticated Hermes evidence API rather than uploading them to GitHub.\n\n"
         "### UNVERIFIED\n"
         f"- {_unverified_evidence_line(result, settings)}\n"
@@ -338,6 +354,8 @@ def _route_reason(parsed: ParsedGitHubEvent) -> str | None:
             return f"pull_request_{parsed.action}"
         if parsed.action in CIRCUIT_HERMES_PR_ACTIONS and _is_circuit_pr(parsed):
             return f"pull_request_{parsed.action}_circuit_hermes"
+        if parsed.action in CIRCUIT_HERMES_PR_ACTIONS and _is_frontend_codex_pr(parsed):
+            return f"pull_request_{parsed.action}_frontend_hermes"
     if parsed.event_type == GitHubEventType.PULL_REQUEST_REVIEW and parsed.action == "submitted" and _labels_request_hermes(parsed.labels, explicit=explicit):
         return "pull_request_review_submitted"
     return None
@@ -361,13 +379,21 @@ def _is_circuit_pr(parsed: ParsedGitHubEvent) -> bool:
     return parsed.event_type == GitHubEventType.PULL_REQUEST and parsed.repository is not None and parsed.head_repo_full_name == parsed.repository and parsed.base_repo_full_name == parsed.repository and parsed.head_ref == CIRCUIT_WORK_BRANCH and parsed.base_ref == CIRCUIT_BASE_BRANCH
 
 
+def _is_frontend_codex_pr(parsed: ParsedGitHubEvent) -> bool:
+    return parsed.event_type == GitHubEventType.PULL_REQUEST and requires_runtime_validation(parsed.repository) and parsed.repository is not None and parsed.head_repo_full_name == parsed.repository and parsed.base_repo_full_name == parsed.repository and (parsed.head_ref or "").startswith(CODEX_M2_BRANCH_PREFIX) and parsed.base_ref == CIRCUIT_WORK_BRANCH
+
+
+def _is_auto_hermes_pr(parsed: ParsedGitHubEvent) -> bool:
+    return _is_circuit_pr(parsed) or _is_frontend_codex_pr(parsed)
+
+
 def _missing_canonical_hermes_trigger_labels(labels: list[str]) -> list[str]:
     existing = set(labels)
     return [label for label in CANONICAL_HERMES_TRIGGER_LABELS if label not in existing]
 
 
 async def _apply_canonical_hermes_trigger_labels(parsed: ParsedGitHubEvent, settings: Settings, *, route: str, github_client: HermesWritebackClient | None) -> str | None:
-    if not settings.enable_github_writeback or github_client is None or not route.endswith("_circuit_hermes"):
+    if not settings.enable_github_writeback or github_client is None or not (route.endswith("_circuit_hermes") or route.endswith("_frontend_hermes")):
         return None
     if not parsed.repository or not parsed.pull_request_number:
         return "Cannot apply Hermes trigger labels without repository and PR number."
@@ -400,29 +426,66 @@ def _missing_config(settings: Settings, *, node: Literal["M2", "DGX"]) -> str | 
     return None
 
 
-async def _resolve_hermes_target_url(parsed: ParsedGitHubEvent, settings: Settings, *, github_client: HermesWritebackClient | None) -> tuple[str, str]:
+async def _resolve_hermes_target_url(parsed: ParsedGitHubEvent, settings: Settings, *, github_client: HermesWritebackClient | None) -> tuple[str | None, str, str | None]:
     payload_preview_url = _preview_url_from_payload(parsed.raw)
     if payload_preview_url:
-        return payload_preview_url, "webhook_payload_preview_url"
-    github_preview_url = await _preview_url_from_github_commit_metadata(parsed, github_client)
+        return payload_preview_url, "webhook_payload_preview_url", None
+    github_preview_url, github_preview_state = await _preview_url_from_github_commit_metadata(parsed, github_client)
     if github_preview_url:
-        return github_preview_url, "github_commit_preview_url"
-    return settings.hermes_default_target, "hermes_default_target"
+        return github_preview_url, "github_commit_preview_url", None
+    if github_preview_state == "failed":
+        return None, "vercel_preview_failed", "HERMES_VALIDATION_BLOCKED: Vercel deployment failed for this PR head SHA."
+    if parsed.event_type == GitHubEventType.PULL_REQUEST and github_client is not None and _github_client_can_check_preview(github_client):
+        return None, "vercel_preview_pending", "No successful Vercel preview deployment is available for this PR head SHA yet."
+    return settings.hermes_default_target, "hermes_default_target", None
 
 
-async def _preview_url_from_github_commit_metadata(parsed: ParsedGitHubEvent, github_client: HermesWritebackClient | None) -> str | None:
+async def _preview_url_from_github_commit_metadata(parsed: ParsedGitHubEvent, github_client: HermesWritebackClient | None) -> tuple[str | None, str | None]:
     if github_client is None or not parsed.repository or not parsed.head_sha:
-        return None
+        return None, None
+    state: str | None = None
     for method_name in ("list_commit_statuses", "list_check_runs_for_ref"):
         method = getattr(github_client, method_name, None)
         if method is not None:
             try:
-                preview_url = _preview_url_from_payload(await method(parsed.repository, parsed.head_sha))
-                if preview_url:
-                    return preview_url
+                metadata = await method(parsed.repository, parsed.head_sha)
+                preview_url = _preview_url_from_payload(metadata)
+                if preview_url and _metadata_contains_successful_vercel(metadata):
+                    return preview_url, "ready"
+                if _metadata_contains_failed_vercel(metadata):
+                    state = "failed"
             except Exception:
                 pass
-    return None
+    return None, state
+
+
+def _github_client_can_check_preview(github_client: HermesWritebackClient | None) -> bool:
+    return github_client is not None and (hasattr(github_client, "list_commit_statuses") or hasattr(github_client, "list_check_runs_for_ref"))
+
+
+def _metadata_contains_successful_vercel(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_metadata_contains_successful_vercel(item) for item in value)
+    if isinstance(value, dict):
+        text = json.dumps(value, default=str).lower()
+        context = str(value.get("context") or value.get("name") or value.get("app") or "").lower()
+        state = str(value.get("state") or value.get("conclusion") or value.get("status") or "").lower()
+        if "vercel" in text and state in {"success", "completed", "ready"} and _preview_url_from_payload(value):
+            return True
+        return any(_metadata_contains_successful_vercel(item) for item in value.values()) if "vercel" not in context else False
+    return False
+
+
+def _metadata_contains_failed_vercel(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_metadata_contains_failed_vercel(item) for item in value)
+    if isinstance(value, dict):
+        text = json.dumps(value, default=str).lower()
+        state = str(value.get("state") or value.get("conclusion") or value.get("status") or "").lower()
+        if "vercel" in text and state in {"failure", "failed", "error", "cancelled"}:
+            return True
+        return any(_metadata_contains_failed_vercel(item) for item in value.values())
+    return False
 
 
 def _preview_url_from_payload(value: Any) -> str | None:
@@ -472,7 +535,9 @@ def _is_vercel_preview_url(url: str | None) -> bool:
     return parsed.scheme in {"http", "https"} and (host == "vercel.app" or host.endswith(".vercel.app"))
 
 
-def _target_url_error(target_url: str) -> str | None:
+def _target_url_error(target_url: str | None) -> str | None:
+    if not target_url:
+        return "Hermes target URL is not available."
     parsed = urlparse(target_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return "HERMES_DEFAULT_TARGET must be an absolute http or https URL."
@@ -566,19 +631,22 @@ def _result_from_hermes_response(response: dict[str, Any], *, node: Literal["M2"
         status: Literal["FAILED", "PASSED", "BLOCKED", "SKIPPED"] = "FAILED"
         label = "agent-revisions"
         success = False
+        validation_state = HermesValidationState.HERMES_VALIDATION_FAILED
     elif status_value in {"BLOCKED", "ERROR"}:
         status = "BLOCKED"
         label = "agent-blocked"
         success = False
+        validation_state = HermesValidationState.HERMES_VALIDATION_BLOCKED
     else:
         status = "PASSED"
         label = "agent-verified"
         success = True
-    return HermesDispatchResult(attempted=True, success=success, status=status, hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, label=label, job_id=str(job_id) if job_id else None)
+        validation_state = HermesValidationState.HERMES_VALIDATION_PASSED
+    return HermesDispatchResult(attempted=True, success=success, status=status, validation_state=validation_state, hermes_node=node, dispatch_key=dispatch_key, correlation_id=correlation_id, label=label, job_id=str(job_id) if job_id else None)
 
 
 async def _notify_and_writeback(parsed: ParsedGitHubEvent, settings: Settings, result: HermesDispatchResult, *, slack_client: SlackIssueDispatchClient | None, github_client: HermesWritebackClient | None) -> HermesDispatchResult:
-    request_message = build_hermes_slack_message(parsed, HermesDispatchResult(hermes_node=result.hermes_node, correlation_id=result.correlation_id, target_url=result.target_url, target_source=result.target_source, preview_url=result.preview_url), settings)
+    request_message = build_hermes_slack_message(parsed, HermesDispatchResult(hermes_node=result.hermes_node, validation_profile=result.validation_profile, correlation_id=result.correlation_id, target_url=result.target_url, target_source=result.target_source, preview_url=result.preview_url), settings)
     final_message = build_hermes_slack_message(parsed, result, settings)
     result.message = final_message
     owns_slack = slack_client is None
@@ -603,6 +671,11 @@ async def _notify_and_writeback(parsed: ParsedGitHubEvent, settings: Settings, r
             try:
                 await github_client.post_issue_comment(parsed.repository, subject_number, comment)
                 await github_client.apply_label(parsed.repository, subject_number, result.label)
+                create_status = getattr(github_client, "create_commit_status", None)
+                if create_status is not None and parsed.head_sha:
+                    state = "success" if result.status == "PASSED" else "failure"
+                    description = f"Hermes Playwright Validation {result.status.lower()}"
+                    await create_status(parsed.repository, parsed.head_sha, state, "Hermes Playwright Validation", description)
             except Exception as exc:
                 result.error = result.error or _redact_sensitive_text(str(exc), settings)
     return result
