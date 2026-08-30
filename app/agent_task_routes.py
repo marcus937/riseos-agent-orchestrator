@@ -152,7 +152,16 @@ async def record_agent_task_execution_result(
 
 
 def _agent_task_create_response(task: AgentTask) -> AgentTaskCreateResponse:
-    return AgentTaskCreateResponse(task_id=task.task_id, status=task.status, created_at=task.created_at, target_agent=task.target_agent, dependency_task_ids=task.dependency_task_ids, blocked=task.blocked, blocked_by=task.blocked_by)
+    return AgentTaskCreateResponse(
+        task_id=task.task_id,
+        status=task.status,
+        created_at=task.created_at,
+        target_agent=task.target_agent,
+        agent_bus_work_item_id=task.agent_bus_work_item_id,
+        dependency_task_ids=task.dependency_task_ids,
+        blocked=task.blocked,
+        blocked_by=task.blocked_by,
+    )
 
 
 def _refresh_all_agent_tasks(store: AgentTaskStore) -> list[AgentTask]:

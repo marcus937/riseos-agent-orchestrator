@@ -108,6 +108,7 @@ def test_create_agent_task_persists_queued_task_and_lifecycle_events(tmp_path, m
     body = created.json()
     assert body["status"] == "queued"
     assert body["target_agent"] == "codex-m2"
+    assert body["agent_bus_work_item_id"] is None
     assert body["task_id"].startswith("agtask-")
     assert listed.status_code == 200
     tasks = listed.json()
@@ -135,6 +136,7 @@ def test_create_agent_task_dispatches_agent_bus_work_item_when_enabled(tmp_path,
     assert created.status_code == 200
     body = created.json()
     assert body["status"] == "assigned"
+    assert body["agent_bus_work_item_id"] == "work-item-123"
     assert fake_bus.payloads[0]["repository"] == "marcus937/riseos-agent-orchestrator"
     assert fake_bus.payloads[0]["owner_agent"] == "codex-m2"
     assert fake_bus.payloads[0]["review_agent"] == "bb2"

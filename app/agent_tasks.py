@@ -65,6 +65,7 @@ class AgentTaskCreateResponse(BaseModel):
     status: AgentTaskStatus
     created_at: datetime
     target_agent: str
+    agent_bus_work_item_id: str | None = None
     dependency_task_ids: list[str] = Field(default_factory=list)
     blocked: bool = False
     blocked_by: list[str] = Field(default_factory=list)
