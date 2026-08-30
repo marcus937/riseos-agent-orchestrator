@@ -1,3 +1,6 @@
+import json
+import sqlite3
+
 from app.event_store import event_record_from_parsed
 from app.github_events import parse_github_event
 from app.review_queue import ReviewWorkItemStatus, review_work_item_from_parsed
@@ -77,6 +80,51 @@ def test_queue_item_persists_and_reloads(tmp_path) -> None:
     assert reloaded.id == item.id
     assert reloaded.pr_number == 7
     assert reloaded.status == "pending_review"
+
+
+def test_queue_item_runtime_validation_context_preserves_workflow_chain(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {"number": 7, "head": {"ref": "feature/task", "sha": "def456"}},
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    workflow_chain = {
+        "workflow_chain_id": "chain-1",
+        "workflow_step": "WF21",
+        "current_workflow_step": "WF21",
+        "next_workflow_step": "WF22",
+        "workflow_steps": ["WF21", "WF22", "WF23"],
+    }
+    item.runtime_validation_context = {
+        "runtime_validation_id": "rv-1",
+        "workflow_id": "chain-1",
+        "workflow_chain": workflow_chain,
+        "review_dispatch": {
+            "workflow_chain": workflow_chain,
+            "workflow_step": "WF21",
+        },
+    }
+    store = SQLiteStateStore(str(db_path))
+
+    store.save_review_work_item(item)
+    with sqlite3.connect(db_path) as conn:
+        raw_json = conn.execute(
+            "SELECT runtime_validation_context FROM review_work_items WHERE id = ?",
+            (item.id,),
+        ).fetchone()[0]
+    raw_context = json.loads(raw_json)
+    reloaded = SQLiteStateStore(str(db_path)).get_review_work_item(item.id)
+
+    assert raw_context["workflow_chain"]["workflow_chain_id"] == "chain-1"
+    assert raw_context["review_dispatch"]["workflow_chain"]["current_workflow_step"] == "WF21"
+    assert reloaded is not None
+    assert reloaded.runtime_validation_context["workflow_chain"]["workflow_step"] == "WF21"
+    assert reloaded.runtime_validation_context["review_dispatch"]["workflow_chain"]["next_workflow_step"] == "WF22"
 
 
 def test_find_pending_duplicate_returns_existing_item(tmp_path) -> None:

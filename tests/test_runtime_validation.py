@@ -1,6 +1,9 @@
 import subprocess
 import sys
 
+from app.circuit_runtime_validation import RuntimeValidationRequest
+from app.circuit_runtime_validation_routes import _request_with_default_base_branch
+from app.config import Settings
 from app.runtime_validation import (
     RuntimeEndpoint,
     RuntimeHttpResponse,
@@ -14,6 +17,24 @@ from app.runtime_validation import (
 
 def test_build_url_normalizes_slashes() -> None:
     assert build_url("http://127.0.0.1:8000/", "/health") == "http://127.0.0.1:8000/health"
+
+
+def test_runtime_validation_defaults_codex_pr_base_to_work_branch() -> None:
+    settings = Settings(work_branch="agent-integration", base_branch="main")
+    request = RuntimeValidationRequest(repo="riseos/example", pr_number=90, branch="codex-m2/dependency-test")
+
+    normalized = _request_with_default_base_branch(request, settings)
+
+    assert normalized.base_branch == "agent-integration"
+
+
+def test_runtime_validation_defaults_work_branch_base_to_base_branch() -> None:
+    settings = Settings(work_branch="agent-integration", base_branch="main")
+    request = RuntimeValidationRequest(repo="riseos/example", pr_number=90, branch="agent-integration")
+
+    normalized = _request_with_default_base_branch(request, settings)
+
+    assert normalized.base_branch == "main"
 
 
 def test_wait_for_readiness_retries_until_success() -> None:

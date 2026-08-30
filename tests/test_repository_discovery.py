@@ -1,14 +1,17 @@
 import asyncio
+from datetime import UTC, datetime
 
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.repository_discovery import (
     InMemoryRepositoryRegistry,
     REQUIRED_WEBHOOK_EVENTS,
+    RepositoryRegistryRecord,
     RepositoryStatus,
     SQLiteRepositoryRegistry,
     WebhookStatus,
     discover_repositories,
+    ensure_orchestration_enabled_repository,
     repository_diagnostics,
 )
 from app.slack_issue_dispatch import InMemoryDispatchedIssueRegistry, dispatch_ready_issue_to_slack
@@ -48,6 +51,22 @@ class FakeSlackClient:
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def registry_record(
+    repo_full_name: str,
+    *,
+    status: RepositoryStatus = RepositoryStatus.ACTIVE,
+    archived: bool = False,
+    orchestration_enabled: bool = True,
+) -> RepositoryRegistryRecord:
+    return RepositoryRegistryRecord(
+        repo_full_name=repo_full_name,
+        status=status,
+        archived=archived,
+        orchestration_enabled=orchestration_enabled,
+        last_discovered_at=datetime.now(UTC),
+    )
 
 
 def test_discovery_detects_new_repository_and_registers_missing_webhook() -> None:
@@ -139,6 +158,69 @@ def test_sqlite_repository_registry_persists_records(tmp_path) -> None:
     assert reloaded.repo_full_name == "marcus937/persisted"
 
 
+def test_existing_registered_repository_is_preserved() -> None:
+    registry = InMemoryRepositoryRegistry()
+    existing = registry_record("marcus937/existing", orchestration_enabled=True)
+    registry.save_repository_registry_record(existing)
+
+    record = ensure_orchestration_enabled_repository(registry, "marcus937/existing")
+
+    assert record == existing
+    assert registry.list_repository_registry_records() == [existing]
+
+
+def test_new_trusted_owner_repository_auto_registers_enabled_record() -> None:
+    registry = InMemoryRepositoryRegistry()
+
+    record = ensure_orchestration_enabled_repository(registry, "marcus937/jarvis-mission-control")
+
+    assert record is not None
+    assert record.repo_full_name == "marcus937/jarvis-mission-control"
+    assert record.status == RepositoryStatus.ACTIVE
+    assert record.archived is False
+    assert record.orchestration_enabled is True
+    assert record.webhook_status == WebhookStatus.SKIPPED
+    assert registry.get_repository_registry_record("marcus937/jarvis-mission-control") == record
+
+
+def test_archived_repository_rejection_is_preserved() -> None:
+    registry = InMemoryRepositoryRegistry()
+    archived = registry_record(
+        "marcus937/archived",
+        status=RepositoryStatus.ARCHIVED,
+        archived=True,
+        orchestration_enabled=False,
+    )
+    registry.save_repository_registry_record(archived)
+
+    record = ensure_orchestration_enabled_repository(registry, "marcus937/archived")
+
+    assert record == archived
+    assert record.archived is True
+    assert record.orchestration_enabled is False
+
+
+def test_explicitly_disabled_repository_rejection_is_preserved() -> None:
+    registry = InMemoryRepositoryRegistry()
+    disabled = registry_record("marcus937/disabled", orchestration_enabled=False)
+    registry.save_repository_registry_record(disabled)
+
+    record = ensure_orchestration_enabled_repository(registry, "marcus937/disabled")
+
+    assert record == disabled
+    assert record.archived is False
+    assert record.orchestration_enabled is False
+
+
+def test_external_owner_repository_is_not_auto_registered() -> None:
+    registry = InMemoryRepositoryRegistry()
+
+    record = ensure_orchestration_enabled_repository(registry, "external/Project-Jarvis")
+
+    assert record is None
+    assert registry.list_repository_registry_records() == []
+
+
 def test_repository_diagnostics_include_health_dashboard_shape() -> None:
     registry = InMemoryRepositoryRegistry()
     settings = Settings(github_webhook_callback_url="https://orchestrator.example/webhooks/github")
@@ -148,11 +230,33 @@ def test_repository_diagnostics_include_health_dashboard_shape() -> None:
     diagnostics = repository_diagnostics(registry)
 
     assert diagnostics[0]["repo"] == "marcus937/dashboard"
+    assert diagnostics[0]["status"] == "active"
+    assert diagnostics[0]["archived"] is False
     assert diagnostics[0]["webhook_status"] == "healthy"
     assert diagnostics[0]["orchestration_enabled"] is True
     assert "last_event" in diagnostics[0]
     assert "last_work_item_generated" in diagnostics[0]
     assert "onboarding_failures" in diagnostics[0]
+
+
+def test_auto_registered_repository_appears_in_diagnostics() -> None:
+    registry = InMemoryRepositoryRegistry()
+
+    ensure_orchestration_enabled_repository(registry, "marcus937/Project-Jarvis")
+
+    diagnostics = repository_diagnostics(registry)
+    assert diagnostics == [
+        {
+            "repo": "marcus937/Project-Jarvis",
+            "status": "active",
+            "archived": False,
+            "webhook_status": "skipped",
+            "last_event": None,
+            "last_work_item_generated": None,
+            "orchestration_enabled": True,
+            "onboarding_failures": [],
+        }
+    ]
 
 
 def test_discovered_repository_can_dispatch_agent_ready_issue_to_slack() -> None:

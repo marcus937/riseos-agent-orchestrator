@@ -1,6 +1,7 @@
 from collections import Counter, deque
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -8,9 +9,11 @@ from pydantic import BaseModel, Field
 from app.github_events import GitHubEventType, ParsedGitHubEvent
 from app.reviewer.decision import ReviewDecision, ReviewDecisionType, RiskLevel
 from app.review_workflow import ReviewWorkflowResult
+from app.workflow_chain_diagnostics import log_review_work_item_identity, log_workflow_chain_availability
 
 
 class ReviewWorkItemStatus(StrEnum):
+    RUNTIME_VALIDATION_PENDING = "runtime_validation_pending"
     PENDING_REVIEW = "pending_review"
     REVIEWING = "reviewing"
     NEEDS_CHANGES = "needs_changes"
@@ -20,6 +23,10 @@ class ReviewWorkItemStatus(StrEnum):
 
 class ReviewLifecycleStage(StrEnum):
     REVIEW_QUEUED = "review_queued"
+    RUNTIME_VALIDATION_PENDING = "runtime_validation_pending"
+    RUNTIME_VALIDATION_COMPLETED = "runtime_validation_completed"
+    RUNTIME_VALIDATION_FAILED = "runtime_validation_failed"
+    BB2_REVIEW_REQUESTED_FROM_RUNTIME_VALIDATION = "bb2_review_requested_from_runtime_validation"
     WORKER_CLAIMED = "worker_claimed"
     REVIEW_STARTED = "review_started"
     OPENAI_REVIEW_ATTEMPTED = "openai_review_attempted"
@@ -29,6 +36,8 @@ class ReviewLifecycleStage(StrEnum):
     REVIEW_FAILED = "review_failed"
     GITHUB_WRITEBACK_STARTED = "github_writeback_started"
     GITHUB_WRITEBACK_COMPLETED = "github_writeback_completed"
+    AGENT_BUS_DISPATCH_STARTED = "agent_bus_dispatch_started"
+    AGENT_BUS_DISPATCH_COMPLETED = "agent_bus_dispatch_completed"
 
 
 class ReviewWorkItem(BaseModel):
@@ -38,6 +47,7 @@ class ReviewWorkItem(BaseModel):
     repo_full_name: str | None = None
     event_type: GitHubEventType
     branch: str | None = None
+    base_branch: str | None = None
     commit_sha: str | None = None
     issue_number: int | None = None
     pr_number: int | None = None
@@ -52,9 +62,57 @@ class ReviewWorkItem(BaseModel):
     github_writeback_started_at: datetime | None = None
     github_writeback_completed_at: datetime | None = None
     github_writeback_success: bool | None = None
+    agent_bus_dispatch_started_at: datetime | None = None
+    agent_bus_dispatch_completed_at: datetime | None = None
+    agent_bus_dispatch_success: bool | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
+    runtime_validation_id: str | None = None
+    runtime_validation_status: str | None = None
+    runtime_validation_digest: str | None = None
+    runtime_validation_completed_at: datetime | None = None
+    runtime_validation_context: dict[str, object] = Field(default_factory=dict)
     failure_count: int = 0
     last_failure_at: datetime | None = None
     last_error: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        log_review_work_item_identity(
+            "wf_chain_review_item_constructed_or_model_validated",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_post_init"),
+        )
+
+    def model_copy(self, *args: Any, **kwargs: Any) -> "ReviewWorkItem":
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_copy",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_copy"),
+        )
+        copied = super().model_copy(*args, **kwargs)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_model_copy",
+            copied,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_copy"),
+            source_id_review_item=id(self),
+        )
+        return copied
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_model_dump",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.model_dump"),
+        )
+        return super().model_dump(*args, **kwargs)
+
+    def dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_dict",
+            self,
+            caller=_review_item_diagnostic_caller("ReviewWorkItem.dict"),
+        )
+        return super().dict(*args, **kwargs)
 
 
 class ReviewProcessResponse(BaseModel):
@@ -77,6 +135,11 @@ class ReviewProcessResponse(BaseModel):
     task_dispatch_success: bool = False
     task_dispatch_issue_number: int | None = None
     task_dispatch_error: str | None = None
+    agent_bus_dispatch_attempted: bool = False
+    agent_bus_dispatch_success: bool = False
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
+    agent_bus_payload: dict[str, object] | None = None
     openai_review_attempted: bool = False
     openai_review_success: bool = False
     openai_review_error: str | None = None
@@ -94,15 +157,6 @@ class ReviewQueueCounters(BaseModel):
     blocked_count: int
 
 
-class ReviewQueueStats(BaseModel):
-    counters: ReviewQueueCounters
-    oldest_pending_age_seconds: float | None = None
-    newest_item_age_seconds: float | None = None
-    failure_count: int
-    recent_failure_count: int
-    last_failure_at: datetime | None = None
-
-
 class WorkerStats(BaseModel):
     auto_processing_enabled: bool
     claimed_count: int
@@ -111,6 +165,15 @@ class WorkerStats(BaseModel):
     failed_count: int
     last_claimed_at: datetime | None = None
     last_review_completed_at: datetime | None = None
+    last_failure_at: datetime | None = None
+
+
+class ReviewQueueStats(BaseModel):
+    counters: ReviewQueueCounters
+    oldest_pending_age_seconds: float | None = None
+    newest_item_age_seconds: float | None = None
+    failure_count: int
+    recent_failure_count: int
     last_failure_at: datetime | None = None
 
 
@@ -129,6 +192,14 @@ class ReviewLifecycleVisibility(BaseModel):
     github_writeback_started_at: datetime | None = None
     github_writeback_completed_at: datetime | None = None
     github_writeback_success: bool | None = None
+    agent_bus_dispatch_started_at: datetime | None = None
+    agent_bus_dispatch_completed_at: datetime | None = None
+    agent_bus_dispatch_success: bool | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
+    runtime_validation_id: str | None = None
+    runtime_validation_status: str | None = None
+    runtime_validation_completed_at: datetime | None = None
     failure_count: int
     last_failure_at: datetime | None = None
     last_error: str | None = None
@@ -161,10 +232,25 @@ class InMemoryReviewQueue:
         return self.add_if_absent(item)
 
     def add_if_absent(self, item: ReviewWorkItem) -> ReviewWorkItem:
+        log_review_work_item_identity(
+            "wf_chain_review_item_before_in_memory_add_if_absent",
+            item,
+            caller="InMemoryReviewQueue.add_if_absent",
+        )
         duplicate = self.find_pending_duplicate(item)
         if duplicate is not None:
+            log_review_work_item_identity(
+                "wf_chain_review_item_in_memory_duplicate_returned",
+                duplicate,
+                caller="InMemoryReviewQueue.add_if_absent",
+            )
             return duplicate
         self._items.append(item)
+        log_review_work_item_identity(
+            "wf_chain_review_item_after_in_memory_append",
+            item,
+            caller="InMemoryReviewQueue.add_if_absent",
+        )
         return item
 
     def find_pending_duplicate(self, item: ReviewWorkItem) -> ReviewWorkItem | None:
@@ -229,18 +315,25 @@ class InMemoryReviewQueue:
 
 def review_work_item_from_parsed(parsed: ParsedGitHubEvent) -> ReviewWorkItem:
     now = datetime.now(UTC)
-    return ReviewWorkItem(
+    item = ReviewWorkItem(
         id=str(uuid4()),
         created_at=now,
         updated_at=now,
         repo_full_name=parsed.repository,
         event_type=parsed.event_type,
         branch=_branch_from_parsed(parsed),
+        base_branch=parsed.base_ref,
         commit_sha=parsed.head_sha,
         issue_number=parsed.issue_number,
         pr_number=parsed.pull_request_number,
         labels=sorted(set(parsed.labels)),
     )
+    log_review_work_item_identity(
+        "wf_chain_review_item_constructed_from_parsed",
+        item,
+        caller="review_work_item_from_parsed.ReviewWorkItem",
+    )
+    return item
 
 
 def review_work_item_identity(item: ReviewWorkItem) -> tuple[str | None, str, str | None, int | None, int | None]:
@@ -260,6 +353,11 @@ def record_lifecycle_stage(
     success: bool | None = None,
     error: str | None = None,
 ) -> ReviewWorkItem:
+    if stage == ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_before_github_writeback_started",
+            item,
+        )
     now = datetime.now(UTC)
     item.updated_at = now
     item.lifecycle_stage = stage
@@ -281,11 +379,24 @@ def record_lifecycle_stage(
     elif stage == ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED:
         item.github_writeback_completed_at = now
         item.github_writeback_success = success
+    elif stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED:
+        item.agent_bus_dispatch_started_at = now
+    elif stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED:
+        item.agent_bus_dispatch_completed_at = now
+        item.agent_bus_dispatch_success = success
     if error:
         item.last_error = error
         item.last_failure_at = now
-        if stage != ReviewLifecycleStage.REVIEW_FAILED:
+        item.agent_bus_dispatch_error = error if stage == ReviewLifecycleStage.AGENT_BUS_DISPATCH_COMPLETED else item.agent_bus_dispatch_error
+        if stage not in {ReviewLifecycleStage.REVIEW_FAILED, ReviewLifecycleStage.RUNTIME_VALIDATION_FAILED}:
             item.failure_count += 1
+    if stage == ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED:
+        log_workflow_chain_availability(
+            "wf_chain_metadata_after_github_writeback_completed",
+            item,
+            github_writeback_success=success,
+            github_writeback_error=error,
+        )
     return item
 
 
@@ -346,6 +457,14 @@ def build_lifecycle_visibility(items: list[ReviewWorkItem]) -> list[ReviewLifecy
             github_writeback_started_at=item.github_writeback_started_at,
             github_writeback_completed_at=item.github_writeback_completed_at,
             github_writeback_success=item.github_writeback_success,
+            agent_bus_dispatch_started_at=item.agent_bus_dispatch_started_at,
+            agent_bus_dispatch_completed_at=item.agent_bus_dispatch_completed_at,
+            agent_bus_dispatch_success=item.agent_bus_dispatch_success,
+            agent_bus_work_item_id=item.agent_bus_work_item_id,
+            agent_bus_dispatch_error=item.agent_bus_dispatch_error,
+            runtime_validation_id=item.runtime_validation_id,
+            runtime_validation_status=item.runtime_validation_status,
+            runtime_validation_completed_at=item.runtime_validation_completed_at,
             failure_count=item.failure_count,
             last_failure_at=item.last_failure_at,
             last_error=item.last_error,
@@ -425,6 +544,10 @@ def process_review_work_item(
     openai_review_error: str | None = None,
     reviewer_model: str | None = None,
 ) -> ReviewProcessResponse:
+    log_workflow_chain_availability(
+        "wf_chain_metadata_process_review_work_item_entered",
+        item,
+    )
     if item.status == ReviewWorkItemStatus.PENDING_REVIEW:
         item.status = ReviewWorkItemStatus.REVIEWING
         record_lifecycle_stage(item, ReviewLifecycleStage.REVIEW_STARTED)
@@ -435,7 +558,7 @@ def process_review_work_item(
         item.last_error = github_context_error
     if github_writeback_error:
         record_lifecycle_stage(item, ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED, success=False, error=github_writeback_error)
-    return ReviewProcessResponse(
+    response = ReviewProcessResponse(
         work_item=item,
         decision=decision,
         intended_next_actions=_intended_next_actions(decision),
@@ -457,6 +580,11 @@ def process_review_work_item(
         reviewer_model=reviewer_model,
         dry_run=True,
     )
+    log_workflow_chain_availability(
+        "wf_chain_metadata_process_review_work_item_returning",
+        response.work_item,
+    )
+    return response
 
 
 def _blocked_reason(item: ReviewWorkItem) -> str | None:
@@ -466,6 +594,8 @@ def _blocked_reason(item: ReviewWorkItem) -> str | None:
         return "Review work item is missing both commit_sha and pr_number."
     if item.event_type not in set(GitHubEventType):
         return f"Review work item event_type is unsupported: {item.event_type}."
+    if item.status == ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING:
+        return "Hermes runtime validation has not reached a terminal state yet."
     return None
 
 
@@ -491,12 +621,30 @@ def _oldest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | N
     return round((now - min(item.created_at for item in items)).total_seconds(), 3)
 
 
-def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
+def _newest_item_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
     if not items:
         return None
     return round((now - max(item.created_at for item in items)).total_seconds(), 3)
 
 
-_UNFINISHED_STATUSES = {ReviewWorkItemStatus.PENDING_REVIEW, ReviewWorkItemStatus.REVIEWING}
+def _newest_age_seconds(items: list[ReviewWorkItem], now: datetime) -> float | None:
+    return _newest_item_age_seconds(items, now)
+
+
+def _review_item_diagnostic_caller(default: str) -> str:
+    import inspect
+
+    for frame_info in inspect.stack()[2:10]:
+        module = frame_info.frame.f_globals.get("__name__", "")
+        if module not in {"app.review_queue", "app.workflow_chain_diagnostics"}:
+            return f"{module}.{frame_info.function}"
+    return default
+
+
+_UNFINISHED_STATUSES = {
+    ReviewWorkItemStatus.RUNTIME_VALIDATION_PENDING,
+    ReviewWorkItemStatus.PENDING_REVIEW,
+    ReviewWorkItemStatus.REVIEWING,
+}
 
 review_queue = InMemoryReviewQueue()

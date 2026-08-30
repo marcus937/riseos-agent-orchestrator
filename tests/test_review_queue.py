@@ -1,5 +1,5 @@
 from app.github_events import parse_github_event
-from app.review_queue import InMemoryReviewQueue, ReviewWorkItemStatus
+from app.review_queue import InMemoryReviewQueue, ReviewWorkItemStatus, review_work_item_from_parsed
 from app.review_workflow import build_review_workflow
 
 
@@ -83,3 +83,23 @@ def test_queue_limit_prunes_oldest_processed_memory_item() -> None:
     assert removed == 1
     assert len(queue.list_items()) == 2
     assert {item.commit_sha for item in queue.list_items()} == {"abc1", "abc2"}
+
+
+def test_pull_request_work_item_preserves_base_branch() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "opened",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {
+                "number": 7,
+                "head": {"ref": "codex-m2/dependency-test", "sha": "abc123"},
+                "base": {"ref": "agent-integration"},
+            },
+        },
+    )
+
+    item = review_work_item_from_parsed(parsed)
+
+    assert item.branch == "codex-m2/dependency-test"
+    assert item.base_branch == "agent-integration"

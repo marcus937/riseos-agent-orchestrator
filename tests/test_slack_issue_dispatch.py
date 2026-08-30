@@ -342,7 +342,7 @@ def test_signed_ping_webhook_is_accepted_without_slack_dispatch(monkeypatch: Any
     client = client_with_secret(secret)
     dispatched: list[tuple[str | None, int | None]] = []
 
-    async def fake_dispatch(parsed: Any, settings: Settings) -> SlackIssueDispatchResult:
+    async def fake_dispatch(parsed: Any, settings: Settings, **_: Any) -> SlackIssueDispatchResult:
         dispatched.append((parsed.repository, parsed.issue_number))
         return SlackIssueDispatchResult(skipped_reason="Not a GitHub issues event.")
 
@@ -363,7 +363,7 @@ def test_signed_issues_webhook_invokes_slack_dispatch(monkeypatch: Any) -> None:
     client = client_with_secret(secret)
     dispatched: list[tuple[str | None, int | None]] = []
 
-    async def fake_dispatch(parsed: Any, settings: Settings) -> SlackIssueDispatchResult:
+    async def fake_dispatch(parsed: Any, settings: Settings, **_: Any) -> SlackIssueDispatchResult:
         dispatched.append((parsed.repository, parsed.issue_number))
         return SlackIssueDispatchResult(attempted=True, success=True, issue_key=f"{parsed.repository}#{parsed.issue_number}")
 

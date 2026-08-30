@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any
+from typing import Any, TextIO
 
 from app.correlation import correlation_id_from_item, correlation_id_from_parsed
 from app.github_events import ParsedGitHubEvent
@@ -8,12 +8,74 @@ from app.review_queue import ReviewWorkItem
 from app.slack_issue_dispatch import SlackIssueDispatchResult
 
 
-logger = logging.getLogger("riseos_agent_orchestrator")
+LOGGER_NAME = "riseos_agent_orchestrator"
+logger = logging.getLogger(LOGGER_NAME)
+
+
+def configure_operational_logger(stream: TextIO | None = None) -> logging.Logger:
+    """Ensure structured operational logs have an INFO-level process stream path."""
+
+    logger.disabled = False
+    logger.setLevel(logging.INFO)
+    if not any(getattr(handler, "_riseos_operational_handler", False) for handler in logger.handlers):
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._riseos_operational_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+    logger.propagate = True
+    return logger
+
+
+configure_operational_logger()
 
 
 def log_event(event: str, **fields: Any) -> None:
-    payload = {"event": event, **{key: value for key, value in fields.items() if value is not None}}
+    include_nulls = bool(fields.pop("_include_nulls", False))
+    event_fields = fields if include_nulls else {key: value for key, value in fields.items() if value is not None}
+    event_fields = _with_workflow_chain_identity_fields(event, event_fields)
+    payload = {"event": event, **event_fields}
     logger.info(json.dumps(payload, sort_keys=True, default=str))
+
+
+def _with_workflow_chain_identity_fields(event: str, fields: dict[str, Any]) -> dict[str, Any]:
+    if not _is_workflow_chain_trace_event(event, fields):
+        return fields
+
+    enriched = dict(fields)
+    for field_name in (
+        "workflow_chain",
+        "source_workflow_chain",
+        "before_workflow_chain",
+        "after_workflow_chain",
+    ):
+        if field_name not in fields:
+            continue
+        _add_workflow_chain_identity(enriched, field_name, fields.get(field_name))
+    return enriched
+
+
+def _is_workflow_chain_trace_event(event: str, fields: dict[str, Any]) -> bool:
+    if event.startswith("workflow_chain_") or event.startswith("wf_chain_"):
+        return True
+    return any("workflow_chain" in key for key in fields)
+
+
+def _add_workflow_chain_identity(fields: dict[str, Any], field_name: str, value: Any) -> None:
+    prefix = field_name.removesuffix("_workflow_chain")
+    if prefix == field_name:
+        prefix = field_name
+    identity_prefix = prefix if prefix else field_name
+
+    if isinstance(value, dict):
+        fields[f"{identity_prefix}_workflow_chain_object_id"] = id(value)
+        fields[f"{identity_prefix}_workflow_chain_keys"] = sorted(str(key) for key in value.keys())
+        fields[f"{identity_prefix}_workflow_chain_length"] = len(value)
+        return
+
+    fields[f"{identity_prefix}_workflow_chain_object_id"] = None
+    fields[f"{identity_prefix}_workflow_chain_keys"] = None
+    fields[f"{identity_prefix}_workflow_chain_length"] = None
 
 
 def log_webhook_accepted(parsed: ParsedGitHubEvent) -> None:
