@@ -1,0 +1,3 @@
+from app.workflow_continuation_engine_repair import install_workflow_continuation_engine_repair
+
+install_workflow_continuation_engine_repair()

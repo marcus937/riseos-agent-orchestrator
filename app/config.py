@@ -10,6 +10,7 @@ class Settings:
     github_webhook_secret: str = ""
     github_webhook_callback_url: str | None = None
     github_repository_owner: str | None = None
+    trusted_repository_owner: str = "marcus937"
     github_token: str | None = None
     github_app_id: str | None = None
     github_app_private_key_path: str | None = None
@@ -28,6 +29,17 @@ class Settings:
     enable_github_context_hydration: bool = False
     enable_github_writeback: bool = False
     enable_task_dispatch: bool = False
+    enable_runtime_validation_review_bridge: bool = False
+    enable_agent_bus_dispatch: bool = False
+    agent_bus_base_url: str | None = None
+    agent_bus_token: str | None = None
+    agent_bus_runtime_validation_token: str | None = None
+    agent_bus_timeout_seconds: int = 30
+    agent_bus_owner_agent: str = "codex-m2"
+    agent_bus_review_agent: str = "bb2"
+    enable_engineering_workforce_scheduler: bool = False
+    circuit_engineering_worker_enabled: bool = True
+    codex_m2_engineering_worker_enabled: bool = True
     circuit_agent_trigger_url: str | None = None
     circuit_agent_access_token: str | None = None
     slack_webhook_url: str | None = None
@@ -67,6 +79,7 @@ def get_settings() -> Settings:
         github_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
         github_webhook_callback_url=os.getenv("GITHUB_WEBHOOK_CALLBACK_URL"),
         github_repository_owner=os.getenv("GITHUB_REPOSITORY_OWNER"),
+        trusted_repository_owner=os.getenv("TRUSTED_REPOSITORY_OWNER", "marcus937"),
         github_token=os.getenv("GITHUB_TOKEN"),
         github_app_id=os.getenv("GITHUB_APP_ID"),
         github_app_private_key_path=os.getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
@@ -85,6 +98,17 @@ def get_settings() -> Settings:
         enable_github_context_hydration=_bool_env("ENABLE_GITHUB_CONTEXT_HYDRATION"),
         enable_github_writeback=_bool_env("ENABLE_GITHUB_WRITEBACK"),
         enable_task_dispatch=_bool_env("ENABLE_TASK_DISPATCH"),
+        enable_runtime_validation_review_bridge=_bool_env("ENABLE_RUNTIME_VALIDATION_REVIEW_BRIDGE"),
+        enable_agent_bus_dispatch=_bool_env("ENABLE_AGENT_BUS_DISPATCH"),
+        agent_bus_base_url=os.getenv("AGENT_BUS_BASE_URL"),
+        agent_bus_token=os.getenv("AGENT_BUS_TOKEN"),
+        agent_bus_runtime_validation_token=os.getenv("AGENT_BUS_RUNTIME_VALIDATION_TOKEN"),
+        agent_bus_timeout_seconds=_int_env("AGENT_BUS_TIMEOUT_SECONDS", 30),
+        agent_bus_owner_agent=os.getenv("AGENT_BUS_OWNER_AGENT", "codex-m2"),
+        agent_bus_review_agent=os.getenv("AGENT_BUS_REVIEW_AGENT", "bb2"),
+        enable_engineering_workforce_scheduler=_bool_env("ENABLE_ENGINEERING_WORKFORCE_SCHEDULER"),
+        circuit_engineering_worker_enabled=os.getenv("CIRCUIT_ENGINEERING_WORKER_ENABLED", "true").lower() == "true",
+        codex_m2_engineering_worker_enabled=os.getenv("CODEX_M2_ENGINEERING_WORKER_ENABLED", "true").lower() == "true",
         circuit_agent_trigger_url=os.getenv("CIRCUIT_AGENT_TRIGGER_URL"),
         circuit_agent_access_token=os.getenv("CIRCUIT_AGENT_ACCESS_TOKEN"),
         slack_webhook_url=legacy_slack_webhook_url,

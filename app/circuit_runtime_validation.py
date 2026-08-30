@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import socket
 import uuid
 from datetime import UTC, datetime
@@ -13,8 +14,21 @@ from pydantic import BaseModel, Field
 from app.circuit_hermes_adapter import CircuitHermesClient, canonical_job_id, format_optional_bool, redact_runtime_text
 from app.config import Settings
 from app.hermes_dispatch import HermesDispatchResult, HermesEvidenceSnapshot
+from app.operational_logging import log_event
 
 RuntimeValidationStatus = Literal["blocked", "completed", "failed", "pending"]
+_WORKFLOW_CHAIN_KEYS = {
+    "workflow_chain_id",
+    "workflow_family",
+    "workflow_sequence",
+    "workflow_steps",
+    "workflow_step",
+    "current_workflow_step",
+    "next_workflow_step",
+    "final_workflow_step",
+    "continuation_mode",
+    "merge_gate",
+}
 
 
 class RuntimeValidationRequest(BaseModel):
@@ -22,10 +36,18 @@ class RuntimeValidationRequest(BaseModel):
     issue_number: int | None = None
     pr_number: int | None = None
     branch: str | None = None
+    base_branch: str | None = None
     target_url: str | None = None
+    target_url_source: str | None = None
+    target_url_pending_reason: str | None = None
     validation_type: str = "playwright"
     requested_by: str = "circuit"
     correlation_id: str | None = None
+    work_item_id: str | None = None
+    evidence_id: str | None = None
+    review_agent: str | None = None
+    workflow_id: str | None = None
+    review_dispatch: dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeValidationHermesSummary(BaseModel):
@@ -72,6 +94,12 @@ class RuntimeValidationResult(BaseModel):
     issue_number: int | None = None
     pr_number: int | None = None
     branch: str | None = None
+    base_branch: str | None = None
+    work_item_id: str | None = None
+    evidence_id: str | None = None
+    review_agent: str | None = None
+    workflow_id: str | None = None
+    review_dispatch: dict[str, Any] = Field(default_factory=dict)
     validation_type: str
     requested_by: str
     created_at: datetime
@@ -108,8 +136,71 @@ class RuntimeValidationStore:
     async def trigger(self, request: RuntimeValidationRequest, settings: Settings) -> RuntimeValidationResult:
         validation_id = str(uuid.uuid4())
         correlation_id = request.correlation_id or f"runtime-validation-{validation_id[:8]}"
-        target_url = request.target_url or settings.hermes_default_target
+        target_url = request.target_url
         created_at = datetime.now(UTC)
+        target_source = request.target_url_source or ("request" if request.target_url else "missing")
+        review_dispatch = _build_review_dispatch_payload(request, correlation_id)
+        log_event(
+            "runtime_validation_trigger_started",
+            validation_id=validation_id,
+            correlation_id=correlation_id,
+            repo=request.repo,
+            issue_number=request.issue_number,
+            pr_number=request.pr_number,
+            branch=request.branch,
+            base_branch=request.base_branch,
+            work_item_id=request.work_item_id,
+            evidence_id=request.evidence_id,
+            review_agent=request.review_agent,
+            workflow_id=request.workflow_id,
+            validation_type=request.validation_type,
+            requested_by=request.requested_by,
+            target_url_source=target_source,
+        )
+
+        if target_url is None and target_source == "vercel_preview_pending":
+            result = RuntimeValidationResult(
+                validation_id=validation_id,
+                status="pending",
+                repo=request.repo,
+                issue_number=request.issue_number,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                work_item_id=request.work_item_id,
+                evidence_id=request.evidence_id,
+                review_agent=request.review_agent,
+                workflow_id=request.workflow_id,
+                review_dispatch=review_dispatch,
+                validation_type=request.validation_type,
+                requested_by=request.requested_by,
+                created_at=created_at,
+                correlation_id=correlation_id,
+                hermes=RuntimeValidationHermesSummary(
+                    target_url=None,
+                    target_source=target_source,
+                    status="SKIPPED",
+                    error=request.target_url_pending_reason,
+                ),
+                evidence=RuntimeValidationEvidenceSummary(),
+                bb2=RuntimeValidationBB2Packet(review_status="pending"),
+                error=request.target_url_pending_reason,
+            )
+            self._items[validation_id] = result
+            log_event(
+                "runtime_validation_preview_pending",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                target_url_source=target_source,
+                fallback_reason=request.target_url_pending_reason,
+            )
+            return result
+
+        target_url = target_url or settings.hermes_default_target
         blocked = _target_url_blocker(target_url, settings)
         if blocked is None:
             blocked = _hermes_config_blocker(settings)
@@ -121,17 +212,34 @@ class RuntimeValidationStore:
                 issue_number=request.issue_number,
                 pr_number=request.pr_number,
                 branch=request.branch,
+                base_branch=request.base_branch,
+                work_item_id=request.work_item_id,
+                evidence_id=request.evidence_id,
+                review_agent=request.review_agent,
+                workflow_id=request.workflow_id,
+                review_dispatch=review_dispatch,
                 validation_type=request.validation_type,
                 requested_by=request.requested_by,
                 created_at=created_at,
                 completed_at=datetime.now(UTC),
                 correlation_id=correlation_id,
-                hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), error=blocked),
+                hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), target_source=target_source, error=blocked),
                 evidence=RuntimeValidationEvidenceSummary(),
                 bb2=RuntimeValidationBB2Packet(review_status="blocked"),
                 error=blocked,
             )
             self._items[validation_id] = result
+            log_event(
+                "runtime_validation_trigger_blocked",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                target_url_source=target_source,
+                error=blocked,
+            )
             return result
 
         result = RuntimeValidationResult(
@@ -141,11 +249,17 @@ class RuntimeValidationStore:
             issue_number=request.issue_number,
             pr_number=request.pr_number,
             branch=request.branch,
+            base_branch=request.base_branch,
+            work_item_id=request.work_item_id,
+            evidence_id=request.evidence_id,
+            review_agent=request.review_agent,
+            workflow_id=request.workflow_id,
+            review_dispatch=review_dispatch,
             validation_type=request.validation_type,
             requested_by=request.requested_by,
             created_at=created_at,
             correlation_id=correlation_id,
-            hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), target_source="request" if request.target_url else "hermes_default_target"),
+            hermes=RuntimeValidationHermesSummary(target_url=_safe_text(target_url, settings), target_source=target_source),
             evidence=RuntimeValidationEvidenceSummary(),
             bb2=RuntimeValidationBB2Packet(),
         )
@@ -153,18 +267,57 @@ class RuntimeValidationStore:
 
         hermes_client = self._hermes_client_factory()
         try:
+            payload = _build_runtime_payload(request, target_url, correlation_id, settings, target_source=target_source)
+            log_event(
+                "hermes_runtime_validation_post_started",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                hermes_base_url=settings.hermes_m2_base_url,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                work_item_id=request.work_item_id,
+                evidence_id=request.evidence_id,
+                review_agent=request.review_agent,
+                workflow_id=request.workflow_id,
+                validation_type=request.validation_type,
+                target_url_source=target_source,
+            )
             response = await hermes_client.post_runtime_validation(
                 settings.hermes_m2_base_url or "",
                 settings.hermes_m2_token or "",
-                _build_runtime_payload(request, target_url, correlation_id, settings),
+                payload,
+            )
+            log_event(
+                "hermes_runtime_validation_post_completed",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                status=response.get("status") or response.get("result"),
+                job_id=canonical_job_id(response),
+                response_keys=sorted(str(key) for key in response.keys()),
             )
             dispatch = _dispatch_result_from_response(response, target_url=target_url, correlation_id=correlation_id, settings=settings)
             if dispatch.job_id and dispatch.status in {"PASSED", "FAILED"}:
+                log_event(
+                    "hermes_evidence_collection_started",
+                    validation_id=validation_id,
+                    correlation_id=correlation_id,
+                    job_id=dispatch.job_id,
+                )
                 dispatch.evidence = await hermes_client.collect_evidence(
                     settings.hermes_m2_base_url or "",
                     settings.hermes_m2_token or "",
                     dispatch.job_id,
                     settings,
+                )
+                log_event(
+                    "hermes_evidence_collection_completed",
+                    validation_id=validation_id,
+                    correlation_id=correlation_id,
+                    job_id=dispatch.job_id,
+                    manifest_fetched=bool(dispatch.evidence and dispatch.evidence.manifest_fetched),
+                    bundle_fetched=bool(dispatch.evidence and dispatch.evidence.bundle_fetched),
                 )
             result = _result_from_dispatch(result, dispatch, settings)
         except Exception as exc:
@@ -175,10 +328,32 @@ class RuntimeValidationStore:
             result.hermes.status = "BLOCKED"
             result.hermes.error = error
             result.bb2 = RuntimeValidationBB2Packet(review_status="blocked")
+            log_event(
+                "runtime_validation_trigger_failed",
+                validation_id=validation_id,
+                correlation_id=correlation_id,
+                repo=request.repo,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=request.base_branch,
+                error=error,
+            )
         finally:
             await hermes_client.aclose()
 
         self._items[validation_id] = result
+        log_event(
+            "runtime_validation_trigger_completed",
+            validation_id=validation_id,
+            correlation_id=correlation_id,
+            repo=result.repo,
+            pr_number=result.pr_number,
+            branch=result.branch,
+            base_branch=result.base_branch,
+            status=result.status,
+            hermes_status=result.hermes.status,
+            bb2_review_status=result.bb2.review_status,
+        )
         return result
 
 
@@ -257,20 +432,36 @@ def _build_runtime_payload(
     target_url: str,
     correlation_id: str,
     settings: Settings,
+    *,
+    target_source: str,
 ) -> dict[str, Any]:
     branch = request.branch or settings.work_branch
+    review_dispatch = _build_review_dispatch_payload(request, correlation_id)
     payload: dict[str, Any] = {
         "source": "riseos-agent-orchestrator",
         "repo": request.repo,
         "branch": branch,
+        "baseBranch": request.base_branch,
+        "base_branch": request.base_branch,
         "targetUrl": target_url,
         "previewUrl": target_url if _is_vercel_preview_url(target_url) else None,
         "preview_url": target_url if _is_vercel_preview_url(target_url) else None,
         "validationType": request.validation_type,
         "validation_type": request.validation_type,
-        "targetSource": "request" if request.target_url else "hermes_default_target",
+        "targetSource": target_source,
+        "target_url_source": target_source,
         "requestedBy": request.requested_by,
         "requested_by": request.requested_by,
+        "workItemId": request.work_item_id,
+        "work_item_id": request.work_item_id,
+        "evidenceId": request.evidence_id,
+        "evidence_id": request.evidence_id,
+        "reviewAgent": request.review_agent,
+        "review_agent": request.review_agent,
+        "workflowId": request.workflow_id,
+        "workflow_id": request.workflow_id,
+        "reviewDispatch": review_dispatch,
+        "review_dispatch": review_dispatch,
         "hermesNode": "M2",
         "trigger": "circuit_runtime_validation_api",
     }
@@ -285,8 +476,52 @@ def _build_runtime_payload(
         "targetUrl": target_url,
         "validation_type": request.validation_type,
         "correlationId": correlation_id,
+        "workItemId": request.work_item_id,
+        "work_item_id": request.work_item_id,
+        "evidenceId": request.evidence_id,
+        "evidence_id": request.evidence_id,
+        "reviewAgent": request.review_agent,
+        "review_agent": request.review_agent,
+        "workflowId": request.workflow_id,
+        "workflow_id": request.workflow_id,
+        "reviewDispatch": review_dispatch,
+        "review_dispatch": review_dispatch,
         "payload": payload,
     }
+
+
+def _build_review_dispatch_payload(request: RuntimeValidationRequest, correlation_id: str) -> dict[str, Any]:
+    review_agent = request.review_agent or request.review_dispatch.get("review_agent") or request.review_dispatch.get("target_agent") or "bb2"
+    pr_number = request.pr_number or request.review_dispatch.get("pr_number")
+    title = request.review_dispatch.get("title") or (
+        f"BB2 review for {request.repo} PR #{pr_number}" if pr_number else f"BB2 review for {request.repo}"
+    )
+    prompt = request.review_dispatch.get("prompt") or "Review Codex worker implementation evidence for this PR."
+    payload = {
+        **request.review_dispatch,
+        "repository": request.review_dispatch.get("repository") or request.repo,
+        "repo": request.review_dispatch.get("repo") or request.repo,
+        "title": title,
+        "prompt": prompt,
+        "issue_number": request.issue_number if request.issue_number is not None else request.review_dispatch.get("issue_number"),
+        "pr_number": pr_number,
+        "branch": request.branch or request.review_dispatch.get("branch"),
+        "base_branch": request.base_branch or request.review_dispatch.get("base_branch"),
+        "work_item_id": request.work_item_id or request.review_dispatch.get("work_item_id"),
+        "evidence_id": request.evidence_id or request.review_dispatch.get("evidence_id"),
+        "evidence_packet_id": request.evidence_id or request.review_dispatch.get("evidence_packet_id"),
+        "owner_agent": request.review_dispatch.get("owner_agent") or review_agent,
+        "reviewer": request.review_dispatch.get("reviewer") or review_agent,
+        "review_agent": review_agent,
+        "target_agent": request.review_dispatch.get("target_agent") or review_agent,
+        "requested_by": request.review_dispatch.get("requested_by") or request.requested_by,
+        "correlation_id": request.review_dispatch.get("correlation_id") or correlation_id,
+        "workflow_id": request.workflow_id or request.review_dispatch.get("workflow_id"),
+        "source": request.review_dispatch.get("source") or "riseos-agent-orchestrator",
+    }
+    if "tool_preference" not in payload:
+        payload["tool_preference"] = ["create_review_packet", "attach_review_to_work_item", "mark_ready_for_review", "dispatch_prompt"]
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _dispatch_result_from_response(
@@ -319,11 +554,7 @@ def _dispatch_result_from_response(
     )
 
 
-def _result_from_dispatch(
-    result: RuntimeValidationResult,
-    dispatch: HermesDispatchResult,
-    settings: Settings,
-) -> RuntimeValidationResult:
+def _result_from_dispatch(result: RuntimeValidationResult, dispatch: HermesDispatchResult, settings: Settings) -> RuntimeValidationResult:
     evidence = _evidence_summary(dispatch.evidence, settings)
     review_status: Literal["approved", "needs_changes", "blocked", "pending"] = "pending"
     if dispatch.status == "PASSED":
@@ -345,17 +576,79 @@ def _result_from_dispatch(
         error=dispatch.error,
     )
     result.evidence = evidence
+    review_context = {
+        "source": "circuit_runtime_validation_api",
+        "correlation_id": result.correlation_id,
+        "work_item_id": result.work_item_id,
+        "evidence_id": result.evidence_id,
+        "review_agent": result.review_agent,
+        "workflow_id": result.workflow_id,
+        "review_dispatch": result.review_dispatch,
+        "field_propagation_matrix": _field_matrix(evidence),
+    }
+    _attach_workflow_chain_to_review_context(review_context, result.review_dispatch)
     result.bb2 = RuntimeValidationBB2Packet(
         packet_created=True,
         review_requested=False,
         review_status=review_status,
-        review_context={
-            "source": "circuit_runtime_validation_api",
-            "correlation_id": result.correlation_id,
-            "field_propagation_matrix": _field_matrix(evidence),
-        },
+        review_context=review_context,
     )
     return result
+
+
+def _attach_workflow_chain_to_review_context(review_context: dict[str, Any], review_dispatch: dict[str, Any]) -> None:
+    workflow_chain = _workflow_chain_from_dispatch(review_dispatch)
+    if not workflow_chain:
+        return
+    review_context["workflow_chain"] = workflow_chain
+    metadata = dict(review_context.get("metadata") or {})
+    metadata.setdefault("workflow_chain", workflow_chain)
+    review_context["metadata"] = metadata
+    runtime_context = dict(review_context.get("runtime_context") or {})
+    runtime_context.setdefault("workflow_chain", workflow_chain)
+    for key in _WORKFLOW_CHAIN_KEYS:
+        if key in workflow_chain and workflow_chain[key] is not None and workflow_chain[key] != "":
+            runtime_context.setdefault(key, workflow_chain[key])
+            review_context.setdefault(key, workflow_chain[key])
+    review_context["runtime_context"] = runtime_context
+
+
+def _workflow_chain_from_dispatch(review_dispatch: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(review_dispatch, dict):
+        return {}
+    workflow_chain = _first_workflow_chain(
+        review_dispatch.get("workflow_chain"),
+        review_dispatch.get("_workflow_chain"),
+        review_dispatch.get("workflowChain"),
+        _nested_workflow_chain(review_dispatch.get("metadata")),
+        _nested_workflow_chain(review_dispatch.get("runtime_context")),
+        _nested_workflow_chain(review_dispatch.get("runtime_validation_context")),
+    )
+    if workflow_chain:
+        return dict(workflow_chain)
+    return {
+        key: review_dispatch[key]
+        for key in _WORKFLOW_CHAIN_KEYS
+        if review_dispatch.get(key) is not None and review_dispatch.get(key) != ""
+    }
+
+
+def _nested_workflow_chain(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return _first_workflow_chain(
+        value.get("workflow_chain"),
+        value.get("_workflow_chain"),
+        value.get("workflowChain"),
+        value if any(key in value for key in _WORKFLOW_CHAIN_KEYS) else None,
+    )
+
+
+def _first_workflow_chain(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict) and value:
+            return value
+    return {}
 
 
 def _evidence_summary(evidence: HermesEvidenceSnapshot | None, settings: Settings) -> RuntimeValidationEvidenceSummary:
@@ -445,5 +738,9 @@ def _is_vercel_preview_host(host: str) -> bool:
 
 
 def stable_validation_digest(result: RuntimeValidationResult) -> str:
-    payload = result.model_dump_json(exclude={"created_at", "completed_at"}, sort_keys=True)
+    payload = json.dumps(
+        result.model_dump(mode="json", exclude={"created_at", "completed_at"}),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

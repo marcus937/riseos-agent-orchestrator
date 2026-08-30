@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 .env
 *.pyc
+
+# Local machine artifacts
+.DS_Store
+*.env

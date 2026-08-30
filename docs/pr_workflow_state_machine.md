@@ -11,6 +11,22 @@ This document defines the canonical Coding Crew PR label workflow for RiseOS Age
 - GitHub writeback is limited to comments and label additions when `ENABLE_GITHUB_WRITEBACK=true`.
 - Trigger labels must remain usable and must not be removed by the orchestrator.
 
+## Branch Policy
+
+Approved agent branch flows:
+
+- Circuit works on `circuit/*` and opens PRs into `agent-integration`.
+- Codex-M2 works on `codex-m2/*` and opens PRs into `agent-integration`.
+- Hermes works on `hermes/*` and opens PRs into `agent-integration`.
+
+A PR from `circuit/*`, `codex-m2/*`, or `hermes/*` into `agent-integration` is compliant and must not be treated as a branch-policy violation.
+
+Invalid branch flows include:
+
+- agent PRs targeting `main` or `production`
+- direct agent commits to `main`, `master`, `production`, `release/*`, `marcus/*`, `bb/*`, or any human-owned branch
+- force pushes, branch protection bypasses, branch deletion, merge, deploy, or unsafe PR retargeting
+
 ## Trigger Labels That Must Remain Available
 
 - `agent-ready` starts Circuit issue pickup.
@@ -36,13 +52,13 @@ Stale `ready-to-merge` labels must never override newer blocker or rework labels
 | State | Canonical labels | Meaning | Next expected handoff |
 |---|---|---|---|
 | Circuit ready | `agent-ready` | Issue is ready for Circuit pickup. | Circuit claims work. |
-| Circuit working | `agent-working` | Circuit is actively working the task. | Circuit opens or updates PR. |
+| Circuit working | `agent-working` | Circuit is actively working the task on `circuit/*`. | Circuit opens or updates PR into `agent-integration`. |
 | Hermes requested | `runtime-agent`, optionally `playwright` | Runtime validation is requested. | Hermes validates the PR. |
 | Hermes verified | `agent-verified` | Hermes validation passed. This is runtime evidence, not merge approval. | BB2 reviews proof packet. |
 | Hermes blocked | `agent-blocked` | Hermes could not run. | Human or agent resolves blocker. |
-| Hermes revisions | `agent-revisions` | Hermes found runtime failure. | Circuit updates PR and Hermes can run again on the new commit. |
+| Hermes revisions | `agent-revisions` | Hermes found runtime failure. | Circuit updates the agent-owned PR branch and Hermes can run again on the new commit. |
 | BB2 review requested | `bb-review-needed` | BB2 review is requested. | BB2 approves, blocks, or requests changes. |
-| BB2 needs changes | `bb2-needs-changes`, `agent-next` | BB2 rejected the packet and sends work back to Circuit. | Circuit reworks on `agent-integration`, then requests validation again. |
+| BB2 needs changes | `bb2-needs-changes`, `agent-next` | BB2 rejected the packet and sends work back to Circuit. | Circuit reworks on `circuit/*`, then requests validation again. |
 | BB2 blocked | `bb2-blocked` | BB2 blocked the packet or escalated it to Marcus. | Human direction is required before work continues. |
 | BB2 approved | `bb2-approved` | BB2 approved for human review only. | Orchestrator may add `ready-to-merge` only if all criteria pass. |
 | Ready to merge | `ready-to-merge` | Coding Crew loop is complete and human merge review can proceed. | Marcus or another authorized human reviews and merges. |
@@ -53,7 +69,7 @@ The current orchestrator supports label-add transitions only. It intentionally d
 
 ### Circuit Completion To Hermes
 
-When a same-repo PR is opened, synchronized, or marked ready for review from `agent-integration` into `main`, Hermes dispatch can add the canonical trigger labels:
+When a same-repo PR is opened, synchronized, or marked ready for review from an approved agent-owned branch into `agent-integration`, Hermes dispatch can add the canonical trigger labels:
 
 - `runtime-agent`
 - `playwright`

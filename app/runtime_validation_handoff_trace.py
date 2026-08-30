@@ -1,0 +1,533 @@
+from __future__ import annotations
+
+import json
+from functools import wraps
+from typing import Any
+
+import httpx
+
+from app.operational_logging import log_event
+
+_PATCHED = False
+HERMES_JOB_ENDPOINT = "/api/v1/jobs"
+
+
+def install_runtime_validation_handoff_trace() -> None:
+    """Install diagnostics around the synchronous runtime validation Hermes handoff."""
+
+    global _PATCHED
+    if _PATCHED:
+        return
+
+    from app import circuit_runtime_validation as runtime_module
+    from app import wf20_runtime_validation as wf20_module
+    from app.circuit_hermes_adapter import CircuitHermesClient
+    from app.hermes_dispatch_impl import HermesHTTPClient
+
+    _patch_runtime_validation_store(runtime_module)
+    _patch_agent_bus_runtime_validation_store(wf20_module)
+    _patch_hermes_http_client(HermesHTTPClient)
+    _patch_circuit_hermes_client(CircuitHermesClient)
+    _PATCHED = True
+
+
+def _patch_runtime_validation_store(runtime_module: Any) -> None:
+    original_trigger = runtime_module.RuntimeValidationStore.trigger
+    original_build_runtime_payload = getattr(runtime_module, "_build_runtime_payload", None)
+    original_build_review_dispatch = getattr(runtime_module, "_build_review_dispatch_payload", None)
+
+    @wraps(original_trigger)
+    async def traced_trigger(self: Any, request: Any, settings: Any) -> Any:
+        trace = _request_fields(request)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_runtime_trigger_request",
+            request,
+            source_object="RuntimeValidationRequest",
+            **trace,
+        )
+        log_event(
+            "runtime_validation_trigger_boundary_entered",
+            **trace,
+            selected_store_class=self.__class__.__name__,
+            selected_store_module=self.__class__.__module__,
+            hermes_base_url=settings.hermes_m2_base_url,
+            hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+            hermes_m2_enable_dispatch=settings.hermes_m2_enable_dispatch,
+            hermes_base_url_configured=bool(settings.hermes_m2_base_url),
+            hermes_token_configured=bool(settings.hermes_m2_token),
+            target_url=getattr(request, "target_url", None),
+        )
+        result = await original_trigger(self, request, settings)
+        result_trace = _result_fields(result)
+        skip_block_reason = _result_skip_or_block_reason(result)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_runtime_trigger_result",
+            result,
+            source_object="RuntimeValidationResult",
+            **result_trace,
+        )
+        log_event(
+            "runtime_validation_created",
+            **result_trace,
+            selected_store_class=self.__class__.__name__,
+            selected_store_module=self.__class__.__module__,
+            hermes_base_url=settings.hermes_m2_base_url,
+            hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+            runtime_validation_status=getattr(result, "status", None),
+            hermes_status=getattr(getattr(result, "hermes", None), "status", None),
+            hermes_job_id=getattr(getattr(result, "hermes", None), "job_id", None),
+            skip_block_reason=skip_block_reason,
+        )
+        log_event(
+            "runtime_validation_trigger_boundary_completed",
+            **result_trace,
+            selected_store_class=self.__class__.__name__,
+            selected_store_module=self.__class__.__module__,
+            hermes_base_url=settings.hermes_m2_base_url,
+            hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+            runtime_validation_status=getattr(result, "status", None),
+            hermes_status=getattr(getattr(result, "hermes", None), "status", None),
+            hermes_job_id=getattr(getattr(result, "hermes", None), "job_id", None),
+            skip_block_reason=skip_block_reason,
+        )
+        if skip_block_reason:
+            log_event(
+                "runtime_validation_handoff_terminal",
+                **result_trace,
+                terminal_reason=_terminal_reason(result),
+                skip_block_reason=skip_block_reason,
+            )
+        return result
+
+    runtime_module.RuntimeValidationStore.trigger = traced_trigger
+
+    if callable(original_build_review_dispatch):
+        @wraps(original_build_review_dispatch)
+        def traced_build_review_dispatch_payload(request: Any, correlation_id: str) -> dict[str, Any]:
+            log_workflow_chain_trace(
+                "workflow_chain_trace_before_review_dispatch_build",
+                request,
+                source_object="RuntimeValidationRequest",
+                correlation_id=correlation_id,
+                **_request_fields(request),
+            )
+            payload = original_build_review_dispatch(request, correlation_id)
+            log_workflow_chain_trace(
+                "workflow_chain_trace_after_review_dispatch_build",
+                payload,
+                source_object="review_dispatch_payload",
+                correlation_id=correlation_id,
+                **_request_fields(request),
+            )
+            return payload
+
+        runtime_module._build_review_dispatch_payload = traced_build_review_dispatch_payload
+
+    if callable(original_build_runtime_payload):
+        @wraps(original_build_runtime_payload)
+        def traced_build_runtime_payload(request: Any, target_url: str, correlation_id: str, settings: Any, *, target_source: str) -> dict[str, Any]:
+            payload = original_build_runtime_payload(request, target_url, correlation_id, settings, target_source=target_source)
+            log_workflow_chain_trace(
+                "workflow_chain_trace_runtime_payload_built",
+                payload,
+                source_object="Hermes runtime payload",
+                correlation_id=correlation_id,
+                target_url=target_url,
+                target_source=target_source,
+                **_payload_fields(payload),
+            )
+            commit_sha = _request_fields(request).get("commit_sha")
+            if commit_sha:
+                payload["commitSha"] = commit_sha
+                payload["commit_sha"] = commit_sha
+                nested = payload.get("payload")
+                if isinstance(nested, dict):
+                    nested["commitSha"] = commit_sha
+                    nested["commit_sha"] = commit_sha
+            return payload
+
+        runtime_module._build_runtime_payload = traced_build_runtime_payload
+
+
+def _patch_agent_bus_runtime_validation_store(wf20_module: Any) -> None:
+    original_trigger = wf20_module.AgentBusRuntimeValidationStore.trigger
+    original_record = wf20_module._record_agent_bus_state
+
+    @wraps(original_trigger)
+    async def traced_agent_bus_trigger(self: Any, request: Any, settings: Any) -> Any:
+        trace = _request_fields(request)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_agent_bus_runtime_trigger_request",
+            request,
+            source_object="AgentBusRuntimeValidationStore.trigger request",
+            **trace,
+        )
+        log_event(
+            "agent_bus_runtime_validation_store_entered",
+            **trace,
+            selected_store_class=self.__class__.__name__,
+            selected_store_module=self.__class__.__module__,
+            hermes_base_url=settings.hermes_m2_base_url,
+            hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+            hermes_m2_enable_dispatch=settings.hermes_m2_enable_dispatch,
+            hermes_base_url_configured=bool(settings.hermes_m2_base_url),
+            hermes_token_configured=bool(settings.hermes_m2_token),
+            target_url=getattr(request, "target_url", None),
+        )
+        result = await original_trigger(self, request, settings)
+        log_workflow_chain_trace(
+            "workflow_chain_trace_agent_bus_runtime_trigger_result",
+            result,
+            source_object="AgentBusRuntimeValidationStore.trigger result",
+            **_result_fields(result),
+        )
+        log_event(
+            "agent_bus_runtime_validation_store_completed",
+            **_result_fields(result),
+            selected_store_class=self.__class__.__name__,
+            selected_store_module=self.__class__.__module__,
+            hermes_base_url=settings.hermes_m2_base_url,
+            hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+            runtime_validation_status=getattr(result, "status", None),
+            hermes_status=getattr(getattr(result, "hermes", None), "status", None),
+            hermes_job_id=getattr(getattr(result, "hermes", None), "job_id", None),
+            skip_block_reason=_result_skip_or_block_reason(result),
+        )
+        return result
+
+    @wraps(original_record)
+    async def traced_record_agent_bus_state(*args: Any, **kwargs: Any) -> Any:
+        request = args[1] if len(args) > 1 else kwargs.get("request")
+        state = args[2] if len(args) > 2 else kwargs.get("state")
+        runtime_result = kwargs.get("runtime_result")
+        trace = _request_fields(request)
+        if runtime_result is not None:
+            trace["runtime_validation_id"] = getattr(runtime_result, "validation_id", None)
+            log_workflow_chain_trace(
+                "workflow_chain_trace_agent_bus_state_write_result",
+                runtime_result,
+                source_object="runtime_result before Agent Bus state write",
+                **_result_fields(runtime_result),
+            )
+        log_event(
+            "agent_bus_runtime_validation_write_started",
+            **trace,
+            lookup_key="AgentBusClient.record_runtime_validation",
+            runtime_state=getattr(state, "value", state),
+            target_url=getattr(request, "target_url", None),
+        )
+        result = await original_record(*args, **kwargs)
+        completed_trace = _request_fields(request)
+        if runtime_result is not None:
+            completed_trace["runtime_validation_id"] = getattr(runtime_result, "validation_id", None)
+        log_event(
+            "agent_bus_runtime_validation_write_completed",
+            **completed_trace,
+            lookup_key="AgentBusClient.record_runtime_validation",
+            runtime_state=getattr(state, "value", state),
+            lookup_result=_compact_mapping(result),
+        )
+        return result
+
+    wf20_module.AgentBusRuntimeValidationStore.trigger = traced_agent_bus_trigger
+    wf20_module._record_agent_bus_state = traced_record_agent_bus_state
+
+
+def _patch_hermes_http_client(hermes_http_client_cls: Any) -> None:
+    async def traced_post_job(self: Any, base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        trace = _payload_fields(payload)
+        endpoint_url = f"{base_url.rstrip('/')}{HERMES_JOB_ENDPOINT}"
+        log_workflow_chain_trace(
+            "workflow_chain_trace_hermes_post_job_payload",
+            payload,
+            source_object="HermesHTTPClient.post_job payload",
+            **trace,
+        )
+        log_event(
+            "hermes_dispatch_started",
+            **trace,
+            hermes_base_url=base_url,
+            hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+            target_url=payload.get("targetUrl") or payload.get("payload", {}).get("targetUrl"),
+            payload_type=payload.get("type"),
+            dry_run=payload.get("dryRun"),
+        )
+        try:
+            response = await self._http_client.post(endpoint_url, headers={"X-Hermes-Token": token}, json=payload)
+            body_summary = _response_body_summary(response)
+            response.raise_for_status()
+            if not response.content:
+                data: dict[str, Any] = {}
+            else:
+                raw_data = response.json()
+                data = raw_data if isinstance(raw_data, dict) else {"raw": raw_data}
+            log_event(
+                "hermes_dispatch_completed",
+                **trace,
+                hermes_base_url=base_url,
+                hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+                hermes_http_status=response.status_code,
+                hermes_response_body_summary=body_summary,
+                hermes_job_id=_first_string(data, "jobId", "job_id", "id"),
+                hermes_status=data.get("status") or data.get("result"),
+            )
+            return data
+        except Exception as exc:
+            status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None else None
+            body_summary = _response_body_summary(exc.response) if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None else None
+            log_event(
+                "hermes_dispatch_failed",
+                **trace,
+                hermes_base_url=base_url,
+                hermes_endpoint_path=HERMES_JOB_ENDPOINT,
+                hermes_http_status=status_code,
+                hermes_response_body_summary=body_summary,
+                exception_source=type(exc).__name__,
+                skip_block_reason=str(exc),
+            )
+            raise
+
+    hermes_http_client_cls.post_job = traced_post_job
+
+
+def _patch_circuit_hermes_client(circuit_hermes_client_cls: Any) -> None:
+    original_collect_evidence = circuit_hermes_client_cls.collect_evidence
+
+    @wraps(original_collect_evidence)
+    async def traced_collect_evidence(self: Any, base_url: str, token: str, job_id: str, settings: Any) -> Any:
+        endpoint_path = f"/api/v1/evidence/{job_id}"
+        log_event(
+            "hermes_evidence_collection_boundary_started",
+            hermes_base_url=base_url,
+            hermes_endpoint_path=endpoint_path,
+            hermes_job_id=job_id,
+        )
+        evidence = await original_collect_evidence(self, base_url, token, job_id, settings)
+        log_event(
+            "hermes_evidence_collected",
+            hermes_base_url=base_url,
+            hermes_endpoint_path=endpoint_path,
+            hermes_job_id=job_id,
+            manifest_fetched=bool(evidence and getattr(evidence, "manifest_fetched", False)),
+            bundle_fetched=bool(evidence and getattr(evidence, "bundle_fetched", False)),
+            evidence_error=getattr(evidence, "error", None) if evidence else None,
+        )
+        return evidence
+
+    circuit_hermes_client_cls.collect_evidence = traced_collect_evidence
+
+
+def _request_fields(request: Any) -> dict[str, Any]:
+    review_dispatch = getattr(request, "review_dispatch", None)
+    if not isinstance(review_dispatch, dict):
+        review_dispatch = {}
+    return {
+        "workflow_id": getattr(request, "workflow_id", None) or review_dispatch.get("workflow_id"),
+        "work_item_id": getattr(request, "work_item_id", None) or review_dispatch.get("work_item_id"),
+        "runtime_validation_id": getattr(request, "validation_id", None),
+        "repository": getattr(request, "repo", None) or review_dispatch.get("repository") or review_dispatch.get("repo"),
+        "pr_number": getattr(request, "pr_number", None) or review_dispatch.get("pr_number"),
+        "branch": getattr(request, "branch", None) or review_dispatch.get("branch"),
+        "commit_sha": getattr(request, "commit_sha", None) or review_dispatch.get("commit_sha"),
+        "evidence_packet_id": getattr(request, "evidence_id", None) or review_dispatch.get("evidence_packet_id") or review_dispatch.get("evidence_id"),
+    }
+
+
+def _result_fields(result: Any) -> dict[str, Any]:
+    review_dispatch = getattr(result, "review_dispatch", None)
+    if not isinstance(review_dispatch, dict):
+        review_dispatch = {}
+    hermes = getattr(result, "hermes", None)
+    return {
+        "workflow_id": getattr(result, "workflow_id", None) or review_dispatch.get("workflow_id"),
+        "work_item_id": getattr(result, "work_item_id", None) or review_dispatch.get("work_item_id"),
+        "runtime_validation_id": getattr(result, "validation_id", None),
+        "repository": getattr(result, "repo", None) or review_dispatch.get("repository") or review_dispatch.get("repo"),
+        "pr_number": getattr(result, "pr_number", None) or review_dispatch.get("pr_number"),
+        "branch": getattr(result, "branch", None) or review_dispatch.get("branch"),
+        "commit_sha": review_dispatch.get("commit_sha"),
+        "target_url": getattr(hermes, "target_url", None),
+        "evidence_packet_id": getattr(result, "evidence_id", None) or review_dispatch.get("evidence_packet_id") or review_dispatch.get("evidence_id"),
+    }
+
+
+def _payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    review_dispatch = payload.get("reviewDispatch") or payload.get("review_dispatch") or nested.get("reviewDispatch") or nested.get("review_dispatch") or {}
+    if not isinstance(review_dispatch, dict):
+        review_dispatch = {}
+    return {
+        "workflow_id": payload.get("workflowId") or payload.get("workflow_id") or nested.get("workflowId") or nested.get("workflow_id") or review_dispatch.get("workflow_id"),
+        "work_item_id": payload.get("workItemId") or payload.get("work_item_id") or nested.get("workItemId") or nested.get("work_item_id") or review_dispatch.get("work_item_id"),
+        "runtime_validation_id": payload.get("validationId") or payload.get("validation_id") or nested.get("validationId") or nested.get("validation_id"),
+        "repository": nested.get("repo") or nested.get("repository") or review_dispatch.get("repository") or review_dispatch.get("repo"),
+        "pr_number": nested.get("prNumber") or nested.get("pr_number") or review_dispatch.get("pr_number"),
+        "branch": nested.get("branch") or review_dispatch.get("branch"),
+        "commit_sha": nested.get("commitSha") or nested.get("commit_sha") or review_dispatch.get("commit_sha"),
+        "evidence_packet_id": payload.get("evidenceId") or payload.get("evidence_id") or nested.get("evidenceId") or nested.get("evidence_id") or review_dispatch.get("evidence_packet_id") or review_dispatch.get("evidence_id"),
+    }
+
+
+def log_workflow_chain_trace(event: str, source: Any, *, source_object: str, **extra: Any) -> None:
+    summary = _workflow_chain_summary(source)
+    log_event(
+        event,
+        source_object=source_object,
+        workflow_chain_exists=summary["exists"],
+        workflow_chain_length=summary["length"],
+        workflow_chain_first_step=summary["first_step"],
+        workflow_chain_last_step=summary["last_step"],
+        workflow_chain_keys=summary["keys"],
+        workflow_chain_source_path=summary["source_path"],
+        **extra,
+        _include_nulls=True,
+    )
+
+
+def _workflow_chain_summary(source: Any) -> dict[str, Any]:
+    chain, source_path = _find_workflow_chain(source)
+    steps = _workflow_steps(chain)
+    return {
+        "exists": bool(chain),
+        "length": len(steps) if steps else len(chain),
+        "first_step": steps[0] if steps else _step_id(chain),
+        "last_step": steps[-1] if steps else _step_id(chain),
+        "keys": sorted(str(key) for key in chain.keys()) if isinstance(chain, dict) else [],
+        "source_path": source_path,
+    }
+
+
+def _find_workflow_chain(source: Any) -> tuple[dict[str, Any], str | None]:
+    candidates: list[tuple[Any, str]] = [(source, "source")]
+    seen: set[int] = set()
+    while candidates:
+        value, path = candidates.pop(0)
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        mapping = _as_dict(value)
+        if not mapping:
+            continue
+        for key in ("workflow_chain", "_workflow_chain", "workflowChain"):
+            nested = mapping.get(key)
+            if isinstance(nested, dict) and nested:
+                return nested, f"{path}.{key}"
+        if _looks_like_workflow_chain(mapping):
+            return mapping, path
+        for key in (
+            "review_dispatch",
+            "reviewDispatch",
+            "runtime_context",
+            "runtimeContext",
+            "runtime_validation_context",
+            "runtimeValidationContext",
+            "metadata",
+            "bb2_packet",
+            "bb2",
+            "review_context",
+            "reviewContext",
+            "payload",
+            "work_item",
+            "agent_bus_work_item",
+        ):
+            nested = mapping.get(key)
+            if isinstance(nested, dict) and nested:
+                candidates.append((nested, f"{path}.{key}"))
+    return {}, None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump(mode="json")
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            return dumped
+    data = getattr(value, "__dict__", None)
+    return data if isinstance(data, dict) else {}
+
+
+def _looks_like_workflow_chain(value: dict[str, Any]) -> bool:
+    return any(
+        key in value
+        for key in (
+            "workflow_chain_id",
+            "workflowChainId",
+            "workflow_step",
+            "workflowStep",
+            "current_workflow_step",
+            "currentWorkflowStep",
+            "workflow_steps",
+            "workflowSteps",
+            "workflow_sequence",
+            "workflowSequence",
+        )
+    )
+
+
+def _workflow_steps(chain: dict[str, Any]) -> list[str]:
+    raw_steps = chain.get("workflow_steps") or chain.get("workflowSteps") or chain.get("workflow_sequence") or chain.get("workflowSequence")
+    if not isinstance(raw_steps, list):
+        return []
+    steps: list[str] = []
+    for step in raw_steps:
+        if isinstance(step, str):
+            steps.append(step)
+        elif isinstance(step, dict):
+            step_id = step.get("id") or step.get("key") or step.get("workflow_step") or step.get("workflowStep") or step.get("name")
+            if step_id is not None:
+                steps.append(str(step_id))
+    return steps
+
+
+def _step_id(chain: dict[str, Any]) -> str | None:
+    value = chain.get("workflow_step") or chain.get("workflowStep") or chain.get("current_workflow_step") or chain.get("currentWorkflowStep")
+    return str(value) if value is not None else None
+
+
+def _result_skip_or_block_reason(result: Any) -> str | None:
+    hermes = getattr(result, "hermes", None)
+    return getattr(result, "error", None) or getattr(hermes, "error", None)
+
+
+def _terminal_reason(result: Any) -> str:
+    status = getattr(result, "status", None)
+    hermes = getattr(result, "hermes", None)
+    hermes_status = getattr(hermes, "status", None)
+    if status == "pending":
+        return "HERMES_SKIPPED_PENDING_DEPLOYMENT"
+    if status == "failed":
+        return "HERMES_DISPATCH_FAILED"
+    if status == "blocked" or hermes_status in {"BLOCKED", "SKIPPED"}:
+        return "HERMES_NOT_CALLED_BLOCKED"
+    return "HERMES_HANDOFF_TERMINAL"
+
+
+def _response_body_summary(response: Any) -> Any:
+    text = getattr(response, "text", None)
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text[:1000]
+    if isinstance(payload, dict):
+        return {key: payload.get(key) for key in sorted(payload)[:20]}
+    return payload
+
+
+def _compact_mapping(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {key: value.get(key) for key in ("id", "runtime_validation_id", "work_item_id", "state", "status", "current_state") if value.get(key) is not None}
+
+
+def _first_string(value: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        item = value.get(key)
+        if item is not None:
+            return str(item)
+    return None

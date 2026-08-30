@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -62,6 +63,14 @@ class GitHubClient:
         self._require_value(head, "head")
         return await self._request("GET", f"/repos/{repo_full_name}/compare/{base}...{head}")
 
+    async def fetch_issue(self, repo_full_name: str, issue_number: int) -> dict[str, Any]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(issue_number)
+        payload = await self._request("GET", f"/repos/{repo_full_name}/issues/{issue_number}")
+        if not isinstance(payload, dict):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/issues/{issue_number}", 200, "Expected object response.")
+        return payload
+
     async def list_commit_statuses(self, repo_full_name: str, ref: str) -> list[dict[str, Any]]:
         self._require_value(repo_full_name, "repo_full_name")
         self._require_value(ref, "ref")
@@ -88,6 +97,30 @@ class GitHubClient:
         if not isinstance(check_runs, list):
             raise GitHubAPIError("GET", f"/repos/{repo_full_name}/commits/{ref}/check-runs", 200, "Expected check_runs list.")
         return [item for item in check_runs if isinstance(item, dict)]
+
+    async def list_deployments(self, repo_full_name: str, ref: str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(ref, "ref")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/deployments",
+            params={"sha": ref, "per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/deployments", 200, "Expected list response.")
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def list_deployment_statuses(self, repo_full_name: str, deployment_id: int | str) -> list[dict[str, Any]]:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_value(str(deployment_id), "deployment_id")
+        payload = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/deployments/{deployment_id}/statuses",
+            params={"per_page": 100},
+        )
+        if not isinstance(payload, list):
+            raise GitHubAPIError("GET", f"/repos/{repo_full_name}/deployments/{deployment_id}/statuses", 200, "Expected list response.")
+        return [item for item in payload if isinstance(item, dict)]
 
     async def list_issue_comments(self, repo_full_name: str, issue_number: int) -> list[dict[str, Any]]:
         self._require_value(repo_full_name, "repo_full_name")
@@ -129,12 +162,17 @@ class GitHubClient:
         self._require_value(owner, "owner")
         payload = await self._request(
             "GET",
-            f"/users/{owner}/repos",
-            params={"type": "all", "per_page": 100},
+            "/user/repos",
+            params={"affiliation": "owner", "per_page": 100},
         )
         if not isinstance(payload, list):
-            raise GitHubAPIError("GET", f"/users/{owner}/repos", 200, "Expected list response.")
-        return payload
+            raise GitHubAPIError("GET", "/user/repos", 200, "Expected list response.")
+        return [
+            repo
+            for repo in payload
+            if isinstance(repo, dict)
+            and str(repo.get("owner", {}).get("login", "")).lower() == owner.lower()
+        ]
 
     async def list_repository_webhooks(self, repo_full_name: str) -> list[dict[str, Any]]:
         self._require_value(repo_full_name, "repo_full_name")
@@ -182,6 +220,16 @@ class GitHubClient:
             json={"body": body},
         )
 
+    async def update_issue_comment(self, repo_full_name: str, comment_id: int, body: str) -> GitHubResponse:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(comment_id)
+        self._require_value(body, "body")
+        return await self._request(
+            "PATCH",
+            f"/repos/{repo_full_name}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+
     async def apply_label(self, repo_full_name: str, issue_number: int, label: str) -> GitHubResponse:
         self._require_value(repo_full_name, "repo_full_name")
         self._require_issue_number(issue_number)
@@ -190,6 +238,15 @@ class GitHubClient:
             "POST",
             f"/repos/{repo_full_name}/issues/{issue_number}/labels",
             json={"labels": [label]},
+        )
+
+    async def remove_label(self, repo_full_name: str, issue_number: int, label: str) -> GitHubResponse:
+        self._require_value(repo_full_name, "repo_full_name")
+        self._require_issue_number(issue_number)
+        self._require_value(label, "label")
+        return await self._request(
+            "DELETE",
+            f"/repos/{repo_full_name}/issues/{issue_number}/labels/{quote(label, safe='')}",
         )
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> GitHubResponse:

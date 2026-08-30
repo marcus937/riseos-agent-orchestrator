@@ -26,21 +26,24 @@ main
 |
 |-- agent-integration
 |-- circuit/*
-|-- bb2/*
-|-- orchestrator/*
+|-- codex-m2/*
 `-- hermes/*
 ```
 
 Workflow:
 
 1. Orchestrator dispatches an approved queued issue.
-2. The assigned agent creates a dedicated working branch such as `circuit/work-queue-phase-3`.
-3. The agent works only on that dedicated branch.
-4. The agent opens a PR into `agent-integration`.
-5. BB2 reviews the PR.
-6. Marcus performs any final human merge decision.
+2. The assigned agent creates a dedicated working branch in its approved namespace.
+3. Circuit works only on `circuit/*` branches.
+4. Codex-M2 works only on `codex-m2/*` branches.
+5. Hermes works only on `hermes/*` branches.
+6. The agent opens a PR into `agent-integration`.
+7. BB2 reviews the PR.
+8. Marcus performs any final human merge decision.
 
-Agents must never commit directly to `main`, merge, deploy, force push, delete branches, or bypass branch protection.
+A PR originating from `circuit/*`, `codex-m2/*`, or `hermes/*` and targeting `agent-integration` is compliant. BB2 should not flag that branch shape as a branch-policy violation.
+
+Agents must never commit directly to `main`, `master`, `production`, `release/*`, `marcus/*`, `bb/*`, or any human-owned branch. Agents must never merge, deploy, force push, delete branches, or bypass branch protection.
 
 Only agent workflow instructions may reference branch creation and PR creation. Orchestrator behavior remains limited to notification, review comments, and labels when the corresponding feature flags explicitly allow those writes.
 
@@ -108,13 +111,28 @@ Reminders:
 - Work only on the dedicated `circuit/<task>` branch.
 - Open a PR into `agent-integration` when the task is ready for review.
 - Request BB2 review on the PR.
-- Never commit directly to `main`.
+- Never commit directly to `main`, `master`, `production`, `release/*`, `marcus/*`, `bb/*`, or a human-owned branch.
 - Never merge or deploy.
 - Comment `Status: Done` with the PR URL and completed commit SHA when finished.
 
 Task summary:
 Implement the task from the issue body.
 ```
+
+## Valid And Invalid Branch Flows
+
+Valid:
+
+- `circuit/add-queue-metrics` -> `agent-integration`
+- `codex-m2/reviewer-prompt-update` -> `agent-integration`
+- `hermes/runtime-validation-fix` -> `agent-integration`
+
+Invalid:
+
+- `circuit/add-queue-metrics` -> `main`
+- `codex-m2/reviewer-prompt-update` -> `production`
+- `hermes/runtime-validation-fix` -> `release/2026-06`
+- any direct agent commit to `main`, `master`, `production`, `release/*`, `marcus/*`, `bb/*`, or a human-owned branch
 
 ## Process Response Fields
 
