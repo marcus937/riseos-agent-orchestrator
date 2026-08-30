@@ -222,7 +222,7 @@ def _patch_review_bridge(bridge_module: Any) -> None:
         )
 
     @wraps(original_enqueue)
-    def traced_enqueue(result: Any, settings: Any, *, storage: Any | None = None, existing_item: Any | None = None) -> Any:
+    def traced_enqueue(result: Any, settings: Any, *, storage: Any | None = None, existing_item: Any | None = None, **kwargs: Any) -> Any:
         trace_runtime_validation_lookup(
             "runtime_validation_review_bridge_enqueue",
             **result_trace_fields(result),
@@ -230,7 +230,7 @@ def _patch_review_bridge(bridge_module: Any) -> None:
             lookup_result="started",
             missing_field=_missing_result_field(result),
         )
-        item = original_enqueue(result, settings, storage=storage, existing_item=existing_item)
+        item = original_enqueue(result, settings, storage=storage, existing_item=existing_item, **kwargs)
         trace_runtime_validation_lookup(
             "runtime_validation_review_bridge_enqueue_completed",
             **(item_trace_fields(item) if item is not None else result_trace_fields(result)),
