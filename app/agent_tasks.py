@@ -361,6 +361,46 @@ def mark_agent_task_assigned(task: AgentTask, *, work_item_id: str) -> AgentTask
     return task
 
 
+def mark_agent_task_review_pending(
+    task: AgentTask, *, review_work_item_id: str
+) -> AgentTask:
+    append_lifecycle_event(
+        task,
+        "review_gate_pending",
+        status=AgentTaskStatus.READY_FOR_REVIEW,
+        metadata={"agent_bus_review_work_item_id": review_work_item_id},
+    )
+    task.completed_at = None
+    return task
+
+
+def mark_agent_task_review_approved(
+    task: AgentTask, *, review_packet_id: str | None = None
+) -> AgentTask:
+    append_lifecycle_event(
+        task,
+        "review_gate_approved",
+        actor="bb2",
+        status=AgentTaskStatus.COMPLETED,
+        metadata={"bb2_review_packet_id": review_packet_id},
+    )
+    task.completed_at = task.updated_at
+    return task
+
+
+def mark_agent_task_review_changes_requested(
+    task: AgentTask, *, decision: str
+) -> AgentTask:
+    append_lifecycle_event(
+        task,
+        "review_gate_changes_requested",
+        actor="bb2",
+        status=AgentTaskStatus.READY_FOR_REVIEW,
+        metadata={"decision": decision},
+    )
+    return task
+
+
 def mark_agent_task_dispatch_failed(task: AgentTask, error: str) -> AgentTask:
     append_lifecycle_event(
         task,

@@ -34,12 +34,26 @@ _install_agent_bus_runtime_methods()
 _install_github_status_method()
 runtime_validation_store = AgentBusRuntimeValidationStore()
 
-from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
+from app.circuit_runtime_validation_routes import (
+    register_circuit_runtime_validation_routes,
+)
+from app.agent_task_review_gate import finalize_review_gated_agent_task
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
-from app.event_store import DebugHealth, EventRecord, event_record_from_parsed, event_store, webhook_delivery_key
+from app.event_store import (
+    DebugHealth,
+    EventRecord,
+    event_record_from_parsed,
+    event_store,
+    webhook_delivery_key,
+)
 from app.github_context import hydrate_github_context
-from app.github_events import ParsedGitHubEvent, UnsupportedGitHubEventError, WebhookAcceptedResponse, parse_github_event
+from app.github_events import (
+    ParsedGitHubEvent,
+    UnsupportedGitHubEventError,
+    WebhookAcceptedResponse,
+    parse_github_event,
+)
 from app.github_writeback import writeback_review_decision
 from app.hermes_dispatch import dispatch_hermes_runtime_validation
 from app.operational_logging import (
@@ -565,33 +579,68 @@ async def _process_work_item(item: ReviewWorkItem, settings: Settings) -> Review
     )
 
     if not settings.enable_github_writeback:
-        log_review_completed(response.work_item, decision=response.decision.decision.value)
-        record_lifecycle_stage(response.work_item, ReviewLifecycleStage.REVIEW_COMPLETED)
+        log_review_completed(
+            response.work_item, decision=response.decision.decision.value
+        )
+        record_lifecycle_stage(
+            response.work_item, ReviewLifecycleStage.REVIEW_COMPLETED
+        )
         return response
 
     log_github_writeback_attempted()
-    record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED)
+    record_lifecycle_stage(
+        response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_STARTED
+    )
     github_client = GitHubClient(token=settings.github_token)
-    agent_bus_client = AgentBusClient(base_url=settings.agent_bus_base_url, token=settings.agent_bus_token) if settings.enable_agent_bus_dispatch else None
+    agent_bus_client = (
+        AgentBusClient(
+            base_url=settings.agent_bus_base_url, token=settings.agent_bus_token
+        )
+        if settings.enable_agent_bus_dispatch
+        else None
+    )
     try:
         writeback = await writeback_review_decision(response, github_client)
         response.github_writeback_attempted = writeback.attempted
         response.github_writeback_success = writeback.success
         response.github_writeback_error = writeback.error
-        record_lifecycle_stage(response.work_item, ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED, success=writeback.success, error=writeback.error)
+        record_lifecycle_stage(
+            response.work_item,
+            ReviewLifecycleStage.GITHUB_WRITEBACK_COMPLETED,
+            success=writeback.success,
+            error=writeback.error,
+        )
         if writeback.success:
-            task_dispatch = await dispatch_workflow_chain_continuation(
-                response.work_item,
-                response.decision.decision,
-                enabled=settings.enable_task_dispatch,
-                agent_bus_client=agent_bus_client,
-                agent_bus_enabled=settings.enable_agent_bus_dispatch,
-                continuation_store=_workflow_continuation_store(),
-                base_branch=settings.base_branch or "agent-integration",
-            )
-            if task_dispatch is None and response.decision.decision == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW:
+            review_gate_handled = False
+            if agent_bus_client is not None:
+                review_gate_handled = await finalize_review_gated_agent_task(
+                    response,
+                    settings,
+                    agent_bus_client=agent_bus_client,
+                    dependency_client=github_client,
+                )
+            task_dispatch = None
+            if not review_gate_handled:
+                task_dispatch = await dispatch_workflow_chain_continuation(
+                    response.work_item,
+                    response.decision.decision,
+                    enabled=settings.enable_task_dispatch,
+                    agent_bus_client=agent_bus_client,
+                    agent_bus_enabled=settings.enable_agent_bus_dispatch,
+                    continuation_store=_workflow_continuation_store(),
+                    base_branch=settings.base_branch or "agent-integration",
+                )
+            if (
+                not review_gate_handled
+                and task_dispatch is None
+                and response.decision.decision
+                == ReviewDecisionType.APPROVED_FOR_HUMAN_REVIEW
+            ):
                 if settings.enable_agent_bus_dispatch:
-                    record_lifecycle_stage(response.work_item, ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED)
+                    record_lifecycle_stage(
+                        response.work_item,
+                        ReviewLifecycleStage.AGENT_BUS_DISPATCH_STARTED,
+                    )
                 task_dispatch = await dispatch_next_agent_task(
                     response.work_item.repo_full_name,
                     github_client,
