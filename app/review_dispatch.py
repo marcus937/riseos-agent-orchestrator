@@ -4,7 +4,14 @@ import json
 import logging
 from typing import Any
 
-from app.agent_tasks import AgentTask, AgentTaskExecutionResult, AgentTaskStore
+from app.agent_tasks import (
+    AgentTask,
+    AgentTaskExecutionResult,
+    AgentTaskStatus,
+    AgentTaskStore,
+    mark_agent_task_review_approved,
+    mark_agent_task_review_changes_requested,
+)
 from app.clients.agent_bus import AgentBusClient
 
 logger = logging.getLogger(__name__)
@@ -105,6 +112,20 @@ async def reconcile_bb2_review_request_status(
         value = metadata.get(source_key)
         if value is not None:
             updated_evidence[target_key] = value
+
+    decision = str(updated_evidence.get("bb2_review_decision") or "").strip().lower()
+    review_status = (
+        str(updated_evidence.get("bb2_review_request_status") or "").strip().lower()
+    )
+    if task.status == AgentTaskStatus.READY_FOR_REVIEW and review_status == "completed":
+        if decision == "approved":
+            packet_id = updated_evidence.get("bb2_review_packet_id")
+            mark_agent_task_review_approved(
+                task,
+                review_packet_id=str(packet_id) if packet_id is not None else None,
+            )
+        elif decision in {"needs_changes", "rejected"}:
+            mark_agent_task_review_changes_requested(task, decision=decision)
 
     if updated_evidence != evidence:
         task.execution_evidence = updated_evidence

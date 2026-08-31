@@ -14,12 +14,14 @@ from app.agent_tasks import (
     AgentTaskCreateRequest,
     AgentTaskCreateResponse,
     AgentTaskExecutionResult,
+    AgentTaskStatus,
     AgentTaskStore,
     apply_execution_result,
     build_agent_task_store,
     create_agent_task,
     mark_agent_task_assigned,
     mark_agent_task_dispatch_failed,
+    mark_agent_task_review_pending,
     missing_dependency_task_ids,
     refresh_agent_task_dependency_state,
     refresh_agent_task_dependency_states,
@@ -146,13 +148,21 @@ async def record_agent_task_execution_result(
         client, should_close = _agent_bus_client(request, settings)
         github_client = _github_dependency_client(settings)
         try:
-            await dispatch_bb2_review_request_from_execution_result(
-                task,
-                payload,
-                client,
-                review_agent=settings.agent_bus_review_agent,
-                store=store,
+            review_work_item_id = (
+                await dispatch_bb2_review_request_from_execution_result(
+                    task,
+                    payload,
+                    client,
+                    review_agent=settings.agent_bus_review_agent,
+                    store=store,
+                )
             )
+            if review_work_item_id and payload.status == AgentTaskStatus.COMPLETED:
+                mark_agent_task_review_pending(
+                    task, review_work_item_id=review_work_item_id
+                )
+                store.save_agent_task(task)
+                _refresh_all_agent_tasks(store)
             await release_runnable_agent_tasks(
                 store,
                 client,

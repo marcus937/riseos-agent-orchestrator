@@ -70,6 +70,34 @@ class AgentBusClient:
         )
         return _object_response(response, "GET", path)
 
+    async def claim_review_request(
+        self, work_item_id: str, *, reviewer: str, actor: str
+    ) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError(
+                "AGENT_BUS_BASE_URL is required for Agent Bus dispatch."
+            )
+        path = f"/reviews/{quote(work_item_id, safe='')}/claim"
+        response = await self._client.post(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+            json={"reviewer": reviewer, "actor": actor},
+        )
+        return _object_response(response, "POST", path)
+
+    async def submit_bb2_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._base_url:
+            raise MissingAgentBusBaseUrlError(
+                "AGENT_BUS_BASE_URL is required for Agent Bus dispatch."
+            )
+        path = "/bb2/reviews"
+        response = await self._client.post(
+            f"{self._base_url}{path}",
+            headers=self._headers(),
+            json=payload,
+        )
+        return _object_response(response, "POST", path)
+
     async def create_review_packet(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._base_url:
             raise MissingAgentBusBaseUrlError("AGENT_BUS_BASE_URL is required for Agent Bus dispatch.")
