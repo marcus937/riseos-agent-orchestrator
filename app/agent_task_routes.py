@@ -32,7 +32,10 @@ from app.repository_discovery import (
     build_repository_registry,
     ensure_orchestration_enabled_repository,
 )
-from app.review_dispatch import dispatch_bb2_review_request_from_execution_result
+from app.review_dispatch import (
+    dispatch_bb2_review_request_from_execution_result,
+    reconcile_bb2_review_request_status,
+)
 from app.workflow_orchestration import build_workflow_store, update_shared_workflow_routing_after_result
 
 logger = logging.getLogger(__name__)
@@ -90,7 +93,16 @@ async def create_agent_task_endpoint(
 @router.get("", response_model=list[AgentTask])
 async def list_agent_tasks(request: Request, _: None = Depends(require_orchestrator_admin_token), settings: Settings = Depends(get_settings)) -> list[AgentTask]:
     store = _agent_task_store(request, settings)
-    return _refresh_all_agent_tasks(store)
+    tasks = _refresh_all_agent_tasks(store)
+    if settings.enable_agent_bus_dispatch:
+        client, should_close = _agent_bus_client(request, settings)
+        try:
+            for task in tasks:
+                await reconcile_bb2_review_request_status(task, client, store=store)
+        finally:
+            if should_close:
+                await client.aclose()
+    return tasks
 
 
 @router.get("/{task_id}", response_model=AgentTask)
@@ -100,6 +112,13 @@ async def get_agent_task(task_id: str, request: Request, _: None = Depends(requi
     task = store.get_agent_task(task_id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent task not found")
+    if settings.enable_agent_bus_dispatch:
+        client, should_close = _agent_bus_client(request, settings)
+        try:
+            await reconcile_bb2_review_request_status(task, client, store=store)
+        finally:
+            if should_close:
+                await client.aclose()
     return task
 
 

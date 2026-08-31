@@ -62,6 +62,56 @@ async def dispatch_bb2_review_request_from_execution_result(
     return review_work_item_id
 
 
+async def reconcile_bb2_review_request_status(
+    task: AgentTask,
+    client: AgentBusClient,
+    *,
+    store: AgentTaskStore,
+) -> AgentTask:
+    """Refresh persisted BB2 request state from its canonical Agent Bus work item."""
+
+    evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+    review_work_item_id = evidence.get("agent_bus_review_work_item_id")
+    if not isinstance(review_work_item_id, str) or not review_work_item_id.strip():
+        return task
+
+    try:
+        response = await client.get_work_item(review_work_item_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not reconcile BB2 review request task_id=%s review_work_item_id=%s error=%s",
+            task.task_id,
+            review_work_item_id,
+            exc,
+        )
+        return task
+
+    work_item = response.get("work_item") if isinstance(response.get("work_item"), dict) else response
+    status = work_item.get("status") if isinstance(work_item, dict) else None
+    if not isinstance(status, str) or not status.strip():
+        logger.warning(
+            "Agent Bus BB2 review response did not include status task_id=%s review_work_item_id=%s",
+            task.task_id,
+            review_work_item_id,
+        )
+        return task
+
+    metadata = work_item.get("metadata") if isinstance(work_item.get("metadata"), dict) else {}
+    updated_evidence = {**evidence, "bb2_review_request_status": status.strip().lower()}
+    for source_key, target_key in (
+        ("source_review_decision", "bb2_review_decision"),
+        ("source_review_packet_id", "bb2_review_packet_id"),
+    ):
+        value = metadata.get(source_key)
+        if value is not None:
+            updated_evidence[target_key] = value
+
+    if updated_evidence != evidence:
+        task.execution_evidence = updated_evidence
+        store.save_agent_task(task)
+    return task
+
+
 def build_agent_bus_review_request_payload(
     task: AgentTask,
     payload: AgentTaskExecutionResult,
