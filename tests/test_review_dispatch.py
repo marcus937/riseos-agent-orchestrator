@@ -3,7 +3,11 @@ from __future__ import annotations
 import anyio
 
 from app.agent_tasks import AgentTaskCreateRequest, AgentTaskExecutionResult, InMemoryAgentTaskStore, create_agent_task
-from app.review_dispatch import build_agent_bus_review_request_payload, dispatch_bb2_review_request_from_execution_result
+from app.review_dispatch import (
+    build_agent_bus_review_request_payload,
+    dispatch_bb2_review_request_from_execution_result,
+    reconcile_bb2_review_request_status,
+)
 
 
 class FakeAgentBusClient:
@@ -13,6 +17,19 @@ class FakeAgentBusClient:
     async def create_work_item(self, payload: dict) -> dict:
         self.payloads.append(payload)
         return {"work_item_id": "review-work-123", "status": "queued"}
+
+
+class FakeStatusAgentBusClient:
+    def __init__(self, response: dict | None = None, error: Exception | None = None) -> None:
+        self.response = response or {}
+        self.error = error
+        self.requested_ids: list[str] = []
+
+    async def get_work_item(self, work_item_id: str) -> dict:
+        self.requested_ids.append(work_item_id)
+        if self.error is not None:
+            raise self.error
+        return self.response
 
 
 def _task():
@@ -195,3 +212,65 @@ def test_execution_result_dispatch_is_idempotent_when_review_work_item_exists() 
 
     assert review_work_item_id == "existing-review-work"
     assert fake_bus.payloads == []
+
+
+def test_reconcile_bb2_review_request_persists_completed_status_and_decision() -> None:
+    task = _task()
+    task.execution_evidence = {
+        "agent_bus_review_work_item_id": "review-work-123",
+        "bb2_review_request_status": "queued",
+    }
+    store = InMemoryAgentTaskStore()
+    store.save_agent_task(task)
+    fake_bus = FakeStatusAgentBusClient(
+        {
+            "work_item": {
+                "work_item_id": "review-work-123",
+                "status": "completed",
+                "metadata": {
+                    "source_review_decision": "approved",
+                    "source_review_packet_id": "review-packet-123",
+                },
+            }
+        }
+    )
+
+    async def run_reconcile():
+        return await reconcile_bb2_review_request_status(task, fake_bus, store=store)
+
+    anyio.run(run_reconcile)
+
+    saved = store.get_agent_task(task.task_id)
+    assert saved is not None
+    assert fake_bus.requested_ids == ["review-work-123"]
+    assert saved.execution_evidence["bb2_review_request_status"] == "completed"
+    assert saved.execution_evidence["bb2_review_decision"] == "approved"
+    assert saved.execution_evidence["bb2_review_packet_id"] == "review-packet-123"
+
+
+def test_reconcile_bb2_review_request_accepts_direct_work_item_shape() -> None:
+    task = _task()
+    task.execution_evidence = {"agent_bus_review_work_item_id": "review-work-123"}
+    store = InMemoryAgentTaskStore()
+    store.save_agent_task(task)
+    fake_bus = FakeStatusAgentBusClient({"work_item_id": "review-work-123", "status": "claimed", "metadata": {}})
+
+    async def run_reconcile():
+        return await reconcile_bb2_review_request_status(task, fake_bus, store=store)
+
+    anyio.run(run_reconcile)
+
+    assert store.get_agent_task(task.task_id).execution_evidence["bb2_review_request_status"] == "claimed"
+
+
+def test_reconcile_bb2_review_request_preserves_last_status_when_agent_bus_is_unavailable() -> None:
+    task = _task()
+    task.execution_evidence = {"agent_bus_review_work_item_id": "review-work-123", "bb2_review_request_status": "queued"}
+    store = InMemoryAgentTaskStore()
+    store.save_agent_task(task)
+    async def run_reconcile():
+        client = FakeStatusAgentBusClient(error=RuntimeError("offline"))
+        return await reconcile_bb2_review_request_status(task, client, store=store)
+
+    anyio.run(run_reconcile)
+    assert store.get_agent_task(task.task_id).execution_evidence["bb2_review_request_status"] == "queued"
