@@ -207,6 +207,7 @@ def test_frontend_pr_vercel_ready_dispatches_hermes_and_records_agent_bus_sequen
         RuntimeValidationState.PLAYWRIGHT_EXECUTED.value,
         RuntimeValidationState.PASSED.value,
     ]
+    assert {state["actor"] for state in agent_bus.states} == {"hermes"}
 
 
 def test_payload_preview_url_without_verified_vercel_status_waits_for_deployment_resume() -> None:

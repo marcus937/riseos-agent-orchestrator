@@ -402,7 +402,7 @@ async def _record_agent_bus_state(agent_bus_client: AgentBusClient, request: Run
     payload: dict[str, Any] = {
         "work_item_id": request.work_item_id,
         "state": state.value,
-        "actor": "hermes" if state not in {RuntimeValidationState.REQUESTED, RuntimeValidationState.BLOCKED} else "orchestrator",
+        "actor": "hermes",
         "job_id": hermes_job_id,
         "hermes_job_id": hermes_job_id,
         "runtime_validation_id": runtime_validation_id,
