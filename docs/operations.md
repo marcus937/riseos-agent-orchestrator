@@ -78,6 +78,10 @@ event-backed workflows:
 The opt-in integration benchmark records wall-clock latency for the same
 requests without adding hardware-sensitive timing assertions to ordinary CI:
 
+Ordinary CI also asserts aggregate count-query shape, bounded per-source
+hydration windows, and serialized-byte budgets for the production-shaped
+fixture. Only the benchmark below records wall-clock latency.
+
 ```bash
 RUN_MISSION_CONTROL_POLLING_BENCHMARK=1 \
 MISSION_CONTROL_POLLING_BENCHMARK_ITERATIONS=10 \

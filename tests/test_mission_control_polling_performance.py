@@ -50,6 +50,15 @@ class InstrumentedMissionControlSQLiteStateStore(SQLiteStateStore):
         self.lifecycle_hydration_count = 0
         self.recent_event_limits: list[int | None] = []
         self.recent_event_hydration_count = 0
+        self.snapshot_count_calls: list[str | None] = []
+        self.event_count_calls = 0
+        self.review_workflow_count_calls: list[dict[str, object]] = []
+        self.event_workflow_count_calls: list[dict[str, object]] = []
+        self.event_snapshot_category_count_calls: list[str] = []
+        self.workflow_summary_count_calls = 0
+        self.review_queue_stats_calls = 0
+        self.worker_stats_calls = 0
+        self.recent_failure_limits: list[int] = []
         self.review_summary_limits: list[int] = []
         self.review_summary_hydration_count = 0
         self.event_summary_limits: list[int] = []
@@ -91,6 +100,68 @@ class InstrumentedMissionControlSQLiteStateStore(SQLiteStateStore):
         self.lifecycle_hydration_count += len(records)
         return records
 
+    def count_review_work_item_snapshot_records(self, *, collection: str | None = None) -> int:
+        self.snapshot_count_calls.append(collection)
+        return super().count_review_work_item_snapshot_records(collection=collection)
+
+    def event_count(self) -> int:
+        self.event_count_calls += 1
+        return super().event_count()
+
+    def count_review_work_items_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: Any = None,
+    ) -> int:
+        self.review_workflow_count_calls.append(
+            {
+                "workflow_filter": workflow_filter,
+                "recent_since": recent_since is not None,
+            }
+        )
+        return super().count_review_work_items_for_workflow_collection(
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+
+    def count_event_records_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: Any = None,
+    ) -> int:
+        self.event_workflow_count_calls.append(
+            {
+                "workflow_filter": workflow_filter,
+                "recent_since": recent_since is not None,
+            }
+        )
+        return super().count_event_records_for_workflow_collection(
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+
+    def workflow_summary_counts_for_snapshot(self) -> Any:
+        self.workflow_summary_count_calls += 1
+        return super().workflow_summary_counts_for_snapshot()
+
+    def _count_event_workflows_for_snapshot_category(self, category: str) -> int:
+        self.event_snapshot_category_count_calls.append(category)
+        return super()._count_event_workflows_for_snapshot_category(category)
+
+    def review_queue_stats(self) -> Any:
+        self.review_queue_stats_calls += 1
+        return super().review_queue_stats()
+
+    def worker_stats(self, *, auto_processing_enabled: bool) -> Any:
+        self.worker_stats_calls += 1
+        return super().worker_stats(auto_processing_enabled=auto_processing_enabled)
+
+    def list_recent_failures(self, *, limit: int = 20) -> Any:
+        self.recent_failure_limits.append(limit)
+        return super().list_recent_failures(limit=limit)
+
     def list_review_work_item_summary_records_for_workflow_collection(
         self,
         *,
@@ -131,6 +202,8 @@ class InstrumentedMissionControlSQLiteAgentTaskStore(SQLiteAgentTaskStore):
         super().__init__(db_path)
         self.agent_summary_limits: list[int] = []
         self.agent_summary_hydration_count = 0
+        self.agent_workflow_count_calls: list[dict[str, object]] = []
+        self.workflow_summary_count_calls = 0
 
     def list_agent_tasks(self) -> list[AgentTask]:
         raise AssertionError("Mission Control polling must not hydrate all agent tasks")
@@ -154,6 +227,27 @@ class InstrumentedMissionControlSQLiteAgentTaskStore(SQLiteAgentTaskStore):
         self.agent_summary_hydration_count += len(records)
         assert all(isinstance(record, AgentTaskWorkflowSummary) for record in records)
         return records
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: Any = None,
+    ) -> int:
+        self.agent_workflow_count_calls.append(
+            {
+                "workflow_filter": workflow_filter,
+                "recent_since": recent_since is not None,
+            }
+        )
+        return super().count_agent_tasks_for_workflow_collection(
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+
+    def workflow_summary_counts_for_snapshot(self) -> Any:
+        self.workflow_summary_count_calls += 1
+        return super().workflow_summary_counts_for_snapshot()
 
 
 def test_mission_control_production_snapshot_has_bounded_queries_and_size_budget(tmp_path: Path) -> None:
@@ -186,6 +280,18 @@ def test_mission_control_production_snapshot_has_bounded_queries_and_size_budget
     ]
     assert storage.lifecycle_limits == [ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT]
     assert storage.recent_event_limits == [ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT]
+    assert storage.snapshot_count_calls == [None, "issues", "prs"]
+    assert storage.event_count_calls == 2
+    assert storage.workflow_summary_count_calls == 1
+    assert storage.review_workflow_count_calls == []
+    assert storage.event_workflow_count_calls == [
+        {"workflow_filter": "active", "recent_since": False},
+    ]
+    assert storage.event_snapshot_category_count_calls == ["blocked", "reviewing"]
+    assert _task_store.workflow_summary_count_calls == 1
+    assert storage.review_queue_stats_calls == 1
+    assert storage.worker_stats_calls == 1
+    assert storage.recent_failure_limits == [20]
     assert storage.snapshot_record_hydration_count <= ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT * 3
     assert storage.lifecycle_hydration_count <= ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
     assert storage.recent_event_hydration_count <= ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT
@@ -204,6 +310,13 @@ def test_mission_control_default_workflow_page_has_bounded_queries_and_size_budg
     assert body["pagination"]["returned"] == 50
     assert body["pagination"]["total"] == fixture.total_workflow_count
     assert body["pagination"]["unfiltered_total"] == fixture.total_workflow_count
+    expected_count_calls = [
+        {"workflow_filter": "active_recent", "recent_since": True},
+        {"workflow_filter": "all", "recent_since": False},
+    ]
+    assert storage.review_workflow_count_calls == expected_count_calls
+    assert storage.event_workflow_count_calls == expected_count_calls
+    assert task_store.agent_workflow_count_calls == expected_count_calls
     assert storage.review_summary_limits == [50]
     assert storage.event_summary_limits == [50]
     assert task_store.agent_summary_limits == [50]
@@ -227,6 +340,13 @@ def test_mission_control_two_item_workflow_page_does_not_hydrate_complete_histor
     assert body["pagination"]["returned"] == 2
     assert body["pagination"]["total"] == fixture.total_workflow_count
     assert body["pagination"]["unfiltered_total"] == fixture.total_workflow_count
+    expected_count_calls = [
+        {"workflow_filter": "active_recent", "recent_since": True},
+        {"workflow_filter": "all", "recent_since": False},
+    ]
+    assert storage.review_workflow_count_calls == expected_count_calls
+    assert storage.event_workflow_count_calls == expected_count_calls
+    assert task_store.agent_workflow_count_calls == expected_count_calls
     assert storage.review_summary_limits == [2]
     assert storage.event_summary_limits == [2]
     assert task_store.agent_summary_limits == [2]
