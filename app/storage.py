@@ -923,6 +923,12 @@ NOT EXISTS (
             AND r.issue_number IS NULL
             AND r.pr_number IS NULL
             AND (
+                {alias}.branch IS NOT NULL
+                OR {alias}.commit_sha IS NOT NULL
+                OR r.branch IS NOT NULL
+                OR r.commit_sha IS NOT NULL
+            )
+            AND (
                 r.branch = {alias}.branch
                 OR (r.branch IS NULL AND {alias}.branch IS NULL)
             )
@@ -930,6 +936,17 @@ NOT EXISTS (
                 r.commit_sha = {alias}.commit_sha
                 OR (r.commit_sha IS NULL AND {alias}.commit_sha IS NULL)
             )
+        )
+        OR (
+            {alias}.issue_number IS NULL
+            AND {alias}.pr_number IS NULL
+            AND {alias}.branch IS NULL
+            AND {alias}.commit_sha IS NULL
+            AND r.issue_number IS NULL
+            AND r.pr_number IS NULL
+            AND r.branch IS NULL
+            AND r.commit_sha IS NULL
+            AND r.id = COALESCE({alias}.correlation_id, {alias}.event_id)
         )
       )
 )

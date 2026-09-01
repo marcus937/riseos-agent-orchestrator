@@ -183,19 +183,9 @@ def _build_bounded_storage_workflow_collection(
     now = datetime.now(UTC)
     recent_since = now - timedelta(days=bounded_recent_days)
     candidate_limit = bounded_offset + bounded_limit
-    review_total = storage.count_review_work_items_for_workflow_collection(
-        workflow_filter=workflow_filter_value,
-        recent_since=recent_since,
-    )
-    agent_task_total = (
-        agent_store.count_agent_tasks_for_workflow_collection(
-            workflow_filter=workflow_filter_value,
-            recent_since=recent_since,
-        )
-        if agent_store is not None
-        else 0
-    )
-    event_total = storage.count_event_records_for_workflow_collection(
+    total = _count_bounded_storage_normalized_workflows(
+        storage,
+        agent_store,
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
     )
@@ -218,13 +208,10 @@ def _build_bounded_storage_workflow_collection(
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
     )
-    total = review_total + agent_task_total + event_total
-    unfiltered_total = (
-        storage.count_review_work_items()
-        + (agent_store.count_agent_tasks() if agent_store is not None else 0)
-        + storage.count_event_records_for_workflow_collection(
-            workflow_filter=WorkflowListFilter.ALL.value,
-        )
+    unfiltered_total = _count_bounded_storage_normalized_workflows(
+        storage,
+        agent_store,
+        workflow_filter=WorkflowListFilter.ALL.value,
     )
     workflows = build_workflow_summaries(review_items, event_candidates, agent_task_summaries)
     page = workflows[bounded_offset : bounded_offset + bounded_limit]
@@ -243,6 +230,35 @@ def _build_bounded_storage_workflow_collection(
             filter=normalized_filter,
             recent_days=bounded_recent_days,
         ),
+    )
+
+
+def _count_bounded_storage_normalized_workflows(
+    storage: SQLiteStateStore,
+    agent_store: AgentTaskStore | None,
+    *,
+    workflow_filter: str,
+    recent_since: datetime | None = None,
+) -> int:
+    # Event workflow counts apply the same review-item identity suppression as
+    # summary listing, so the sum is normalized workflow records, not raw rows.
+    return (
+        storage.count_review_work_items_for_workflow_collection(
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+        + (
+            agent_store.count_agent_tasks_for_workflow_collection(
+                workflow_filter=workflow_filter,
+                recent_since=recent_since,
+            )
+            if agent_store is not None
+            else 0
+        )
+        + storage.count_event_records_for_workflow_collection(
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
     )
 
 
@@ -379,7 +395,6 @@ def _supports_bounded_workflow_storage(storage: object) -> bool:
         hasattr(storage, name)
         for name in (
             "count_event_records_for_workflow_collection",
-            "count_review_work_items",
             "count_review_work_items_for_workflow_collection",
             "list_event_workflow_summary_records_for_collection",
             "list_review_work_item_summary_records_for_workflow_collection",
@@ -393,7 +408,6 @@ def _supports_bounded_agent_task_store(agent_store: object | None) -> bool:
     return all(
         hasattr(agent_store, name)
         for name in (
-            "count_agent_tasks",
             "count_agent_tasks_for_workflow_collection",
             "list_agent_task_workflow_summaries_for_collection",
         )

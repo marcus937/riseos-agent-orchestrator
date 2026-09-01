@@ -545,7 +545,7 @@ def _review_item_workflow_identity_key(
 
 
 def _event_records_workflow_identity_key(
-    records: list[EventRecord],
+    records: list[EventRecord | EventWorkflowSummary],
 ) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
     ordered_records = sorted(records, key=lambda record: (record.received_at, record.event_id))
     for record in reversed(ordered_records):
@@ -555,7 +555,7 @@ def _event_records_workflow_identity_key(
 
 
 def _event_record_workflow_identity_key(
-    record: EventRecord,
+    record: EventRecord | EventWorkflowSummary,
 ) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
     return _github_workflow_identity_key(
         repo_full_name=record.repo_full_name,
@@ -583,14 +583,14 @@ def _github_workflow_identity_key(
     return ("github_record", repo_full_name, None, None, fallback_id, None)
 
 
-def _event_workflow_id(record: EventRecord) -> str:
+def _event_workflow_id(record: EventRecord | EventWorkflowSummary) -> str:
     workflow_id = getattr(record, "workflow_id", None)
     if workflow_id:
         return workflow_id
     return f"wf-{record.correlation_id or record.event_id}"
 
 
-def _latest_record_value(records: list[EventRecord], name: str) -> Any:
+def _latest_record_value(records: list[EventRecord | EventWorkflowSummary], name: str) -> Any:
     for record in reversed(records):
         value = getattr(record, name)
         if value is not None:

@@ -883,6 +883,84 @@ def test_workflow_endpoint_bounded_sqlite_keeps_distinct_ref_workflows(tmp_path)
     assert body["pagination"]["unfiltered_total"] == 2
 
 
+def test_workflow_endpoint_bounded_sqlite_keeps_distinct_fallback_workflows(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="generic-review",
+            created_at=base,
+            updated_at=base,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PUSH,
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="generic-event",
+            github_event=GitHubEventType.PUSH,
+            repo_full_name="riseos/example",
+            received_at=base + timedelta(minutes=1),
+        )
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-generic-event",
+        "wf-generic-review",
+    ]
+    assert body["pagination"]["returned"] == 2
+    assert body["pagination"]["total"] == 2
+    assert body["pagination"]["unfiltered_total"] == 2
+    assert body["pagination"]["has_next"] is False
+
+
+def test_workflow_endpoint_bounded_sqlite_deduplicates_matching_fallback_workflows(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="shared-fallback",
+            created_at=base,
+            updated_at=base,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PUSH,
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="shared-fallback-event",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="shared-fallback",
+            repo_full_name="riseos/example",
+            received_at=base + timedelta(minutes=1),
+        )
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == ["wf-shared-fallback"]
+    assert body["pagination"]["returned"] == 1
+    assert body["pagination"]["total"] == 1
+    assert body["pagination"]["unfiltered_total"] == 1
+    assert body["pagination"]["has_next"] is False
+
+
 def test_workflow_detail_uses_targeted_sqlite_review_item_lookup(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)

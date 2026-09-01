@@ -106,7 +106,8 @@ The `workflows` array is intentionally compact for polling clients. It omits
 `GET /api/v1/workflows/{workflow_id}/timeline` when a view needs full detail.
 Correlated GitHub event records are collapsed into one event-backed workflow;
 event-backed workflows are de-duplicated against review work items by issue/PR
-subject when present, or by branch and commit for ref-only events. `pagination.total`
+subject when present, by branch and commit for ref-only events, or by fallback
+workflow record ID when neither subject nor ref is available. `pagination.total`
 and `pagination.unfiltered_total` count normalized workflows, not raw event rows.
 Correlated event workflow summaries preserve the first event as `created_at`
 and the latest event as `updated_at`/`last_activity_at`; full event sequences
