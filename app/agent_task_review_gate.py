@@ -4,11 +4,14 @@ import logging
 from typing import Any
 
 from app.agent_task_release import release_runnable_agent_tasks
+from app.agent_task_release import dispatch_circuit_wakeup_for_assigned_task
+from app.agent_task_dispatch import build_agent_bus_work_item_payload
 from app.agent_tasks import (
     AgentTask,
     AgentTaskStatus,
     AgentTaskStore,
     build_agent_task_store,
+    mark_agent_task_assigned,
 )
 from app.clients.agent_bus import AgentBusAPIError, AgentBusClient
 from app.config import Settings
@@ -67,7 +70,7 @@ async def finalize_review_gated_agent_task(
         await _claim_review_envelope(
             client, review_work_item_id, reviewer=settings.agent_bus_review_agent
         )
-        await client.submit_bb2_review(
+        review_packet = await client.submit_bb2_review(
             _bb2_review_payload(
                 response,
                 review_work_item_id=review_work_item_id,
@@ -86,10 +89,83 @@ async def finalize_review_gated_agent_task(
                 correlation_id=task.correlation_id,
                 settings=settings,
             )
+        elif decision in _CHANGES_REQUESTED:
+            await _dispatch_bb2_revision(
+                refreshed,
+                response,
+                review_packet=review_packet,
+                store=task_store,
+                client=client,
+                settings=settings,
+            )
         return True
     finally:
         if owns_client:
             await client.aclose()
+
+
+async def _dispatch_bb2_revision(
+    task: AgentTask,
+    response: ReviewProcessResponse,
+    *,
+    review_packet: dict[str, Any],
+    store: AgentTaskStore,
+    client: AgentBusClient,
+    settings: Settings,
+) -> None:
+    """Requeue the current step on its existing branch after BB2 requests changes."""
+
+    evidence = task.execution_evidence if isinstance(task.execution_evidence, dict) else {}
+    packet_id = str(review_packet.get("review_packet_id") or "").strip()
+    if packet_id and evidence.get("bb2_revision_review_packet_id") == packet_id:
+        return
+
+    payload = build_agent_bus_work_item_payload(
+        task,
+        review_agent=settings.agent_bus_review_agent,
+    )
+    metadata = payload.setdefault("metadata", {})
+    required_changes = list(response.decision.required_changes)
+    branch = response.work_item.branch or task.branch
+    pr_number = response.work_item.pr_number
+    if branch:
+        payload["branch"] = branch
+        metadata["source_branch"] = branch
+    if pr_number is not None:
+        payload["pr_number"] = pr_number
+        metadata["source_pr_number"] = pr_number
+    metadata.update(
+        {
+            "dispatch_reason": "bb2_needs_changes_revision",
+            "revision_of_work_item_id": task.agent_bus_work_item_id,
+            "review_packet_id": packet_id or None,
+            "review_summary": response.decision.summary,
+            "required_changes": required_changes,
+            "revision_instructions": required_changes,
+            "reuse_existing_pr": True,
+            "create_new_pr": False,
+        }
+    )
+    created = await client.create_work_item(payload)
+    raw_work_item_id = created.get("work_item_id") or created.get("id")
+    if not raw_work_item_id:
+        raise RuntimeError("Agent Bus revision response did not include work_item_id.")
+
+    previous_work_item_id = task.agent_bus_work_item_id
+    task.execution_evidence = {
+        **evidence,
+        "bb2_revision_review_packet_id": packet_id or None,
+        "bb2_revision_of_work_item_id": previous_work_item_id,
+        "bb2_required_changes": required_changes,
+    }
+    mark_agent_task_assigned(task, work_item_id=str(raw_work_item_id))
+    store.save_agent_task(task)
+    await dispatch_circuit_wakeup_for_assigned_task(
+        task,
+        settings=settings,
+        agent_bus_client=client,
+    )
+    store.save_agent_task(task)
 
 
 async def _claim_review_envelope(

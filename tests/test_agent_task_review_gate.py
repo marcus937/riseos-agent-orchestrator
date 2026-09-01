@@ -152,7 +152,45 @@ def test_changes_requested_keeps_successor_blocked() -> None:
         )
 
     assert anyio.run(run) is True
-    assert store.get_agent_task(first_id).status == AgentTaskStatus.READY_FOR_REVIEW
+    revised = store.get_agent_task(first_id)
+    assert revised.status == AgentTaskStatus.ASSIGNED
+    assert revised.agent_bus_work_item_id == "implementation-2"
     assert store.get_agent_task(second_id).blocked is True
     assert bus.reviews[0]["decision"] == "needs_changes"
-    assert bus.created == []
+    assert len(bus.created) == 1
+    revision = bus.created[0]
+    assert revision["owner_agent"] == "codex-m2"
+    assert revision["branch"] == "codex-m2/contract-alignment"
+    assert revision["pr_number"] == 202
+    assert revision["metadata"]["dispatch_reason"] == "bb2_needs_changes_revision"
+    assert revision["metadata"]["required_changes"] == ["Fix the contract."]
+    assert revision["metadata"]["reuse_existing_pr"] is True
+    assert revision["metadata"]["create_new_pr"] is False
+    assert revised.execution_evidence["bb2_revision_review_packet_id"] == "packet-1"
+
+
+def test_duplicate_changes_requested_does_not_create_duplicate_revision() -> None:
+    store, first_id, _ = _store()
+    bus = FakeAgentBusClient(decision="needs_changes")
+
+    async def run() -> None:
+        response = _response(ReviewDecisionType.NEEDS_CHANGES)
+        assert await finalize_review_gated_agent_task(
+            response,
+            Settings(),
+            store=store,
+            agent_bus_client=bus,
+        )
+        # Simulate replaying the same review event against a still-reviewable task.
+        task = store.get_agent_task(first_id)
+        task.status = AgentTaskStatus.READY_FOR_REVIEW
+        store.save_agent_task(task)
+        assert await finalize_review_gated_agent_task(
+            response,
+            Settings(),
+            store=store,
+            agent_bus_client=bus,
+        )
+
+    anyio.run(run)
+    assert len(bus.created) == 1
