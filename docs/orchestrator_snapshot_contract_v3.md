@@ -123,6 +123,9 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 - SQLite-backed snapshots merge AgentTask workflow counts only from a matching
   SQLite AgentTask store; in-memory AgentTask state is ignored when persisted
   storage is active.
+- Snapshot workflow summary counts use aggregate count queries and the same
+  event-backed workflow de-duplication identity as `/api/v1/workflows`, so raw
+  correlated event rows do not inflate dashboard counts.
 - Workforce records preserve compact workflow summary fields, including `workflow_id`, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
 - Workforce records intentionally do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
 - Top-level `workflows` counts include review work items, AgentTask workflows, and de-duplicated event-backed workflows using summary/count records only.
@@ -203,5 +206,6 @@ The contract is covered by endpoint tests that verify:
 - Workforce list payloads are bounded and omit full workflow timeline arrays and runtime validation context payloads.
 - Storage-backed snapshot collection queries are bounded while `workforce.meta.*.total` remains accurate.
 - Snapshot workflow counts include AgentTask workflows without hydrating full AgentTask detail payloads.
+- Snapshot workflow counts de-duplicate event-backed workflows that match persisted review work item identities.
 - The endpoint follows the debug-read access policy when token protection is enabled.
 - Runtime status does not expose configured secret values.

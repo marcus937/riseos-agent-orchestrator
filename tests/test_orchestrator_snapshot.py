@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -454,6 +454,61 @@ def test_orchestrator_snapshot_counts_sqlite_agent_task_workflows_without_detail
         "verified": 0,
     }
     assert detail_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_sqlite_workflow_counts_deduplicate_event_backed_review_items(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="duplicate-review-pr",
+            created_at=base,
+            updated_at=base,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            pr_number=17,
+            status=ReviewWorkItemStatus.BLOCKED,
+            lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
+            last_failure_at=base,
+            last_error="blocked",
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="duplicate-closed-pr-event",
+            github_event=GitHubEventType.PULL_REQUEST,
+            correlation_id="duplicate-closed-pr",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            pr_merged=False,
+            received_at=base + timedelta(minutes=1),
+            raw_action="closed",
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="unique-review-event",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            repo_full_name="riseos/example",
+            pr_number=18,
+            received_at=base + timedelta(minutes=2),
+            raw_action="submitted",
+        )
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["workflows"] == {
+        "active": 2,
+        "blocked": 1,
+        "reviewing": 1,
+        "verified": 0,
+    }
 
 
 def test_orchestrator_snapshot_storage_path_does_not_count_global_agent_tasks(tmp_path) -> None:

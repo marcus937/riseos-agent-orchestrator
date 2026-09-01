@@ -16,7 +16,7 @@ from app.agent_tasks import (
 )
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
-from app.event_store import EventRecord, event_store
+from app.event_store import EventRecord, EventWorkflowSummary, event_store
 from app.github_events import GitHubEventType
 from app.main import app
 from app.review_queue import ReviewWorkItem, ReviewWorkItemWorkflowSummary, review_queue
@@ -97,6 +97,61 @@ class SummaryOnlyWorkflowListSQLiteAgentTaskStore(NoFullWorkflowListSQLiteAgentT
         assert all(not hasattr(summary, "execution_evidence") for summary in summaries)
         assert all(not hasattr(summary, "lifecycle_events") for summary in summaries)
         return summaries
+
+
+class QueryShapeWorkflowListSQLiteStateStore(NoFullWorkflowListSQLiteStateStore):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.review_summary_limits: list[int] = []
+        self.event_summary_limits: list[int] = []
+
+    def list_review_work_item_summary_records_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[ReviewWorkItemWorkflowSummary]:
+        self.review_summary_limits.append(limit)
+        return super().list_review_work_item_summary_records_for_workflow_collection(
+            limit=limit,
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+
+    def list_event_workflow_summary_records_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[EventWorkflowSummary]:
+        self.event_summary_limits.append(limit)
+        return super().list_event_workflow_summary_records_for_collection(
+            limit=limit,
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+
+
+class QueryShapeWorkflowListSQLiteAgentTaskStore(NoFullWorkflowListSQLiteAgentTaskStore):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.agent_summary_limits: list[int] = []
+
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
+        self.agent_summary_limits.append(limit)
+        return super().list_agent_task_workflow_summaries_for_collection(
+            limit=limit,
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -557,6 +612,43 @@ def test_workflow_endpoint_bounded_sqlite_pages_across_sources_by_activity(tmp_p
         "filter": "all",
         "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     }
+
+
+def test_workflow_endpoint_bounded_sqlite_fetches_only_candidate_window_per_source(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = QueryShapeWorkflowListSQLiteStateStore(db_path)
+    task_store = QueryShapeWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    for index in range(20):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"query-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch=f"query-event-{index}",
+                commit_sha=f"event-sha-{index}",
+                received_at=base + timedelta(minutes=index),
+            )
+        )
+        storage.save_review_work_item(_review_item(f"query-review-{index}", base + timedelta(minutes=index)))
+        task_store.save_agent_task(
+            _agent_task(f"query-agent-{index}", AgentTaskStatus.QUEUED, base + timedelta(minutes=index))
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=3&offset=4")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["workflows"]) == 3
+    assert body["pagination"]["total"] == 60
+    assert body["pagination"]["unfiltered_total"] == 60
+    assert storage.review_summary_limits == [7]
+    assert storage.event_summary_limits == [7]
+    assert task_store.agent_summary_limits == [7]
 
 
 def test_workflow_endpoint_bounded_sqlite_recent_filter_counts_review_items(tmp_path) -> None:

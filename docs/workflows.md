@@ -116,6 +116,13 @@ When SQLite storage is active, AgentTask workflows are merged into the list only
 from a matching SQLite AgentTask store. In-memory AgentTask stores are ignored
 for storage-backed polling so global process state cannot inflate or leak into
 the persisted workflow collection.
+Storage-backed list assembly fetches at most `offset + limit` compact summary
+rows from each workflow source, computes totals with count queries, merges the
+candidate summaries by activity, then slices the requested page. This keeps the
+polling payload and query result sets bounded while preserving cross-source
+ordering. Full workflow and timeline hydration is reserved for
+`GET /api/v1/workflows/{workflow_id}` and
+`GET /api/v1/workflows/{workflow_id}/timeline`.
 `pagination.truncated` means more filtered workflows exist beyond the returned
 page. `pagination.has_next` is true only when `next_offset` is within the
 bounded offset window.
