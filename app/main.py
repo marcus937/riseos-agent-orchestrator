@@ -290,11 +290,12 @@ def _review_items() -> list[ReviewWorkItem]:
     return review_queue.list_items()
 
 
-def _recent_events() -> list[EventRecord]:
+def _recent_events(*, limit: int | None = None) -> list[EventRecord]:
     storage = _storage()
     if storage is not None:
-        return storage.recent_events()
-    return event_store.recent_events()
+        return storage.recent_events(limit=limit) if limit is not None else storage.recent_events()
+    events = event_store.recent_events()
+    return events[:limit] if limit is not None else events
 
 
 def _review_queue_stats(items: list[ReviewWorkItem] | None = None) -> ReviewQueueStats:
@@ -466,7 +467,7 @@ async def orchestrator_snapshot(
         ),
         workforce_totals=_snapshot_workforce_totals(),
         workflow_counts=_snapshot_workflow_counts(),
-        events=_recent_events(),
+        events=_recent_events(limit=ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
         recent_failures=_recent_failures(items),
     )
 

@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 import app.orchestrator_snapshot as snapshot_module
 from app.config import get_settings
-from app.event_store import event_store
+from app.event_store import EventRecord, event_store
 from app.github_events import GitHubEventType
 from app.main import app
 from app.orchestrator_snapshot import (
@@ -62,6 +62,12 @@ class SnapshotBoundedSQLiteStateStore(SnapshotCompactSQLiteStateStore):
         super().__init__(db_path)
         self.snapshot_record_calls: list[dict[str, object]] = []
         self.lifecycle_limits: list[int | None] = []
+        self.recent_event_limits: list[int | None] = []
+
+    def recent_events(self, limit: int = 50) -> list[EventRecord]:
+        self.recent_event_limits.append(limit)
+        assert limit == ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT
+        return super().recent_events(limit=limit)
 
     def list_review_work_item_snapshot_records(
         self,
@@ -355,6 +361,7 @@ def test_orchestrator_snapshot_uses_bounded_sqlite_collection_queries(tmp_path) 
         {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": "prs"},
     ]
     assert storage.lifecycle_limits == [ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT]
+    assert storage.recent_event_limits == [ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT]
     assert body["workforce"]["meta"]["agents"] == {
         "returned": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
         "total": total,
