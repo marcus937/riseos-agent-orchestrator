@@ -71,7 +71,7 @@ Only agent workflow instructions may reference branch creation and PR creation. 
 
 ## GitHub Token Permissions
 
-`GITHUB_TOKEN` should be scoped to the smallest permissions needed for the target repository. The client uses read access for commits, branch comparisons, and open issues, plus issue/PR write access for comments and labels. It does not create branches, merge, delete branches, mutate refs, retarget PRs, close issues, or write repository files.
+`GITHUB_TOKEN` should be scoped to the smallest permissions needed for the target repository. The client uses read access for commits, branch comparisons, and open issues, issue/PR write access for comments and labels, and **Commit statuses: Read and write** when Hermes runtime-validation status writeback is enabled. A classic personal access token needs `repo:status` (or `repo`). It does not create branches, merge, delete branches, mutate refs, retarget PRs, close issues, or write repository files.
 
 Recommended fine-grained token permissions:
 

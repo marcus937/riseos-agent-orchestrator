@@ -74,6 +74,14 @@ class FakeGitHubClient:
         self.closed = True
 
 
+class PartiallyFailingGitHubClient(FakeGitHubClient):
+    async def post_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> dict[str, Any]:
+        raise RuntimeError("comment write denied")
+
+    async def create_commit_status(self, repo_full_name: str, sha: str, **payload: Any) -> dict[str, Any]:
+        raise RuntimeError("commit status write denied")
+
+
 class FakeHermesClient:
     def __init__(self, response: dict[str, Any] | None = None, *, evidence: HermesEvidenceSnapshot | None = None) -> None:
         self.response = response or {"status": "PASSED", "jobId": "hermes-job-1"}
@@ -258,6 +266,29 @@ def test_hermes_passed_creates_github_comment_label_and_commit_status() -> None:
     assert github.labels == [("marcus937/jarvis-mission-control", 134, "agent-verified")]
     assert github.commit_statuses[0][2]["context"] == "Hermes Playwright Validation"
     assert github.commit_statuses[0][2]["state"] == "success"
+
+
+def test_github_writebacks_are_isolated_and_do_not_poison_validation(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "app.circuit_runtime_validation.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("93.184.216.34", 0))],
+    )
+    parsed = parse_github_event("pull_request", pr_payload())
+    agent_bus = FakeAgentBusClient()
+    github = PartiallyFailingGitHubClient()
+    hermes = FakeHermesClient({"status": "PASSED", "jobId": "job-ok"})
+    store = make_store(agent_bus, github, hermes)
+    request = run(runtime_validation_request_from_parsed(parsed, settings(), github_client=github))
+
+    result = run(store.trigger(request, settings()))
+
+    assert result.status == "completed"
+    assert result.error is None
+    assert github.labels == [("marcus937/jarvis-mission-control", 134, "agent-verified")]
+    assert result.bb2.review_context["github_writeback_errors"] == {
+        "comment": "comment write denied",
+        "commit_status": "commit status write denied",
+    }
 
 
 def test_hermes_failed_prevents_ready_for_review_by_agent_bus_result() -> None:
