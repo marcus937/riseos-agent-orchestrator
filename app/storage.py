@@ -1364,8 +1364,10 @@ def _log_review_work_item_persistence_json(
         workflow_chain_populated=bool(workflow_chain),
         runtime_context_populated=bool(context),
         review_dispatch_populated=bool(review_dispatch),
-        raw_json_stored=raw_json_stored,
-        raw_json_loaded=raw_json_loaded,
+        raw_json_stored_present=raw_json_stored is not None,
+        raw_json_stored_bytes=_serialized_text_bytes(raw_json_stored),
+        raw_json_loaded_present=raw_json_loaded is not None,
+        raw_json_loaded_bytes=_serialized_text_bytes(raw_json_loaded),
         _include_nulls=True,
     )
 
@@ -1375,6 +1377,12 @@ def _first_dict(*values: Any) -> dict[str, Any]:
         if isinstance(value, dict) and value:
             return value
     return {}
+
+
+def _serialized_text_bytes(value: object | None) -> int | None:
+    if value is None:
+        return None
+    return len(str(value).encode("utf-8"))
 
 
 _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [

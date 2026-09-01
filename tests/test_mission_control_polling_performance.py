@@ -281,6 +281,34 @@ def test_mission_control_polling_observability_is_scalar_only(
         assert PRODUCTION_SECRET_SENTINEL not in serialized_log
 
 
+def test_mission_control_production_fixture_diagnostics_do_not_log_payloads(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=LOGGER_NAME)
+    caplog.clear()
+
+    storage = SQLiteStateStore(str(tmp_path / "orchestrator.db"), max_review_items=1_000)
+    task_store = SQLiteAgentTaskStore(str(tmp_path / "orchestrator.db"))
+    seed_mission_control_production_fixture(storage, task_store)
+
+    serialized_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert PRODUCTION_DETAIL_SENTINEL not in serialized_logs
+    assert PRODUCTION_SECRET_SENTINEL not in serialized_logs
+
+    storage_payload_logs = [
+        payload
+        for payload in _json_log_payloads(caplog)
+        if str(payload.get("event", "")).startswith("wf_chain_metadata_storage_")
+    ]
+    assert storage_payload_logs
+    assert any(payload.get("raw_json_stored_present") for payload in storage_payload_logs)
+    assert any(payload.get("raw_json_stored_bytes", 0) > 0 for payload in storage_payload_logs)
+    for payload in storage_payload_logs:
+        assert "raw_json_stored" not in payload
+        assert "raw_json_loaded" not in payload
+
+
 @pytest.mark.skipif(
     os.getenv(BENCHMARK_ENV_VAR) != "1",
     reason=f"Set {BENCHMARK_ENV_VAR}=1 to record Mission Control polling latency.",
@@ -347,14 +375,21 @@ def _model_serialized_bytes(payload: dict[str, Any]) -> int:
 
 
 def _polling_logs(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        payload
+        for payload in _json_log_payloads(caplog)
+        if payload.get("event") == "mission_control_polling_response"
+    ]
+
+
+def _json_log_payloads(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
     logs: list[dict[str, Any]] = []
     for record in caplog.records:
         try:
             payload = json.loads(record.getMessage())
         except json.JSONDecodeError:
             continue
-        if payload.get("event") == "mission_control_polling_response":
-            logs.append(payload)
+        logs.append(payload)
     return logs
 
 
