@@ -4,7 +4,13 @@ from datetime import UTC, datetime, timedelta
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.agent_tasks import agent_task_store
+from app.agent_tasks import (
+    AgentTask,
+    AgentTaskCreateRequest,
+    SQLiteAgentTaskStore,
+    agent_task_store,
+    create_agent_task,
+)
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
 from app.event_store import event_store
@@ -12,6 +18,7 @@ from app.github_events import GitHubEventType
 from app.main import app
 from app.review_queue import ReviewWorkItem, review_queue
 from app.security import build_signature
+from app.storage import SQLiteStateStore
 from app.workflow_lifecycle import WorkflowState
 from app.workflow_routes import register_workflow_routes
 from app.workflows import (
@@ -28,6 +35,7 @@ def client_with_secret(
     secret: str = "test-secret",
     admin_token: str = "admin-token",
     require_debug_read_token: bool = False,
+    db_path: str | None = None,
 ) -> TestClient:
     get_settings.cache_clear()
     event_store.reset()
@@ -38,12 +46,23 @@ def client_with_secret(
             delattr(app.state, state_key)
     app.dependency_overrides[get_settings] = lambda: get_settings().__class__(
         github_webhook_secret=secret,
+        orchestrator_db_path=db_path,
         orchestrator_admin_token=admin_token,
         require_admin_token_for_debug_reads=require_debug_read_token,
         hermes_m2_token="hermes-m2-secret",
         hermes_dgx_token="hermes-dgx-secret",
     )
     return TestClient(app)
+
+
+class NoFullWorkflowListSQLiteStateStore(SQLiteStateStore):
+    def list_review_work_items(self) -> list[ReviewWorkItem]:
+        raise AssertionError("GET /api/v1/workflows must not hydrate all review work items")
+
+
+class NoFullWorkflowListSQLiteAgentTaskStore(SQLiteAgentTaskStore):
+    def list_agent_tasks(self) -> list[AgentTask]:
+        raise AssertionError("GET /api/v1/workflows must not hydrate all agent tasks")
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -219,6 +238,55 @@ def test_workflow_endpoint_honors_pagination_query_params() -> None:
         "truncated": False,
         "has_next": False,
         "next_offset": None,
+        "filter": "all",
+        "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    }
+
+
+def test_workflow_endpoint_uses_bounded_sqlite_queries_for_collection(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    for index in range(8):
+        storage.save_review_work_item(_review_item(f"review-{index}", base + timedelta(minutes=index)))
+    for index in range(8):
+        task = create_agent_task(
+            AgentTaskCreateRequest(
+                repo_full_name="riseos/example",
+                title=f"Task {index}",
+                objective=f"Run task {index}.",
+            )
+        )
+        task.task_id = f"bounded-{index}"
+        task.created_at = base + timedelta(minutes=20 + index)
+        task.updated_at = task.created_at
+        for event in task.lifecycle_events:
+            event.occurred_at = task.created_at
+        task_store.save_agent_task(task)
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=3")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-agent-task-bounded-7",
+        "wf-agent-task-bounded-6",
+        "wf-agent-task-bounded-5",
+    ]
+    assert body["pagination"] == {
+        "limit": 3,
+        "offset": 0,
+        "returned": 3,
+        "total": 16,
+        "unfiltered_total": 16,
+        "truncated": True,
+        "has_next": True,
+        "next_offset": 3,
         "filter": "all",
         "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     }

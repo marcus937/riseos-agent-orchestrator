@@ -123,6 +123,26 @@ class AgentTaskStore(Protocol):
     def list_agent_tasks(self) -> list[AgentTask]:
         ...
 
+    def count_agent_tasks(self) -> int:
+        ...
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        ...
+
+    def list_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTask]:
+        ...
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         ...
 
@@ -140,6 +160,39 @@ class InMemoryAgentTaskStore:
 
     def list_agent_tasks(self) -> list[AgentTask]:
         return sorted(self._items, key=lambda task: task.created_at, reverse=True)
+
+    def count_agent_tasks(self) -> int:
+        return len(self._items)
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        return len(
+            _filter_agent_tasks_for_workflow_collection(
+                list(self._items),
+                workflow_filter=workflow_filter,
+                recent_since=recent_since,
+            )
+        )
+
+    def list_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTask]:
+        if limit <= 0:
+            return []
+        tasks = _filter_agent_tasks_for_workflow_collection(
+            list(self._items),
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+        return _sort_agent_tasks_for_workflow_collection(tasks)[:limit]
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         return next((task for task in self._items if task.task_id == task_id), None)
@@ -197,6 +250,12 @@ class SQLiteAgentTaskStore:
             )
             for column_name, column_type in _AGENT_TASK_EXTRA_COLUMNS:
                 _ensure_column(conn, "agent_tasks", column_name, column_type)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_workflow_collection
+                ON agent_tasks (status, updated_at DESC, created_at DESC, task_id)
+                """
+            )
 
     def save_agent_task(self, task: AgentTask) -> None:
         with self._connect() as conn:
@@ -284,6 +343,53 @@ class SQLiteAgentTaskStore:
                 """
             ).fetchall()
         return refresh_agent_task_dependency_states([_task_from_row(row) for row in rows])
+
+    def count_agent_tasks(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM agent_tasks").fetchone()
+        return int(row["count"])
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        where_sql, params = _agent_task_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM agent_tasks
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTask]:
+        if limit <= 0:
+            return []
+        where_sql, params = _agent_task_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM agent_tasks
+                {where_sql}
+                ORDER BY updated_at DESC,
+                         created_at DESC,
+                         ('wf-agent-task-' || task_id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [_task_from_row(row) for row in rows]
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._connect() as conn:
@@ -489,6 +595,48 @@ def _task_from_row(row: sqlite3.Row) -> AgentTask:
     data["execution_evidence"] = json.loads(data.get("execution_evidence") or "{}")
     data["lifecycle_events"] = json.loads(data["lifecycle_events"] or "[]")
     return AgentTask.model_validate(data)
+
+
+def _filter_agent_tasks_for_workflow_collection(
+    tasks: list[AgentTask],
+    *,
+    workflow_filter: str,
+    recent_since: datetime | None,
+) -> list[AgentTask]:
+    if workflow_filter == "all":
+        return tasks
+    if workflow_filter == "active":
+        return [task for task in tasks if _agent_task_workflow_active(task)]
+    if workflow_filter == "recent":
+        return [task for task in tasks if recent_since is not None and task.updated_at >= recent_since]
+    return [
+        task
+        for task in tasks
+        if _agent_task_workflow_active(task)
+        or (recent_since is not None and task.updated_at >= recent_since)
+    ]
+
+
+def _sort_agent_tasks_for_workflow_collection(tasks: list[AgentTask]) -> list[AgentTask]:
+    return sorted(
+        sorted(tasks, key=lambda task: f"wf-agent-task-{task.task_id}"),
+        key=lambda task: (task.updated_at, task.created_at),
+        reverse=True,
+    )
+
+
+def _agent_task_workflow_active(task: AgentTask) -> bool:
+    return task.status != AgentTaskStatus.COMPLETED
+
+
+def _agent_task_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    if workflow_filter == "all":
+        return "", ()
+    if workflow_filter == "active":
+        return "WHERE status <> ?", (AgentTaskStatus.COMPLETED.value,)
+    if workflow_filter == "recent":
+        return "WHERE updated_at >= ?", (_dt(recent_since),)
+    return "WHERE status <> ? OR updated_at >= ?", (AgentTaskStatus.COMPLETED.value, _dt(recent_since))
 
 
 def _execution_evidence_with_preserved_orchestration_metadata(

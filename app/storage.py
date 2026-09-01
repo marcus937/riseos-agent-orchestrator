@@ -47,6 +47,12 @@ class SQLiteStateStore:
             _ensure_column(conn, "event_records", "pr_merged", "INTEGER")
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_event_records_received_at
+                ON event_records (received_at DESC)
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS issue_dispatch_claims (
                     issue_key TEXT PRIMARY KEY,
                     claimed_at TEXT NOT NULL
@@ -70,6 +76,18 @@ class SQLiteStateStore:
             )
             for column_name, column_type in _REVIEW_WORK_ITEM_EXTRA_COLUMNS:
                 _ensure_column(conn, "review_work_items", column_name, column_type)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_review_work_items_workflow_identity
+                ON review_work_items (repo_full_name, issue_number, pr_number)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_review_work_items_workflow_dates
+                ON review_work_items (status, updated_at DESC, created_at DESC, id)
+                """
+            )
 
     def has_event_record(self, event_id: str) -> bool:
         with self._connect() as conn:
@@ -388,6 +406,82 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._review_work_item_from_row(row) for row in rows]
 
+    def count_review_work_items(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM review_work_items").fetchone()
+        return int(row["count"])
+
+    def count_review_work_items_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM review_work_items
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_review_work_items_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[ReviewWorkItem]:
+        if limit <= 0:
+            return []
+        where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM review_work_items
+                {where_sql}
+                ORDER BY {_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         COALESCE(updated_at, created_at) DESC,
+                         created_at DESC,
+                         ('wf-' || id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._review_work_item_from_row(row) for row in rows]
+
+    def has_review_workflow_identity(
+        self,
+        *,
+        repo_full_name: str | None,
+        issue_number: int | None,
+        pr_number: int | None,
+    ) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM review_work_items
+                WHERE (repo_full_name = ? OR (repo_full_name IS NULL AND ? IS NULL))
+                  AND (issue_number = ? OR (issue_number IS NULL AND ? IS NULL))
+                  AND (pr_number = ? OR (pr_number IS NULL AND ? IS NULL))
+                LIMIT 1
+                """,
+                (
+                    repo_full_name,
+                    repo_full_name,
+                    issue_number,
+                    issue_number,
+                    pr_number,
+                    pr_number,
+                ),
+            ).fetchone()
+        return row is not None
+
     def get_review_work_item(self, item_id: str) -> ReviewWorkItem | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM review_work_items WHERE id = ?", (item_id,)).fetchone()
@@ -516,6 +610,12 @@ def _load_json(value: object | None) -> dict[str, object]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _review_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    if workflow_filter == "recent":
+        return f"WHERE {_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} >= ?", (_dt(recent_since),)
+    return "", ()
+
+
 def _log_review_work_item_persistence_json(
     event: str,
     *,
@@ -591,3 +691,23 @@ _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("last_failure_at", "TEXT"),
     ("last_error", "TEXT"),
 ]
+
+
+_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL = """
+max(
+    COALESCE(created_at, ''),
+    COALESCE(worker_claimed_at, ''),
+    COALESCE(review_started_at, ''),
+    COALESCE(openai_review_attempted_at, ''),
+    COALESCE(openai_review_completed_at, ''),
+    COALESCE(github_writeback_started_at, ''),
+    COALESCE(github_writeback_completed_at, ''),
+    COALESCE(review_completed_at, ''),
+    COALESCE(last_failure_at, ''),
+    CASE
+        WHEN status IN ('reviewing', 'needs_changes', 'approved_for_human_review', 'blocked')
+        THEN COALESCE(updated_at, review_completed_at, '')
+        ELSE ''
+    END
+)
+"""

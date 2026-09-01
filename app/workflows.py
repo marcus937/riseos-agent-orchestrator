@@ -137,6 +137,52 @@ def build_workflow_collection(
     )
 
 
+def build_workflow_collection_from_candidates(
+    review_items: list[ReviewWorkItem],
+    events: list[EventRecord],
+    agent_tasks: list[AgentTask] | None = None,
+    *,
+    limit: int = WORKFLOW_LIST_DEFAULT_LIMIT,
+    offset: int = 0,
+    workflow_filter: WorkflowListFilter = WorkflowListFilter.ACTIVE_RECENT,
+    recent_days: int = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    total: int,
+    unfiltered_total: int,
+    now: datetime | None = None,
+) -> WorkflowCollection:
+    bounded_limit = min(max(limit, 1), WORKFLOW_LIST_MAX_LIMIT)
+    bounded_offset = max(offset, 0)
+    bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
+    normalized_filter = WorkflowListFilter(workflow_filter)
+    filtered_candidates = filter_workflows(
+        build_workflows(review_items, events, agent_tasks),
+        workflow_filter=normalized_filter,
+        recent_days=bounded_recent_days,
+        now=now,
+    )
+    page = filtered_candidates[bounded_offset : bounded_offset + bounded_limit]
+    next_offset = (
+        bounded_offset + bounded_limit
+        if bounded_offset + bounded_limit < total
+        else None
+    )
+    return WorkflowCollection(
+        workflows=page,
+        pagination=WorkflowPaginationMetadata(
+            limit=bounded_limit,
+            offset=bounded_offset,
+            returned=len(page),
+            total=total,
+            unfiltered_total=unfiltered_total,
+            truncated=next_offset is not None,
+            has_next=next_offset is not None,
+            next_offset=next_offset,
+            filter=normalized_filter,
+            recent_days=bounded_recent_days,
+        ),
+    )
+
+
 def filter_workflows(
     workflows: list[WorkflowRecord],
     *,
