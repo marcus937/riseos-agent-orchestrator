@@ -126,6 +126,66 @@ def test_wakeup_message_includes_workflow_and_work_item_context() -> None:
     assert client.calls[0]["message"] == result.message
 
 
+def test_codex_m2_wakeup_uses_targeted_one_shot_work_item() -> None:
+    client = FakeCircuitTriggerClient(status_code=202)
+    settings = Settings(
+        codex_m2_agent_trigger_url="https://api.chatgpt.com/v1/workspace_agents/ai-commander/trigger",
+        codex_m2_agent_access_token="codex-secret-token",
+    )
+
+    result = run(
+        wake_circuit_agent_for_work(
+            settings,
+            target_agent="codex-m2",
+            repo_full_name="marcus937/jarvis-mission-control",
+            workflow_id="wf-controlled",
+            work_item_id="work-item-current",
+            client=client,
+        )
+    )
+
+    assert result.success is True
+    assert client.calls[0]["token"] == "codex-secret-token"
+    assert "python worker.py --work-item-id work-item-current" in client.calls[0]["message"]
+    assert "Do not start the persistent polling worker" in client.calls[0]["message"]
+    assert "do not claim any other queued work item" in client.calls[0]["message"]
+
+
+def test_codex_m2_wakeup_without_work_item_id_is_refused() -> None:
+    client = FakeCircuitTriggerClient(status_code=202)
+    settings = Settings(
+        codex_m2_agent_trigger_url="https://api.chatgpt.com/v1/workspace_agents/ai-commander/trigger",
+        codex_m2_agent_access_token="codex-secret-token",
+    )
+
+    result = run(wake_circuit_agent_for_work(settings, target_agent="codex-m2", client=client))
+
+    assert result.attempted is False
+    assert result.skipped_reason == "M2 Codex wakeup requires a safe explicit work item ID."
+    assert client.calls == []
+
+
+def test_codex_m2_wakeup_rejects_shell_metacharacters_in_work_item_id() -> None:
+    client = FakeCircuitTriggerClient(status_code=202)
+    settings = Settings(
+        codex_m2_agent_trigger_url="https://api.chatgpt.com/v1/workspace_agents/ai-commander/trigger",
+        codex_m2_agent_access_token="codex-secret-token",
+    )
+
+    result = run(
+        wake_circuit_agent_for_work(
+            settings,
+            target_agent="codex-m2",
+            work_item_id="work-item-123; python worker.py",
+            client=client,
+        )
+    )
+
+    assert result.attempted is False
+    assert result.skipped_reason == "M2 Codex wakeup requires a safe explicit work item ID."
+    assert client.calls == []
+
+
 def test_wakeup_normalizes_configured_access_token_before_dispatch() -> None:
     client = FakeCircuitTriggerClient(status_code=202)
     settings = Settings(
