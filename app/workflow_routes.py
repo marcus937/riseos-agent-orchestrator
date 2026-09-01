@@ -19,6 +19,7 @@ from app.workflows import (
     WORKFLOW_LIST_DEFAULT_LIMIT,
     WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     WORKFLOW_LIST_MAX_LIMIT,
+    WORKFLOW_LIST_MAX_OFFSET,
     WORKFLOW_LIST_MAX_RECENT_DAYS,
     WorkflowCollection,
     WorkflowListFilter,
@@ -113,7 +114,7 @@ async def create_workflow_endpoint(
 async def list_workflows(
     request: Request,
     limit: Annotated[int, Query(ge=1, le=WORKFLOW_LIST_MAX_LIMIT)] = WORKFLOW_LIST_DEFAULT_LIMIT,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=WORKFLOW_LIST_MAX_OFFSET)] = 0,
     workflow_filter: Annotated[WorkflowListFilter, Query(alias="filter")] = WorkflowListFilter.ACTIVE_RECENT,
     recent_days: Annotated[int, Query(ge=1, le=WORKFLOW_LIST_MAX_RECENT_DAYS)] = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     _: None = Depends(_require_workflow_read_access),
@@ -176,7 +177,7 @@ def _build_bounded_storage_workflow_collection(
     recent_days: int,
 ) -> WorkflowCollection:
     bounded_limit = min(max(limit, 1), WORKFLOW_LIST_MAX_LIMIT)
-    bounded_offset = max(offset, 0)
+    bounded_offset = min(max(offset, 0), WORKFLOW_LIST_MAX_OFFSET)
     bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
     normalized_filter = WorkflowListFilter(workflow_filter)
     workflow_filter_value = normalized_filter.value
@@ -215,7 +216,9 @@ def _build_bounded_storage_workflow_collection(
     )
     workflows = build_workflow_summaries(review_items, event_candidates, agent_task_summaries)
     page = workflows[bounded_offset : bounded_offset + bounded_limit]
-    next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < total else None
+    next_offset_candidate = bounded_offset + bounded_limit
+    truncated = next_offset_candidate < total
+    next_offset = next_offset_candidate if truncated and next_offset_candidate <= WORKFLOW_LIST_MAX_OFFSET else None
     return WorkflowCollection(
         workflows=page,
         pagination=WorkflowPaginationMetadata(
@@ -224,7 +227,7 @@ def _build_bounded_storage_workflow_collection(
             returned=len(page),
             total=total,
             unfiltered_total=unfiltered_total,
-            truncated=next_offset is not None,
+            truncated=truncated,
             has_next=next_offset is not None,
             next_offset=next_offset,
             filter=normalized_filter,

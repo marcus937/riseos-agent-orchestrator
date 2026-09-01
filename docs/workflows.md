@@ -97,7 +97,7 @@ Query parameters:
 | Parameter | Default | Notes |
 | --- | --- | --- |
 | `limit` | `50` | Page size. Must be between `1` and `100`. |
-| `offset` | `0` | Zero-based offset into the filtered workflow list. |
+| `offset` | `0` | Zero-based offset into the filtered workflow list. Must be between `0` and `1000` so storage-backed polling remains query-bounded. |
 | `filter` | `active_recent` | One of `active_recent`, `active`, `recent`, or `all`. |
 | `recent_days` | `14` | Recent activity window. Must be between `1` and `90`. |
 
@@ -112,6 +112,9 @@ and `pagination.unfiltered_total` count normalized workflows, not raw event rows
 Correlated event workflow summaries preserve the first event as `created_at`
 and the latest event as `updated_at`/`last_activity_at`; full event sequences
 remain detail-only.
+`pagination.truncated` means more filtered workflows exist beyond the returned
+page. `pagination.has_next` is true only when `next_offset` is within the
+bounded offset window.
 `pagination` is additive metadata:
 
 ```json
@@ -203,3 +206,7 @@ Workforce entries include both legacy and canonical values:
 Snapshot v3 workforce entries omit `workflow_events` and `workflow_state_history`.
 These fields are dashboard summaries. Detailed UI surfaces should use the
 workflow endpoints above.
+
+Snapshot `workflows` counts use the same normalized summary semantics as the
+workflow list: review work items, AgentTask workflows, and de-duplicated
+event-backed workflows are counted without embedding timeline detail.

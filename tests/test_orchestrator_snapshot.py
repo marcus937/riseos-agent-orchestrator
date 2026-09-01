@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from fastapi.testclient import TestClient
 
 import app.orchestrator_snapshot as snapshot_module
+from app.agent_tasks import AgentTask, AgentTaskLifecycleEvent, AgentTaskStatus, SQLiteAgentTaskStore
 from app.config import get_settings
 from app.event_store import EventRecord, event_store
 from app.github_events import GitHubEventType
@@ -90,6 +91,11 @@ class SnapshotBoundedSQLiteStateStore(SnapshotCompactSQLiteStateStore):
         self.lifecycle_limits.append(limit)
         assert limit == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
         return super().list_lifecycle_visibility_records(limit=limit)
+
+
+class SnapshotCompactSQLiteAgentTaskStore(SQLiteAgentTaskStore):
+    def list_agent_tasks(self) -> list[AgentTask]:
+        raise AssertionError("Snapshot must not hydrate full agent task rows")
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -274,6 +280,38 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     assert huge_historical_payload not in response.text
 
 
+def test_orchestrator_snapshot_memory_event_meta_uses_total_before_payload_limit() -> None:
+    client = client_with_secret()
+    total_events = ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT + 3
+
+    for index in range(total_events):
+        payload = {
+            "repository": {"full_name": "riseos/example"},
+            "sender": {"login": "agent"},
+            "ref": f"refs/heads/agent-integration-{index}",
+            "after": f"abc{index}",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        response = client.post(
+            "/webhooks/github",
+            content=body,
+            headers=signed_headers("test-secret", "push", body),
+        )
+        assert response.status_code == 200
+
+    snapshot = client.get("/api/v1/orchestrator/snapshot")
+
+    assert snapshot.status_code == 200
+    workforce = snapshot.json()["workforce"]
+    assert len(workforce["events"]) == ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT
+    assert workforce["meta"]["events"] == {
+        "returned": ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT,
+        "total": total_events,
+        "limit": ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT,
+        "truncated": True,
+    }
+
+
 def test_orchestrator_snapshot_uses_sqlite_compact_records_without_detail_hydration(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = SnapshotCompactSQLiteStateStore(db_path)
@@ -376,6 +414,41 @@ def test_orchestrator_snapshot_uses_bounded_sqlite_collection_queries(tmp_path) 
     assert body["workflows"]["blocked"] == pr_total
 
 
+def test_orchestrator_snapshot_counts_sqlite_agent_task_workflows_without_detail_hydration(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    task_store = SnapshotCompactSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    detail_sentinel = "agent-task-detail-sentinel-" + ("x" * 10_000)
+
+    task_store.save_agent_task(
+        _agent_task("queued-agent", AgentTaskStatus.QUEUED, now, detail_sentinel)
+    )
+    task_store.save_agent_task(
+        _agent_task("ready-agent", AgentTaskStatus.READY_FOR_REVIEW, now, detail_sentinel)
+    )
+    task_store.save_agent_task(
+        _agent_task("failed-agent", AgentTaskStatus.FAILED, now, detail_sentinel)
+    )
+    task_store.save_agent_task(
+        _agent_task("completed-agent", AgentTaskStatus.COMPLETED, now, detail_sentinel)
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["workflows"] == {
+        "active": 3,
+        "blocked": 1,
+        "reviewing": 1,
+        "verified": 0,
+    }
+    assert detail_sentinel not in response.text
+
+
 def test_orchestrator_snapshot_limits_before_work_item_projection(monkeypatch) -> None:
     client = client_with_secret()
     now = datetime.now(UTC)
@@ -438,3 +511,35 @@ def test_orchestrator_snapshot_runtime_status_does_not_expose_secret_values() ->
         "dgx_dispatch_enabled",
         "dgx_configured",
     }
+
+
+def _agent_task(
+    task_id: str,
+    status: AgentTaskStatus,
+    activity_at: datetime,
+    detail_sentinel: str,
+) -> AgentTask:
+    return AgentTask(
+        task_id=task_id,
+        repo_full_name="riseos/example",
+        title=f"Task {task_id}",
+        objective=f"Run task {task_id}.",
+        body=detail_sentinel,
+        instructions=[detail_sentinel],
+        execution_evidence={"large_payload": detail_sentinel},
+        target_agent="codex-m2",
+        status=status,
+        created_at=activity_at,
+        updated_at=activity_at,
+        queued_at=activity_at if status == AgentTaskStatus.QUEUED else None,
+        completed_at=activity_at if status == AgentTaskStatus.COMPLETED else None,
+        failed_at=activity_at if status == AgentTaskStatus.FAILED else None,
+        lifecycle_events=[
+            AgentTaskLifecycleEvent(event="created", occurred_at=activity_at),
+            AgentTaskLifecycleEvent(
+                event=status.value,
+                occurred_at=activity_at,
+                metadata={"large_payload": detail_sentinel},
+            ),
+        ],
+    )

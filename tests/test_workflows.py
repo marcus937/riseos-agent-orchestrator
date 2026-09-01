@@ -28,6 +28,7 @@ from app.workflows import (
     WORKFLOW_LIST_DEFAULT_LIMIT,
     WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     WORKFLOW_LIST_MAX_LIMIT,
+    WORKFLOW_LIST_MAX_OFFSET,
     WorkflowListFilter,
     WorkflowRecord,
     build_workflow_collection,
@@ -251,6 +252,31 @@ def test_workflow_collection_uses_stable_id_tiebreaker_for_equal_activity() -> N
     )
 
     assert [workflow.workflow_id for workflow in collection.workflows] == ["wf-alpha", "wf-bravo", "wf-charlie"]
+
+
+def test_workflow_collection_does_not_advertise_next_offset_past_bounded_window() -> None:
+    now = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    workflows = [
+        _workflow_record(
+            f"wf-{index:04d}",
+            WorkflowState.ASSIGNED,
+            now - timedelta(seconds=index),
+        )
+        for index in range(WORKFLOW_LIST_MAX_OFFSET + 2)
+    ]
+
+    collection = build_workflow_collection(
+        workflows,
+        limit=1,
+        offset=WORKFLOW_LIST_MAX_OFFSET,
+        workflow_filter=WorkflowListFilter.ALL,
+        now=now,
+    )
+
+    assert collection.pagination is not None
+    assert collection.pagination.truncated is True
+    assert collection.pagination.has_next is False
+    assert collection.pagination.next_offset is None
 
 
 def test_build_workflows_merges_correlated_event_records_into_full_timeline() -> None:
@@ -1121,6 +1147,14 @@ def test_workflow_endpoint_rejects_unbounded_limit() -> None:
     client = client_with_secret()
 
     response = client.get(f"/api/v1/workflows?limit={WORKFLOW_LIST_MAX_LIMIT + 1}")
+
+    assert response.status_code == 422
+
+
+def test_workflow_endpoint_rejects_unbounded_offset() -> None:
+    client = client_with_secret()
+
+    response = client.get(f"/api/v1/workflows?offset={WORKFLOW_LIST_MAX_OFFSET + 1}")
 
     assert response.status_code == 422
 

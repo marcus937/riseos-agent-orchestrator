@@ -37,6 +37,7 @@ runtime_validation_store = AgentBusRuntimeValidationStore()
 from app.circuit_runtime_validation_routes import (
     register_circuit_runtime_validation_routes,
 )
+from app.agent_tasks import AgentTaskStore, build_agent_task_store
 from app.agent_task_review_gate import finalize_review_gated_agent_task
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
@@ -120,7 +121,7 @@ from app.storage import SQLiteStateStore, build_sqlite_store
 from app.task_dispatch import dispatch_next_agent_task, dispatch_workflow_chain_continuation, resume_workflow_continuations
 from app.workflow_continuation import SQLiteWorkflowContinuationStore, build_workflow_continuation_store
 from app.workflow_routes import register_workflow_routes
-from app.workflows import WorkflowSummaryCounts
+from app.workflows import WorkflowSummaryCounts, build_workflow_summaries, build_workflow_summary_counts
 
 
 class AgentTaskSubmission(BaseModel):
@@ -357,7 +358,15 @@ def _lifecycle_visibility(
 
 def _snapshot_workforce_totals() -> OrchestratorSnapshotWorkforceTotals | None:
     storage = _storage()
-    if storage is None or not hasattr(storage, "count_review_work_item_snapshot_records"):
+    if storage is None:
+        items = review_queue.list_items()
+        return OrchestratorSnapshotWorkforceTotals(
+            agents=len(items),
+            issues=sum(1 for item in items if item.issue_number is not None and item.pr_number is None),
+            prs=sum(1 for item in items if item.pr_number is not None),
+            events=len(event_store.recent_events()),
+        )
+    if not hasattr(storage, "count_review_work_item_snapshot_records"):
         return None
     event_total = storage.event_count() if hasattr(storage, "event_count") else None
     return OrchestratorSnapshotWorkforceTotals(
@@ -368,11 +377,55 @@ def _snapshot_workforce_totals() -> OrchestratorSnapshotWorkforceTotals | None:
     )
 
 
-def _snapshot_workflow_counts() -> WorkflowSummaryCounts | None:
+def _snapshot_workflow_counts(settings: Settings) -> WorkflowSummaryCounts:
     storage = _storage()
     if storage is not None and hasattr(storage, "workflow_summary_counts_for_snapshot"):
-        return storage.workflow_summary_counts_for_snapshot()
+        return _merge_workflow_summary_counts(
+            storage.workflow_summary_counts_for_snapshot(),
+            _snapshot_agent_task_workflow_counts(settings),
+        )
+    review_event_counts = build_workflow_summary_counts(
+        build_workflow_summaries(_review_items(), _recent_events())
+    )
+    return _merge_workflow_summary_counts(
+        review_event_counts,
+        _snapshot_agent_task_workflow_counts(settings),
+    )
+
+
+def _snapshot_agent_task_workflow_counts(settings: Settings) -> WorkflowSummaryCounts | None:
+    store = _snapshot_agent_task_store(settings)
+    if store is None:
+        return None
+    if hasattr(store, "workflow_summary_counts_for_snapshot"):
+        return store.workflow_summary_counts_for_snapshot()
+    if hasattr(store, "list_agent_tasks"):
+        return build_workflow_summary_counts(build_workflow_summaries([], [], store.list_agent_tasks()))
     return None
+
+
+def _snapshot_agent_task_store(settings: Settings) -> AgentTaskStore | None:
+    store = getattr(app.state, "agent_task_store", None)
+    if store is not None:
+        store_db_path = getattr(store, "db_path", None)
+        if store_db_path is not None and str(store_db_path) != settings.orchestrator_db_path:
+            return None
+        return store
+    return build_agent_task_store(settings.orchestrator_db_path)
+
+
+def _merge_workflow_summary_counts(
+    first: WorkflowSummaryCounts | None,
+    second: WorkflowSummaryCounts | None,
+) -> WorkflowSummaryCounts:
+    first = first or WorkflowSummaryCounts()
+    second = second or WorkflowSummaryCounts()
+    return WorkflowSummaryCounts(
+        active=first.active + second.active,
+        blocked=first.blocked + second.blocked,
+        reviewing=first.reviewing + second.reviewing,
+        verified=first.verified + second.verified,
+    )
 
 
 def _recent_failures(items: list[ReviewWorkItem]) -> list[RecentFailure]:
@@ -467,7 +520,7 @@ async def orchestrator_snapshot(
             else None
         ),
         workforce_totals=_snapshot_workforce_totals(),
-        workflow_counts=_snapshot_workflow_counts(),
+        workflow_counts=_snapshot_workflow_counts(settings),
         events=_recent_events(limit=ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
         recent_failures=_recent_failures(items),
     )

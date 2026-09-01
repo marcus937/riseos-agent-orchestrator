@@ -174,6 +174,9 @@ class AgentTaskStore(Protocol):
     ) -> list[AgentTaskWorkflowSummary]:
         ...
 
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        ...
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         ...
 
@@ -242,6 +245,10 @@ class InMemoryAgentTaskStore:
                 recent_since=recent_since,
             )
         ]
+
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        refresh_agent_task_dependency_states(list(self._items))
+        return _agent_task_workflow_summary_counts(list(self._items))
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         return next((task for task in self._items if task.task_id == task_id), None)
@@ -490,6 +497,32 @@ class SQLiteAgentTaskStore:
             ).fetchall()
         return [AgentTaskWorkflowSummary.model_validate(dict(row)) for row in rows]
 
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        from app.workflows import WorkflowSummaryCounts
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status <> ? THEN 1 ELSE 0 END) AS active_count,
+                    SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END) AS blocked_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS reviewing_count
+                FROM agent_tasks
+                """,
+                (
+                    AgentTaskStatus.COMPLETED.value,
+                    AgentTaskStatus.FAILED.value,
+                    AgentTaskStatus.CANCELLED.value,
+                    AgentTaskStatus.READY_FOR_REVIEW.value,
+                ),
+            ).fetchone()
+        return WorkflowSummaryCounts(
+            active=int(row["active_count"] or 0),
+            blocked=int(row["blocked_count"] or 0),
+            reviewing=int(row["reviewing_count"] or 0),
+            verified=0,
+        )
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
@@ -570,6 +603,17 @@ def agent_task_workflow_summary(task: AgentTask) -> AgentTaskWorkflowSummary:
         branch=task.branch,
         commit_sha=task.commit_sha,
         last_actor=_last_agent_task_lifecycle_actor(task),
+    )
+
+
+def _agent_task_workflow_summary_counts(tasks: list[AgentTask]) -> "WorkflowSummaryCounts":
+    from app.workflows import WorkflowSummaryCounts
+
+    return WorkflowSummaryCounts(
+        active=sum(1 for task in tasks if task.status != AgentTaskStatus.COMPLETED),
+        blocked=sum(1 for task in tasks if task.status in {AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED}),
+        reviewing=sum(1 for task in tasks if task.status == AgentTaskStatus.READY_FOR_REVIEW),
+        verified=0,
     )
 
 

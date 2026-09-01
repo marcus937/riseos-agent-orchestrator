@@ -122,6 +122,7 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 - SQLite-backed snapshots use limited compact collection queries and separate aggregate totals for collection metadata.
 - Workforce records preserve compact workflow summary fields, including `workflow_id`, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
 - Workforce records intentionally do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
+- Top-level `workflows` counts include review work items, AgentTask workflows, and de-duplicated event-backed workflows using summary/count records only.
 - `labels` returns at most 20 labels per work item while preserving `label_count` and `labels_truncated`.
 - `recent_failures` returns at most 20 records.
 - Error strings in workforce records and `recent_failures` are capped at 2048 characters and expose a matching `*_truncated` boolean.
@@ -198,5 +199,6 @@ The contract is covered by endpoint tests that verify:
 - Existing webhook, event, queue, lifecycle, health, and runtime data are aggregated into one payload with JMC Workforce data under `workforce`.
 - Workforce list payloads are bounded and omit full workflow timeline arrays and runtime validation context payloads.
 - Storage-backed snapshot collection queries are bounded while `workforce.meta.*.total` remains accurate.
+- Snapshot workflow counts include AgentTask workflows without hydrating full AgentTask detail payloads.
 - The endpoint follows the debug-read access policy when token protection is enabled.
 - Runtime status does not expose configured secret values.

@@ -19,6 +19,7 @@ from app.workflow_lifecycle import (
 
 WORKFLOW_LIST_DEFAULT_LIMIT = 50
 WORKFLOW_LIST_MAX_LIMIT = 100
+WORKFLOW_LIST_MAX_OFFSET = 1000
 WORKFLOW_LIST_DEFAULT_RECENT_DAYS = 14
 WORKFLOW_LIST_MAX_RECENT_DAYS = 90
 
@@ -137,7 +138,7 @@ def build_workflow_collection(
     now: datetime | None = None,
 ) -> WorkflowCollection:
     bounded_limit = min(max(limit, 1), WORKFLOW_LIST_MAX_LIMIT)
-    bounded_offset = max(offset, 0)
+    bounded_offset = min(max(offset, 0), WORKFLOW_LIST_MAX_OFFSET)
     bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
     normalized_filter = WorkflowListFilter(workflow_filter)
     summaries = workflow_summaries(sort_workflows(workflows))
@@ -148,11 +149,9 @@ def build_workflow_collection(
         now=now,
     )
     page = filtered[bounded_offset : bounded_offset + bounded_limit]
-    next_offset = (
-        bounded_offset + bounded_limit
-        if bounded_offset + bounded_limit < len(filtered)
-        else None
-    )
+    next_offset_candidate = bounded_offset + bounded_limit
+    truncated = next_offset_candidate < len(filtered)
+    next_offset = next_offset_candidate if truncated and next_offset_candidate <= WORKFLOW_LIST_MAX_OFFSET else None
     return WorkflowCollection(
         workflows=page,
         pagination=WorkflowPaginationMetadata(
@@ -161,7 +160,7 @@ def build_workflow_collection(
             returned=len(page),
             total=len(filtered),
             unfiltered_total=len(workflows),
-            truncated=next_offset is not None,
+            truncated=truncated,
             has_next=next_offset is not None,
             next_offset=next_offset,
             filter=normalized_filter,
