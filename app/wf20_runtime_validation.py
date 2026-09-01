@@ -540,20 +540,31 @@ async def _write_github_runtime_outcome(github_client: Any | None, request: Runt
     status = _github_runtime_status(result)
     label = _github_runtime_label(result)
     comment = _github_runtime_comment(request, result)
-    try:
-        await github_client.post_issue_comment(request.repo, request.pr_number, comment)
-        await github_client.apply_label(request.repo, request.pr_number, label)
-        if commit_sha and hasattr(github_client, "create_commit_status"):
-            await github_client.create_commit_status(
+    writeback_errors: dict[str, str] = {}
+
+    async def attempt(name: str, operation: Any) -> None:
+        try:
+            await operation
+        except Exception as exc:
+            writeback_errors[name] = str(exc)
+
+    await attempt("comment", github_client.post_issue_comment(request.repo, request.pr_number, comment))
+    await attempt("label", github_client.apply_label(request.repo, request.pr_number, label))
+    if commit_sha and hasattr(github_client, "create_commit_status"):
+        await attempt(
+            "commit_status",
+            github_client.create_commit_status(
                 request.repo,
                 commit_sha,
                 state=status,
                 context=GITHUB_STATUS_CONTEXT,
                 description=f"Hermes runtime validation {result.hermes.status}",
                 target_url=result.hermes.target_url or request.target_url,
-            )
-    except Exception as exc:
-        result.error = result.error or str(exc)
+            ),
+        )
+
+    if writeback_errors:
+        result.bb2.review_context["github_writeback_errors"] = writeback_errors
 
 
 def _github_runtime_status(result: RuntimeValidationResult) -> str:
