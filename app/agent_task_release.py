@@ -14,7 +14,7 @@ from app.agent_tasks import (
     mark_agent_task_dispatch_failed,
     refresh_agent_task_dependency_states,
 )
-from app.circuit_agent_trigger import is_circuit_agent, wake_circuit_agent_for_work
+from app.circuit_agent_trigger import is_wakeable_agent, wake_circuit_agent_for_work
 from app.config import Settings
 from app.engineering_workforce import apply_scheduler_decision, schedule_engineering_workforce
 
@@ -103,7 +103,7 @@ async def dispatch_circuit_wakeup_for_assigned_task(
     settings: Settings | None,
     agent_bus_client: object | None = None,
 ) -> None:
-    if settings is None or not is_circuit_agent(task.target_agent):
+    if settings is None or not is_wakeable_agent(task.target_agent):
         return
     if not task.agent_bus_work_item_id:
         logger.info("[CIRCUIT] wakeup skipped task_id=%s reason=no_work_item_id", task.task_id)

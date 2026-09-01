@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -14,6 +15,8 @@ from app.config import Settings
 logger = logging.getLogger("riseos_agent_orchestrator")
 
 CIRCUIT_AGENT_ALIASES = {"circuit", "circuit-forge", "circuit forge"}
+CODEX_M2_AGENT_ALIASES = {"codex-m2", "codex m2"}
+SAFE_WORK_ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
 
 class CircuitAgentTriggerResult(BaseModel):
@@ -79,12 +82,24 @@ async def wake_circuit_agent_for_work(
     work_item_id: str | None = None,
     client: CircuitAgentTriggerClient | None = None,
 ) -> CircuitAgentTriggerResult:
-    if not is_circuit_agent(target_agent) and not is_circuit_agent(owner_agent):
-        return CircuitAgentTriggerResult(skipped_reason="Work is not owned by Circuit.")
+    agent_name = target_agent if is_wakeable_agent(target_agent) else owner_agent
+    if not is_wakeable_agent(agent_name):
+        return CircuitAgentTriggerResult(skipped_reason="Work is not owned by a wakeable agent.")
 
-    trigger_url = _normalize_optional_text(settings.circuit_agent_trigger_url)
-    access_token = _normalize_access_token(settings.circuit_agent_access_token)
-    message = build_circuit_wakeup_message(
+    is_codex_m2 = is_codex_m2_agent(agent_name)
+    if is_codex_m2 and (not work_item_id or not SAFE_WORK_ITEM_ID.fullmatch(work_item_id)):
+        return CircuitAgentTriggerResult(
+            skipped_reason="M2 Codex wakeup requires a safe explicit work item ID.",
+            message=build_agent_wakeup_message(agent_name=agent_name),
+        )
+    trigger_url = _normalize_optional_text(
+        settings.codex_m2_agent_trigger_url if is_codex_m2 else settings.circuit_agent_trigger_url
+    )
+    access_token = _normalize_access_token(
+        settings.codex_m2_agent_access_token if is_codex_m2 else settings.circuit_agent_access_token
+    )
+    message = build_agent_wakeup_message(
+        agent_name=agent_name,
         repo_full_name=repo_full_name,
         issue_number=issue_number,
         workflow_id=workflow_id,
@@ -92,7 +107,11 @@ async def wake_circuit_agent_for_work(
     )
     if not trigger_url or not access_token:
         return CircuitAgentTriggerResult(
-            skipped_reason="Circuit agent trigger is not configured.",
+            skipped_reason=(
+                "M2 Codex agent trigger is not configured."
+                if is_codex_m2
+                else "Circuit agent trigger is not configured."
+            ),
             message=message,
         )
     if not _is_trigger_url(trigger_url):
@@ -175,6 +194,47 @@ def is_circuit_agent(agent_name: str | None) -> bool:
     if not agent_name:
         return False
     return _normalize_agent_name(agent_name) in CIRCUIT_AGENT_ALIASES
+
+
+def is_codex_m2_agent(agent_name: str | None) -> bool:
+    if not agent_name:
+        return False
+    return _normalize_agent_name(agent_name) in CODEX_M2_AGENT_ALIASES
+
+
+def is_wakeable_agent(agent_name: str | None) -> bool:
+    return is_circuit_agent(agent_name) or is_codex_m2_agent(agent_name)
+
+
+def build_agent_wakeup_message(
+    *,
+    agent_name: str | None,
+    repo_full_name: str | None = None,
+    issue_number: int | None = None,
+    workflow_id: str | None = None,
+    work_item_id: str | None = None,
+) -> str:
+    if is_codex_m2_agent(agent_name):
+        if not work_item_id:
+            return "M2 Codex wakeup refused: no explicit Agent Bus work item ID was supplied."
+        parts = [
+            "Wake M2 Codex for exactly one Agent Bus work item. Use AI Commander on aic-M2-Mac to run the "
+            "Jarvis Codex Worker in targeted mode with this exact command: "
+            "cd '/Users/marcuslivers/RiseOS/GitHub Repos/jarvis-codex-worker' && "
+            f". .venv/bin/activate && exec python worker.py --work-item-id {work_item_id}. "
+            "Do not start the persistent polling worker and do not claim any other queued work item."
+        ]
+        if repo_full_name:
+            parts.append(f"Repository: {repo_full_name}.")
+        if workflow_id:
+            parts.append(f"Workflow ID: {workflow_id}.")
+        return " ".join(parts)
+    return build_circuit_wakeup_message(
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        workflow_id=workflow_id,
+        work_item_id=work_item_id,
+    )
 
 
 def build_circuit_wakeup_message(
@@ -291,11 +351,11 @@ def _redact_sensitive_text(value: str, settings: Settings) -> str:
 
 def _sensitive_values(settings: Settings) -> tuple[str, ...]:
     values: list[str] = []
-    raw_token = settings.circuit_agent_access_token
-    normalized_token = _normalize_access_token(raw_token)
-    for secret in (raw_token, normalized_token):
-        if secret and secret not in values:
-            values.append(secret)
+    for raw_token in (settings.circuit_agent_access_token, settings.codex_m2_agent_access_token):
+        normalized_token = _normalize_access_token(raw_token)
+        for secret in (raw_token, normalized_token):
+            if secret and secret not in values:
+                values.append(secret)
     return tuple(values)
 
 

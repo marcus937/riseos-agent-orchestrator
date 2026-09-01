@@ -42,6 +42,8 @@ class Settings:
     codex_m2_engineering_worker_enabled: bool = True
     circuit_agent_trigger_url: str | None = None
     circuit_agent_access_token: str | None = None
+    codex_m2_agent_trigger_url: str | None = None
+    codex_m2_agent_access_token: str | None = None
     slack_webhook_url: str | None = None
     slack_bot_token: str | None = None
     slack_channel: str = "#jarvis-agent-orchestrator"
@@ -111,6 +113,8 @@ def get_settings() -> Settings:
         codex_m2_engineering_worker_enabled=os.getenv("CODEX_M2_ENGINEERING_WORKER_ENABLED", "true").lower() == "true",
         circuit_agent_trigger_url=os.getenv("CIRCUIT_AGENT_TRIGGER_URL"),
         circuit_agent_access_token=os.getenv("CIRCUIT_AGENT_ACCESS_TOKEN"),
+        codex_m2_agent_trigger_url=os.getenv("CODEX_M2_AGENT_TRIGGER_URL"),
+        codex_m2_agent_access_token=os.getenv("CODEX_M2_AGENT_ACCESS_TOKEN"),
         slack_webhook_url=legacy_slack_webhook_url,
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN"),
         slack_channel=legacy_slack_channel or orchestrator_slack_channel,

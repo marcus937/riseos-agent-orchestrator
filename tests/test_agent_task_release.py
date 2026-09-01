@@ -163,8 +163,26 @@ def test_circuit_target_agent_aliases_trigger_wakeup(monkeypatch) -> None:
     assert [call["work_item_id"] for call in wake_calls] == ["work-item-circuit", "work-item-circuit-forge"]
 
 
-def test_non_circuit_assignment_does_not_trigger_wakeup(monkeypatch) -> None:
+def test_codex_m2_assignment_triggers_targeted_wakeup(monkeypatch) -> None:
     task = make_task(target_agent="codex-m2")
+    mark_agent_task_assigned(task, work_item_id="work-item-123")
+    wake_calls: list[dict[str, Any]] = []
+
+    async def fake_wake_circuit_agent_for_work(settings: Settings, **kwargs: Any) -> CircuitAgentTriggerResult:
+        wake_calls.append(kwargs)
+        return CircuitAgentTriggerResult(attempted=True, success=True, status_code=202)
+
+    monkeypatch.setattr("app.agent_task_release.wake_circuit_agent_for_work", fake_wake_circuit_agent_for_work)
+
+    run(dispatch_circuit_wakeup_for_assigned_task(task, settings=circuit_settings(), agent_bus_client=FakeAgentBusClient()))
+
+    assert len(wake_calls) == 1
+    assert wake_calls[0]["target_agent"] == "codex-m2"
+    assert wake_calls[0]["work_item_id"] == "work-item-123"
+
+
+def test_unconfigured_agent_assignment_does_not_trigger_wakeup(monkeypatch) -> None:
+    task = make_task(target_agent="unknown-worker")
     mark_agent_task_assigned(task, work_item_id="work-item-123")
     wake_calls: list[dict[str, Any]] = []
 
