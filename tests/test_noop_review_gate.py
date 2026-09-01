@@ -68,6 +68,34 @@ def test_verified_noop_requires_complete_fail_closed_evidence() -> None:
     assert is_verified_noop_execution(_payload(evidence={"no_op": True})) is False
 
 
+def test_verified_noop_accepts_unchanged_existing_pull_request() -> None:
+    payload = _payload(
+        evidence={
+            "execution_type": "no_op",
+            "no_op": True,
+            "success": True,
+            "codex_exit_code": 0,
+            "codex_timed_out": False,
+            "push_success": False,
+            "pr_number": 209,
+            "pull_request": {"status": "existing", "number": 209},
+            "review_dispatch": {"evidence_packet_id": "evidence-existing-pr"},
+        }
+    )
+
+    assert is_verified_noop_execution(payload) is True
+
+
+def test_verified_noop_rejects_created_or_mismatched_pull_request() -> None:
+    base_evidence = _payload().evidence
+
+    created = {**base_evidence, "pr_number": 209, "pull_request": {"status": "created", "number": 209}}
+    mismatched = {**base_evidence, "pr_number": 209, "pull_request": {"status": "existing", "number": 210}}
+
+    assert is_verified_noop_execution(_payload(evidence=created)) is False
+    assert is_verified_noop_execution(_payload(evidence=mismatched)) is False
+
+
 def test_verified_noop_completes_review_envelope_and_task() -> None:
     task = create_agent_task(
         AgentTaskCreateRequest(
