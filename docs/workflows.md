@@ -175,7 +175,7 @@ Returns canonical lifecycle events for one workflow while preserving legacy even
 
 ## Snapshot Integration
 
-`GET /api/v1/orchestrator/snapshot` includes workflow summary counts:
+`GET /api/v1/orchestrator/snapshot` schema `orchestrator.snapshot.v3` includes workflow summary counts:
 
 ```json
 {
@@ -200,6 +200,6 @@ Workforce entries include both legacy and canonical values:
 }
 ```
 
-Snapshot workforce entries omit `workflow_events` and `workflow_state_history`.
+Snapshot v3 workforce entries omit `workflow_events` and `workflow_state_history`.
 These fields are dashboard summaries. Detailed UI surfaces should use the
 workflow endpoints above.

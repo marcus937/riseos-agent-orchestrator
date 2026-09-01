@@ -76,7 +76,8 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
 
     assert snapshot.status_code == 200
     data = snapshot.json()
-    assert data["schema_version"] == ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION
+    assert ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION == "orchestrator.snapshot.v3"
+    assert data["schema_version"] == "orchestrator.snapshot.v3"
     assert data["generated_at"]
     assert set(data) >= {"workforce", "workflows", "queue", "health", "runtime", "recent_failures"}
     assert data["workflows"] == {"active": 1, "blocked": 0, "reviewing": 0, "verified": 0}
@@ -314,7 +315,7 @@ def test_orchestrator_snapshot_uses_debug_read_access_policy() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION
+    assert response.json()["schema_version"] == "orchestrator.snapshot.v3"
 
 
 def test_orchestrator_snapshot_runtime_status_does_not_expose_secret_values() -> None:

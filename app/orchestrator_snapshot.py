@@ -25,7 +25,7 @@ from app.workflow_lifecycle import (
 )
 from app.workflows import WorkflowSummaryCounts, build_workflow_summaries, build_workflow_summary_counts
 
-ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v2"
+ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v3"
 ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT = 50
 ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT = 25
 ORCHESTRATOR_SNAPSHOT_RECENT_FAILURE_LIMIT = 20
