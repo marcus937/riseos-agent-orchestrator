@@ -30,6 +30,7 @@ from app.workflows import (
     WorkflowListFilter,
     WorkflowRecord,
     build_workflow_collection,
+    build_workflows,
 )
 
 
@@ -225,6 +226,48 @@ def test_workflow_collection_uses_stable_id_tiebreaker_for_equal_activity() -> N
     assert [workflow.workflow_id for workflow in collection.workflows] == ["wf-alpha", "wf-bravo", "wf-charlie"]
 
 
+def test_build_workflows_merges_correlated_event_records_into_full_timeline() -> None:
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    correlation_id = "orch-shared-event-workflow"
+
+    workflows = build_workflows(
+        [],
+        [
+            EventRecord(
+                event_id="event-2",
+                github_event=GitHubEventType.PULL_REQUEST,
+                correlation_id=correlation_id,
+                repo_full_name="riseos/example",
+                pr_number=17,
+                pr_merged=True,
+                received_at=base + timedelta(minutes=1),
+                raw_action="closed",
+            ),
+            EventRecord(
+                event_id="event-1",
+                github_event=GitHubEventType.PUSH,
+                correlation_id=correlation_id,
+                repo_full_name="riseos/example",
+                branch="agent-integration",
+                commit_sha="abc123",
+                received_at=base,
+            ),
+        ],
+    )
+
+    assert len(workflows) == 1
+    workflow = workflows[0]
+    assert workflow.workflow_id == f"wf-{correlation_id}"
+    assert workflow.current_state == WorkflowState.MERGED
+    assert workflow.last_activity_at == base + timedelta(minutes=1)
+    assert [event.canonical_state for event in workflow.timeline] == [
+        WorkflowState.CIRCUIT_WORKING,
+        WorkflowState.MERGED,
+    ]
+    assert workflow.timeline[1].previous_state == workflow.timeline[0].state
+    assert workflow.route_history == ["Circuit: CIRCUIT_WORKING", "Human: MERGED"]
+
+
 def test_workflow_endpoint_honors_pagination_query_params() -> None:
     client = client_with_secret()
     base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
@@ -407,6 +450,54 @@ def test_workflow_endpoint_bounded_sqlite_event_candidates_follow_requested_page
     assert body["pagination"]["next_offset"] == 75
 
 
+def test_workflow_endpoint_bounded_sqlite_event_totals_are_deduplicated_by_workflow_id(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    for index in range(8):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"shared-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                correlation_id="orch-shared-event-workflow",
+                repo_full_name="riseos/example",
+                branch="agent-shared",
+                commit_sha=f"shared-sha-{index}",
+                received_at=base + timedelta(minutes=index),
+            )
+        )
+    for index in range(2):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"unique-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch=f"agent-unique-{index}",
+                commit_sha=f"unique-sha-{index}",
+                received_at=base + timedelta(hours=1, minutes=index),
+            )
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-unique-event-1",
+        "wf-unique-event-0",
+    ]
+    assert body["pagination"]["returned"] == 2
+    assert body["pagination"]["total"] == 3
+    assert body["pagination"]["unfiltered_total"] == 3
+    assert body["pagination"]["has_next"] is True
+    assert body["pagination"]["next_offset"] == 2
+
+
 def test_workflow_detail_uses_targeted_sqlite_review_item_lookup(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)
@@ -464,6 +555,17 @@ def test_workflow_detail_uses_targeted_sqlite_event_lookup_by_correlation_id(tmp
         received_at=base,
     )
     storage.save_event_record(target)
+    storage.save_event_record(
+        EventRecord(
+            event_id="target-review-event",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            correlation_id=target.correlation_id,
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=2),
+            raw_action="submitted",
+        )
+    )
     for index in range(60):
         storage.save_event_record(
             EventRecord(
@@ -486,10 +588,16 @@ def test_workflow_detail_uses_targeted_sqlite_event_lookup_by_correlation_id(tmp
     detail_body = detail.json()
     assert detail_body["workflow_id"] == workflow_id
     assert detail_body["correlation_id"] == target.correlation_id
+    assert detail_body["current_state"] == "BB2_REVIEWING"
+    assert len(detail_body["timeline"]) == 2
     assert detail_body["timeline"][0]["source"] == "github_webhook"
     assert detail_body["timeline"][0]["commit_sha"] == "target-sha"
+    assert detail_body["timeline"][1]["new_state"] == "BB2_REVIEWING"
+    assert detail_body["timeline"][1]["previous_state"] == "CIRCUIT_IN_PROGRESS"
     assert timeline.status_code == 200
+    assert len(timeline.json()["events"]) == 2
     assert timeline.json()["events"][0]["commit_sha"] == "target-sha"
+    assert timeline.json()["events"][1]["new_state"] == "BB2_REVIEWING"
 
 
 def test_workflow_endpoint_bounded_sqlite_event_filters_match_active_recent_contract(tmp_path) -> None:

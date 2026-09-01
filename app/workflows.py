@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +12,7 @@ from app.workflow_lifecycle import (
     WorkflowEvent,
     WorkflowOwner,
     WorkflowState,
+    build_event_records_workflow_projection,
     build_event_workflow_projection,
     build_work_item_workflow_projection,
 )
@@ -87,11 +89,14 @@ def build_workflows(
     workflows = [_workflow_from_item(item) for item in review_items]
     workflows.extend(_workflow_from_agent_task(task) for task in (agent_tasks or []))
     item_keys = {_workflow_identity_key(workflow) for workflow in workflows}
+    event_records_by_workflow_id: dict[str, list[EventRecord]] = {}
     for record in events:
         projection = build_event_workflow_projection(record)
         if not projection.canonical_workflow_state:
             continue
-        event_workflow = _workflow_from_event(record)
+        event_records_by_workflow_id.setdefault(_event_workflow_id(record), []).append(record)
+    for records in event_records_by_workflow_id.values():
+        event_workflow = _workflow_from_events(records)
         if _workflow_identity_key(event_workflow) in item_keys:
             continue
         workflows.append(event_workflow)
@@ -279,23 +284,25 @@ def _workflow_from_agent_task(task: AgentTask) -> WorkflowRecord:
     )
 
 
-def _workflow_from_event(record: EventRecord) -> WorkflowRecord:
-    projection = build_event_workflow_projection(record)
+def _workflow_from_events(records: list[EventRecord]) -> WorkflowRecord:
+    ordered_records = sorted(records, key=lambda record: (record.received_at, record.event_id))
+    projection = build_event_records_workflow_projection(ordered_records)
     timeline = projection.workflow_events
     current_state = projection.canonical_workflow_state or WorkflowState.CREATED
-    workflow_id = f"wf-{record.correlation_id or record.event_id}"
+    first_record = ordered_records[0]
+    last_record = ordered_records[-1]
     return WorkflowRecord(
-        workflow_id=workflow_id,
-        correlation_id=record.correlation_id,
-        repo_full_name=record.repo_full_name,
-        issue_number=record.issue_number,
-        pr_number=record.pr_number,
+        workflow_id=_event_workflow_id(last_record),
+        correlation_id=_latest_record_value(ordered_records, "correlation_id"),
+        repo_full_name=_latest_record_value(ordered_records, "repo_full_name"),
+        issue_number=_latest_record_value(ordered_records, "issue_number"),
+        pr_number=_latest_record_value(ordered_records, "pr_number"),
         current_state=current_state,
         assigned_agent=_assigned_agent(None, current_state),
         last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
-        created_at=record.received_at,
-        updated_at=record.received_at,
-        last_activity_at=record.received_at,
+        created_at=first_record.received_at,
+        updated_at=last_record.received_at,
+        last_activity_at=last_record.received_at,
         timeline=timeline,
         route_history=[_route_history_entry(event) for event in timeline],
     )
@@ -413,6 +420,18 @@ def _owner_from_agent_task_state(state: WorkflowState) -> WorkflowOwner:
 
 def _workflow_identity_key(workflow: WorkflowRecord) -> tuple[str | None, int | None, int | None, str | None]:
     return (workflow.repo_full_name, workflow.issue_number, workflow.pr_number, workflow.agent_task_id)
+
+
+def _event_workflow_id(record: EventRecord) -> str:
+    return f"wf-{record.correlation_id or record.event_id}"
+
+
+def _latest_record_value(records: list[EventRecord], name: str) -> Any:
+    for record in reversed(records):
+        value = getattr(record, name)
+        if value is not None:
+            return value
+    return None
 
 
 def _assigned_agent(item: ReviewWorkItem | None, state: WorkflowState) -> str | None:

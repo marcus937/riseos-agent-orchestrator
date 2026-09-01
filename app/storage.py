@@ -184,12 +184,13 @@ class SQLiteStateStore:
         workflow_filter: str = "active_recent",
         recent_since: datetime | None = None,
     ) -> int:
-        where_sql, params = _event_workflow_filter_sql(workflow_filter, recent_since)
+        where_sql, params = _latest_event_workflow_filter_sql(workflow_filter, recent_since)
         with self._connect() as conn:
             row = conn.execute(
                 f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
                 SELECT COUNT(*) AS count
-                FROM event_records AS e
+                FROM ranked_event_workflows AS latest
                 {where_sql}
                 """,
                 params,
@@ -205,15 +206,16 @@ class SQLiteStateStore:
     ) -> list[EventRecord]:
         if limit <= 0:
             return []
-        where_sql, params = _event_workflow_filter_sql(workflow_filter, recent_since)
+        where_sql, params = _latest_event_workflow_filter_sql(workflow_filter, recent_since)
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT e.*
-                FROM event_records AS e
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT {_event_record_select_sql("latest")}
+                FROM ranked_event_workflows AS latest
                 {where_sql}
-                ORDER BY e.received_at DESC,
-                         ('wf-' || COALESCE(e.correlation_id, e.event_id)) ASC
+                ORDER BY latest.received_at DESC,
+                         latest.workflow_id ASC
                 LIMIT ?
                 """,
                 (*params, limit),
@@ -221,25 +223,26 @@ class SQLiteStateStore:
         return [self._event_record_from_row(row) for row in rows]
 
     def get_event_record_for_workflow_id(self, workflow_id: str) -> EventRecord | None:
+        records = self.list_event_records_for_workflow_id(workflow_id)
+        return records[-1] if records else None
+
+    def list_event_records_for_workflow_id(self, workflow_id: str) -> list[EventRecord]:
         if not workflow_id.startswith("wf-"):
-            return None
+            return []
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 f"""
-                SELECT e.*
+                SELECT {_event_record_select_sql("e")}
                 FROM event_records AS e
                 WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
                   AND ({_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL})
                   AND ('wf-' || COALESCE(e.correlation_id, e.event_id)) = ?
-                ORDER BY e.received_at DESC,
-                         ('wf-' || COALESCE(e.correlation_id, e.event_id)) ASC
-                LIMIT 1
+                ORDER BY e.received_at ASC,
+                         e.event_id ASC
                 """,
                 (workflow_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return self._event_record_from_row(row)
+            ).fetchall()
+        return [self._event_record_from_row(row) for row in rows]
 
     def save_review_work_item(self, item: ReviewWorkItem) -> None:
         log_workflow_chain_availability(
@@ -720,11 +723,11 @@ def _review_workflow_filter_sql(workflow_filter: str, recent_since: datetime | N
     return f"WHERE ({active_sql}) OR ({recent_sql})", recent_params
 
 
-def _event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
-    predicates = [_EVENT_WORKFLOW_CANONICAL_SQL, _EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL]
+def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    predicates = ["latest.workflow_rank = 1"]
     params: list[object] = []
-    recent_sql = "e.received_at >= ?"
-    active_sql = _EVENT_WORKFLOW_ACTIVE_SQL
+    recent_sql = "latest.received_at >= ?"
+    active_sql = "NOT (latest.github_event = 'pull_request' AND latest.raw_action = 'closed')"
     if workflow_filter == "active":
         predicates.append(active_sql)
     elif workflow_filter == "recent":
@@ -737,6 +740,10 @@ def _event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | No
         f"({predicate})" for predicate in predicates
     )
     return where_sql, tuple(params)
+
+
+def _event_record_select_sql(alias: str) -> str:
+    return ", ".join(f"{alias}.{column}" for column in _EVENT_RECORD_COLUMNS)
 
 
 def _log_review_work_item_persistence_json(
@@ -873,4 +880,33 @@ NOT EXISTS (
 )
 """
 
-_EVENT_WORKFLOW_ACTIVE_SQL = "NOT (e.github_event = 'pull_request' AND e.raw_action = 'closed')"
+_RANKED_EVENT_WORKFLOWS_CTE_SQL = f"""
+ranked_event_workflows AS (
+    SELECT
+        e.*,
+        ('wf-' || COALESCE(e.correlation_id, e.event_id)) AS workflow_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+            ORDER BY e.received_at DESC, e.event_id DESC
+        ) AS workflow_rank
+    FROM event_records AS e
+    WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
+      AND ({_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL})
+)
+"""
+
+_EVENT_RECORD_COLUMNS = (
+    "event_id",
+    "github_event",
+    "diagnostic_stage",
+    "correlation_id",
+    "correlation_key",
+    "repo_full_name",
+    "branch",
+    "commit_sha",
+    "issue_number",
+    "pr_number",
+    "pr_merged",
+    "received_at",
+    "raw_action",
+)

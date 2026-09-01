@@ -131,6 +131,13 @@ def build_event_workflow_projection(record: EventRecord) -> WorkflowStateProject
     return _projection_from_events([event])
 
 
+def build_event_records_workflow_projection(records: list[EventRecord]) -> WorkflowStateProjection:
+    events: list[WorkflowEvent] = []
+    for record in sorted(records, key=lambda item: (item.received_at, item.event_id)):
+        events.extend(build_event_workflow_projection(record).workflow_events)
+    return _projection_from_events(events)
+
+
 def _initial_work_item_event(item: ReviewWorkItem) -> WorkflowEvent:
     state = _initial_state_for_item(item)
     return _workflow_event(

@@ -326,6 +326,12 @@ def _build_storage_workflow(
     if review_item is not None:
         return build_workflows([review_item], [], [])[0]
 
+    if hasattr(storage, "list_event_records_for_workflow_id"):
+        event_records = storage.list_event_records_for_workflow_id(workflow_id)
+        if event_records:
+            workflows = build_workflows([], event_records, [])
+            return workflows[0] if workflows else None
+
     if hasattr(storage, "get_event_record_for_workflow_id"):
         event_record = storage.get_event_record_for_workflow_id(workflow_id)
         if event_record is not None:

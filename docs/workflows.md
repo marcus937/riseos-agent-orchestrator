@@ -104,7 +104,9 @@ Query parameters:
 The `workflows` array is intentionally compact for polling clients. It omits
 `timeline` and `route_history`; fetch `GET /api/v1/workflows/{workflow_id}` or
 `GET /api/v1/workflows/{workflow_id}/timeline` when a view needs full detail.
-`pagination` is additive metadata:
+Correlated GitHub event records are collapsed into one event-backed workflow;
+`pagination.total` and `pagination.unfiltered_total` count normalized workflows,
+not raw event rows. `pagination` is additive metadata:
 
 ```json
 {

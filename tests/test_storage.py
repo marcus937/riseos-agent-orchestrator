@@ -1,9 +1,10 @@
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 from app.correlation import correlation_id_from_key
-from app.event_store import event_record_from_parsed
-from app.github_events import parse_github_event
+from app.event_store import EventRecord, event_record_from_parsed
+from app.github_events import GitHubEventType, parse_github_event
 from app.review_queue import ReviewWorkItemStatus, review_work_item_from_parsed
 from app.storage import SQLiteStateStore, build_sqlite_store
 
@@ -86,6 +87,43 @@ def test_event_record_correlation_id_backfills_existing_rows(tmp_path) -> None:
     assert reloaded is not None
     assert reloaded.event_id == "legacy-event"
     assert reloaded.correlation_id == correlation_id_from_key(correlation_key)
+
+
+def test_event_records_for_workflow_id_return_full_correlated_timeline(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    store = SQLiteStateStore(str(db_path))
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    workflow_id = "wf-orch-correlated-events"
+
+    store.save_event_record(
+        EventRecord(
+            event_id="event-1",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="orch-correlated-events",
+            repo_full_name="riseos/example",
+            branch="agent-integration",
+            commit_sha="abc123",
+            received_at=base,
+        )
+    )
+    store.save_event_record(
+        EventRecord(
+            event_id="event-2",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            correlation_id="orch-correlated-events",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=1),
+            raw_action="submitted",
+        )
+    )
+
+    records = store.list_event_records_for_workflow_id(workflow_id)
+    latest = store.get_event_record_for_workflow_id(workflow_id)
+
+    assert [record.event_id for record in records] == ["event-1", "event-2"]
+    assert latest is not None
+    assert latest.event_id == "event-2"
 
 
 def test_issue_dispatch_claim_is_single_owner(tmp_path) -> None:
