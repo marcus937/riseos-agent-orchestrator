@@ -164,8 +164,8 @@ def test_valid_pr_hydration_compares_base_and_head() -> None:
 
     context = run(hydrate_github_context(item, client, base_branch="main"))
 
-    assert client.compare_branch_calls == [("riseos/example", "main", "feature/task")]
-    assert client.fetch_commit_calls == []
+    assert client.compare_branch_calls == []
+    assert client.fetch_commit_calls == [("riseos/example", "def456")]
     assert client.list_issue_comments_calls == [("riseos/example", 7)]
     assert context.github_context_available is True
     assert context.changed_files == ["README.md"]
@@ -178,7 +178,7 @@ def test_pr_hydration_attaches_hermes_evidence_comments() -> None:
         {
             "action": "opened",
             "repository": {"full_name": "riseos/example"},
-            "pull_request": {"number": 7, "head": {"ref": "agent-integration", "sha": "def456"}},
+            "pull_request": {"number": 7, "head": {"ref": "agent-integration", "sha": "def4567"}},
         },
     )
     item = review_work_item_from_parsed(parsed)
@@ -188,7 +188,7 @@ def test_pr_hydration_attaches_hermes_evidence_comments() -> None:
             {"id": 1, "body": "Ordinary review comment", "user": {"login": "marcus937"}},
             {
                 "id": 2,
-                "body": "## Hermes Runtime Validation\n\nStatus: PASSED\n\n### Evidence Packet\n- Manifest fetched: True\n- Bundle fetched: True",
+                "body": "## Hermes Runtime Validation\n\nStatus: PASSED\nCommit: def4567\n\n### Evidence Packet\n- Manifest fetched: True\n- Bundle fetched: True",
                 "created_at": "2026-06-08T00:00:00Z",
                 "html_url": "https://github.com/riseos/example/pull/7#issuecomment-2",
                 "user": {"login": "github-actions[bot]"},
@@ -216,9 +216,46 @@ def test_pr_hydration_attaches_hermes_evidence_comments() -> None:
             "author": "github-actions[bot]",
             "created_at": "2026-06-08T00:00:00Z",
             "html_url": "https://github.com/riseos/example/pull/7#issuecomment-2",
-            "summary": "## Hermes Runtime Validation\n\nStatus: PASSED\n\n### Evidence Packet\n- Manifest fetched: True\n- Bundle fetched: True",
+            "summary": "## Hermes Runtime Validation\n\nStatus: PASSED\nCommit: def4567\n\n### Evidence Packet\n- Manifest fetched: True\n- Bundle fetched: True",
         }
     ]
+
+
+def test_pr_hydration_excludes_stale_and_unbound_hermes_evidence() -> None:
+    parsed = parse_github_event(
+        "pull_request",
+        {
+            "action": "synchronize",
+            "repository": {"full_name": "riseos/example"},
+            "pull_request": {
+                "number": 7,
+                "head": {"ref": "feature/task", "sha": "def4567890abc"},
+            },
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    client = FakeGitHubClient(
+        response={"files": [{"filename": "app/main.py"}]},
+        comments=[
+            {
+                "id": 1,
+                "body": "## Hermes Runtime Validation\nStatus: PASSED\nCommit: abc1234\nTarget: https://apple.com",
+            },
+            {
+                "id": 2,
+                "body": "## Hermes Runtime Validation\nStatus: PASSED\nTarget: https://apple.com",
+            },
+            {
+                "id": 3,
+                "body": "## Hermes Runtime Validation\nStatus: PASSED\nCommit SHA: def4567\nTarget: https://orchestrator.riseconnect.us",
+            },
+        ],
+    )
+
+    context = run(hydrate_github_context(item, client, base_branch="main"))
+
+    assert [entry["comment_id"] for entry in context.runtime_evidence_context] == [3]
+    assert "apple.com" not in str(context.runtime_evidence_context)
 
 
 def test_pr_hydration_records_runtime_evidence_comment_errors() -> None:
