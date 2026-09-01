@@ -1,11 +1,17 @@
 from datetime import UTC, datetime
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
+from app import agent_task_routes as routes_module
 from app import main as main_module
-from app.agent_task_routes import _require_orchestration_enabled_repository
+from app.agent_task_routes import (
+    _reconcile_reviews_and_release,
+    _require_orchestration_enabled_repository,
+)
+from app.agent_tasks import AgentTaskStatus
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.repository_discovery import InMemoryRepositoryRegistry, RepositoryRegistryRecord, RepositoryStatus
@@ -129,3 +135,82 @@ def test_webhook_observation_still_does_not_auto_register_repository() -> None:
     main_module._record_repository_event(parsed, work_item_created=True)
 
     assert registry.get_repository_registry_record("marcus937/Project-Jarvis") is None
+
+
+def test_delayed_review_reconciliation_releases_next_workflow_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = SimpleNamespace(
+        status=AgentTaskStatus.READY_FOR_REVIEW,
+        correlation_id="wf-test",
+    )
+    released: list[dict[str, object]] = []
+
+    async def reconcile(candidate, _client, *, store) -> None:
+        candidate.status = AgentTaskStatus.COMPLETED
+
+    async def release(store, client, **kwargs) -> None:
+        released.append(kwargs)
+
+    monkeypatch.setattr(
+        routes_module,
+        "reconcile_bb2_review_request_status",
+        reconcile,
+    )
+    monkeypatch.setattr(routes_module, "release_runnable_agent_tasks", release)
+    monkeypatch.setattr(routes_module, "_github_dependency_client", lambda _settings: None)
+
+    settings = Settings(agent_bus_review_agent="bb2")
+    asyncio.run(
+        _reconcile_reviews_and_release(
+            [task],
+            store=object(),
+            client=object(),
+            settings=settings,
+            correlation_id="wf-test",
+        )
+    )
+
+    assert released == [
+        {
+            "review_agent": "bb2",
+            "dependency_client": None,
+            "correlation_id": "wf-test",
+            "settings": settings,
+        }
+    ]
+
+
+def test_review_reconciliation_does_not_release_without_new_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = SimpleNamespace(
+        status=AgentTaskStatus.READY_FOR_REVIEW,
+        correlation_id="wf-test",
+    )
+
+    async def reconcile(candidate, _client, *, store) -> None:
+        return None
+
+    async def unexpected_release(*args, **kwargs) -> None:
+        raise AssertionError("release should not run")
+
+    monkeypatch.setattr(
+        routes_module,
+        "reconcile_bb2_review_request_status",
+        reconcile,
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "release_runnable_agent_tasks",
+        unexpected_release,
+    )
+
+    asyncio.run(
+        _reconcile_reviews_and_release(
+            [task],
+            store=object(),
+            client=object(),
+            settings=Settings(agent_bus_review_agent="bb2"),
+        )
+    )

@@ -99,8 +99,12 @@ async def list_agent_tasks(request: Request, _: None = Depends(require_orchestra
     if settings.enable_agent_bus_dispatch:
         client, should_close = _agent_bus_client(request, settings)
         try:
-            for task in tasks:
-                await reconcile_bb2_review_request_status(task, client, store=store)
+            await _reconcile_reviews_and_release(
+                tasks,
+                store=store,
+                client=client,
+                settings=settings,
+            )
         finally:
             if should_close:
                 await client.aclose()
@@ -117,11 +121,55 @@ async def get_agent_task(task_id: str, request: Request, _: None = Depends(requi
     if settings.enable_agent_bus_dispatch:
         client, should_close = _agent_bus_client(request, settings)
         try:
-            await reconcile_bb2_review_request_status(task, client, store=store)
+            await _reconcile_reviews_and_release(
+                [task],
+                store=store,
+                client=client,
+                settings=settings,
+                correlation_id=task.correlation_id,
+            )
         finally:
             if should_close:
                 await client.aclose()
     return task
+
+
+async def _reconcile_reviews_and_release(
+    tasks: list[AgentTask],
+    *,
+    store: AgentTaskStore,
+    client: AgentBusClient,
+    settings: Settings,
+    correlation_id: str | None = None,
+) -> None:
+    """Release newly-runnable work after delayed BB2 reconciliation completes a task."""
+
+    completed_during_reconciliation = False
+    for task in tasks:
+        previous_status = task.status
+        await reconcile_bb2_review_request_status(task, client, store=store)
+        if (
+            previous_status != AgentTaskStatus.COMPLETED
+            and task.status == AgentTaskStatus.COMPLETED
+        ):
+            completed_during_reconciliation = True
+
+    if not completed_during_reconciliation:
+        return
+
+    github_client = _github_dependency_client(settings)
+    try:
+        await release_runnable_agent_tasks(
+            store,
+            client,
+            review_agent=settings.agent_bus_review_agent,
+            dependency_client=github_client,
+            correlation_id=correlation_id,
+            settings=settings,
+        )
+    finally:
+        if github_client is not None:
+            await github_client.aclose()
 
 
 @router.post("/{task_id}/execution-result", response_model=AgentTask)
