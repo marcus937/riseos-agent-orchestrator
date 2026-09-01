@@ -34,6 +34,7 @@ from app.repository_discovery import (
     build_repository_registry,
     ensure_orchestration_enabled_repository,
 )
+from app.noop_review_gate import finalize_verified_noop_review
 from app.review_dispatch import (
     dispatch_bb2_review_request_from_execution_result,
     reconcile_bb2_review_request_status,
@@ -211,6 +212,13 @@ async def record_agent_task_execution_result(
                 )
                 store.save_agent_task(task)
                 _refresh_all_agent_tasks(store)
+                await finalize_verified_noop_review(
+                    task,
+                    payload,
+                    client,
+                    reviewer=settings.agent_bus_review_agent,
+                    store=store,
+                )
             await release_runnable_agent_tasks(
                 store,
                 client,
