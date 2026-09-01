@@ -87,7 +87,21 @@ summary contract, but does not infer verification from approval or merge events.
 
 ### `GET /api/v1/workflows`
 
-Returns normalized workflow records:
+Returns a bounded page of normalized workflow records. By default, the endpoint
+returns active workflows plus terminal workflows with activity in the last 14 days,
+sorted by most recent activity with a stable `workflow_id` tie-breaker.
+
+Query parameters:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `limit` | `50` | Page size. Must be between `1` and `100`. |
+| `offset` | `0` | Zero-based offset into the filtered workflow list. |
+| `filter` | `active_recent` | One of `active_recent`, `active`, `recent`, or `all`. |
+| `recent_days` | `14` | Recent activity window. Must be between `1` and `90`. |
+
+The `workflows` array remains the canonical record list. `pagination` is additive
+metadata for polling clients:
 
 ```json
 {
@@ -108,7 +122,19 @@ Returns normalized workflow records:
       "timeline": [],
       "route_history": []
     }
-  ]
+  ],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "returned": 1,
+    "total": 1,
+    "unfiltered_total": 1,
+    "truncated": false,
+    "has_next": false,
+    "next_offset": null,
+    "filter": "active_recent",
+    "recent_days": 14
+  }
 }
 ```
 

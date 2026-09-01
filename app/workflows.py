@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +14,18 @@ from app.workflow_lifecycle import (
     build_event_workflow_projection,
     build_work_item_workflow_projection,
 )
+
+WORKFLOW_LIST_DEFAULT_LIMIT = 50
+WORKFLOW_LIST_MAX_LIMIT = 100
+WORKFLOW_LIST_DEFAULT_RECENT_DAYS = 14
+WORKFLOW_LIST_MAX_RECENT_DAYS = 90
+
+
+class WorkflowListFilter(StrEnum):
+    ACTIVE_RECENT = "active_recent"
+    ACTIVE = "active"
+    RECENT = "recent"
+    ALL = "all"
 
 
 class WorkflowRecord(BaseModel):
@@ -33,8 +46,22 @@ class WorkflowRecord(BaseModel):
     route_history: list[str] = Field(default_factory=list)
 
 
+class WorkflowPaginationMetadata(BaseModel):
+    limit: int
+    offset: int
+    returned: int
+    total: int
+    unfiltered_total: int
+    truncated: bool
+    has_next: bool
+    next_offset: int | None = None
+    filter: WorkflowListFilter
+    recent_days: int
+
+
 class WorkflowCollection(BaseModel):
     workflows: list[WorkflowRecord]
+    pagination: WorkflowPaginationMetadata | None = None
 
 
 class WorkflowTimeline(BaseModel):
@@ -65,7 +92,76 @@ def build_workflows(
         if _workflow_identity_key(event_workflow) in item_keys:
             continue
         workflows.append(event_workflow)
-    return sorted(workflows, key=lambda workflow: workflow.last_activity_at, reverse=True)
+    return sort_workflows(workflows)
+
+
+def build_workflow_collection(
+    workflows: list[WorkflowRecord],
+    *,
+    limit: int = WORKFLOW_LIST_DEFAULT_LIMIT,
+    offset: int = 0,
+    workflow_filter: WorkflowListFilter = WorkflowListFilter.ACTIVE_RECENT,
+    recent_days: int = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    now: datetime | None = None,
+) -> WorkflowCollection:
+    bounded_limit = min(max(limit, 1), WORKFLOW_LIST_MAX_LIMIT)
+    bounded_offset = max(offset, 0)
+    bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
+    normalized_filter = WorkflowListFilter(workflow_filter)
+    filtered = filter_workflows(
+        sort_workflows(workflows),
+        workflow_filter=normalized_filter,
+        recent_days=bounded_recent_days,
+        now=now,
+    )
+    page = filtered[bounded_offset : bounded_offset + bounded_limit]
+    next_offset = (
+        bounded_offset + bounded_limit
+        if bounded_offset + bounded_limit < len(filtered)
+        else None
+    )
+    return WorkflowCollection(
+        workflows=page,
+        pagination=WorkflowPaginationMetadata(
+            limit=bounded_limit,
+            offset=bounded_offset,
+            returned=len(page),
+            total=len(filtered),
+            unfiltered_total=len(workflows),
+            truncated=next_offset is not None,
+            has_next=next_offset is not None,
+            next_offset=next_offset,
+            filter=normalized_filter,
+            recent_days=bounded_recent_days,
+        ),
+    )
+
+
+def filter_workflows(
+    workflows: list[WorkflowRecord],
+    *,
+    workflow_filter: WorkflowListFilter = WorkflowListFilter.ACTIVE_RECENT,
+    recent_days: int = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    now: datetime | None = None,
+) -> list[WorkflowRecord]:
+    normalized_filter = WorkflowListFilter(workflow_filter)
+    if normalized_filter == WorkflowListFilter.ALL:
+        return workflows
+
+    cutoff = _as_utc(now or datetime.now(UTC)) - timedelta(days=recent_days)
+    return [workflow for workflow in workflows if _matches_workflow_filter(workflow, normalized_filter, cutoff)]
+
+
+def sort_workflows(workflows: list[WorkflowRecord]) -> list[WorkflowRecord]:
+    return sorted(
+        sorted(workflows, key=lambda workflow: workflow.workflow_id),
+        key=lambda workflow: (
+            _as_utc(workflow.last_activity_at),
+            _as_utc(workflow.updated_at),
+            _as_utc(workflow.created_at),
+        ),
+        reverse=True,
+    )
 
 
 def find_workflow(workflows: list[WorkflowRecord], workflow_id: str) -> WorkflowRecord | None:
@@ -271,6 +367,22 @@ def _route_history_entry(event: WorkflowEvent) -> str:
     return f"{event.actor or event.owner.value}: {event.new_state or event.canonical_state}"
 
 
+def _matches_workflow_filter(workflow: WorkflowRecord, workflow_filter: WorkflowListFilter, cutoff: datetime) -> bool:
+    active = workflow.current_state not in _TERMINAL_STATES
+    recent = _as_utc(workflow.last_activity_at) >= cutoff
+    if workflow_filter == WorkflowListFilter.ACTIVE:
+        return active
+    if workflow_filter == WorkflowListFilter.RECENT:
+        return recent
+    return active or recent
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 _TERMINAL_STATES = {
     WorkflowState.COMPLETED,
     WorkflowState.MERGED,
@@ -279,5 +391,14 @@ _TERMINAL_STATES = {
     WorkflowState.DEPLOYED,
     WorkflowState.VERIFIED,
 }
-_BLOCKED_STATES = {WorkflowState.BLOCKED, WorkflowState.HERMES_FAILED, WorkflowState.CLOSED_UNMERGED, WorkflowState.ABANDONED}
-_REVIEWING_STATES = {WorkflowState.HERMES_VALIDATING, WorkflowState.BB2_REVIEWING, WorkflowState.CHANGES_REQUESTED}
+_BLOCKED_STATES = {
+    WorkflowState.BLOCKED,
+    WorkflowState.HERMES_FAILED,
+    WorkflowState.CLOSED_UNMERGED,
+    WorkflowState.ABANDONED,
+}
+_REVIEWING_STATES = {
+    WorkflowState.HERMES_VALIDATING,
+    WorkflowState.BB2_REVIEWING,
+    WorkflowState.CHANGES_REQUESTED,
+}
