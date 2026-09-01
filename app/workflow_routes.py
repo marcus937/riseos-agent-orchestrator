@@ -192,6 +192,31 @@ def _build_bounded_storage_workflow_collection(
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
     )
+    unfiltered_total = (
+        total
+        if normalized_filter == WorkflowListFilter.ALL
+        else _count_bounded_storage_normalized_workflows(
+            storage,
+            agent_store,
+            workflow_filter=WorkflowListFilter.ALL.value,
+        )
+    )
+    if bounded_offset >= total:
+        return WorkflowCollection(
+            workflows=[],
+            pagination=WorkflowPaginationMetadata(
+                limit=bounded_limit,
+                offset=bounded_offset,
+                returned=0,
+                total=total,
+                unfiltered_total=unfiltered_total,
+                truncated=False,
+                has_next=False,
+                next_offset=None,
+                filter=normalized_filter,
+                recent_days=bounded_recent_days,
+            ),
+        )
     review_items = storage.list_review_work_item_summary_records_for_workflow_collection(
         limit=candidate_limit,
         workflow_filter=workflow_filter_value,
@@ -210,11 +235,6 @@ def _build_bounded_storage_workflow_collection(
         limit=candidate_limit,
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
-    )
-    unfiltered_total = _count_bounded_storage_normalized_workflows(
-        storage,
-        agent_store,
-        workflow_filter=WorkflowListFilter.ALL.value,
     )
     workflows = build_workflow_summaries(review_items, event_candidates, agent_task_summaries)
     page = workflows[bounded_offset : bounded_offset + bounded_limit]

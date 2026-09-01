@@ -651,6 +651,39 @@ def test_workflow_endpoint_bounded_sqlite_fetches_only_candidate_window_per_sour
     assert task_store.agent_summary_limits == [7]
 
 
+def test_workflow_endpoint_bounded_sqlite_empty_page_skips_summary_queries(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = QueryShapeWorkflowListSQLiteStateStore(db_path)
+    task_store = QueryShapeWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    storage.save_review_work_item(_review_item("only-review", base))
+    task_store.save_agent_task(_agent_task("only-agent", AgentTaskStatus.QUEUED, base + timedelta(minutes=1)))
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=3&offset=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["workflows"] == []
+    assert body["pagination"] == {
+        "limit": 3,
+        "offset": 10,
+        "returned": 0,
+        "total": 2,
+        "unfiltered_total": 2,
+        "truncated": False,
+        "has_next": False,
+        "next_offset": None,
+        "filter": "all",
+        "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    }
+    assert storage.review_summary_limits == []
+    assert storage.event_summary_limits == []
+    assert task_store.agent_summary_limits == []
+
+
 def test_workflow_endpoint_bounded_sqlite_page_can_be_filled_by_one_source(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)
