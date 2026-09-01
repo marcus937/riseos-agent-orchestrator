@@ -115,6 +115,31 @@ class ReviewWorkItem(BaseModel):
         return super().dict(*args, **kwargs)
 
 
+class ReviewWorkItemWorkflowSummary(BaseModel):
+    id: str
+    created_at: datetime
+    updated_at: datetime | None = None
+    repo_full_name: str | None = None
+    event_type: GitHubEventType
+    branch: str | None = None
+    base_branch: str | None = None
+    commit_sha: str | None = None
+    issue_number: int | None = None
+    pr_number: int | None = None
+    labels: list[str] = Field(default_factory=list)
+    status: ReviewWorkItemStatus = ReviewWorkItemStatus.PENDING_REVIEW
+    lifecycle_stage: ReviewLifecycleStage = ReviewLifecycleStage.REVIEW_QUEUED
+    worker_claimed_at: datetime | None = None
+    review_started_at: datetime | None = None
+    openai_review_attempted_at: datetime | None = None
+    openai_review_completed_at: datetime | None = None
+    review_completed_at: datetime | None = None
+    github_writeback_started_at: datetime | None = None
+    github_writeback_completed_at: datetime | None = None
+    github_writeback_success: bool | None = None
+    last_failure_at: datetime | None = None
+
+
 class ReviewProcessResponse(BaseModel):
     work_item: ReviewWorkItem
     decision: ReviewDecision

@@ -7,7 +7,14 @@ from typing import Any
 from app.correlation import correlation_id_from_key
 from app.event_store import EventRecord
 from app.operational_logging import log_event
-from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
+from app.review_queue import (
+    ReviewQueueCounters,
+    ReviewWorkItem,
+    ReviewWorkItemStatus,
+    ReviewWorkItemWorkflowSummary,
+    review_queue_counters,
+    review_work_item_identity,
+)
 from app.workflow_chain_diagnostics import log_workflow_chain_availability
 
 
@@ -563,7 +570,7 @@ class SQLiteStateStore:
         limit: int,
         workflow_filter: str = "active_recent",
         recent_since: datetime | None = None,
-    ) -> list[ReviewWorkItem]:
+    ) -> list[ReviewWorkItemWorkflowSummary]:
         if limit <= 0:
             return []
         where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
@@ -602,7 +609,7 @@ class SQLiteStateStore:
                 """,
                 (*params, limit),
             ).fetchall()
-        return [self._review_work_item_from_row(row) for row in rows]
+        return [self._review_work_item_workflow_summary_from_row(row) for row in rows]
 
     def has_review_workflow_identity(
         self,
@@ -710,6 +717,12 @@ class SQLiteStateStore:
             item,
         )
         return item
+
+    def _review_work_item_workflow_summary_from_row(self, row: sqlite3.Row) -> ReviewWorkItemWorkflowSummary:
+        data = dict(row)
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        return ReviewWorkItemWorkflowSummary.model_validate(data)
 
 
 def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> SQLiteStateStore | None:

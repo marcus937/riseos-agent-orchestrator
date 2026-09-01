@@ -6,7 +6,15 @@ from pydantic import BaseModel, Field
 
 from app.event_store import EventRecord
 from app.github_events import GitHubEventType
-from app.review_queue import ReviewLifecycleStage, ReviewWorkItem, ReviewWorkItemStatus
+from app.review_queue import (
+    ReviewLifecycleStage,
+    ReviewWorkItem,
+    ReviewWorkItemStatus,
+    ReviewWorkItemWorkflowSummary,
+)
+
+
+ReviewWorkItemProjectionSource = ReviewWorkItem | ReviewWorkItemWorkflowSummary
 
 
 class WorkflowState(StrEnum):
@@ -101,7 +109,7 @@ class WorkflowStateProjection(BaseModel):
     current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
 
 
-def build_work_item_workflow_projection(item: ReviewWorkItem) -> WorkflowStateProjection:
+def build_work_item_workflow_projection(item: ReviewWorkItemProjectionSource) -> WorkflowStateProjection:
     events = _dedupe_events(
         [
             _initial_work_item_event(item),
@@ -138,7 +146,7 @@ def build_event_records_workflow_projection(records: list[EventRecord]) -> Workf
     return _projection_from_events(events)
 
 
-def _initial_work_item_event(item: ReviewWorkItem) -> WorkflowEvent:
+def _initial_work_item_event(item: ReviewWorkItemProjectionSource) -> WorkflowEvent:
     state = _initial_state_for_item(item)
     return _workflow_event(
         state=state,
@@ -155,7 +163,7 @@ def _initial_work_item_event(item: ReviewWorkItem) -> WorkflowEvent:
     )
 
 
-def _review_lifecycle_events(item: ReviewWorkItem) -> list[WorkflowEvent]:
+def _review_lifecycle_events(item: ReviewWorkItemProjectionSource) -> list[WorkflowEvent]:
     stage_times: list[tuple[ReviewLifecycleStage, datetime | None]] = [
         (ReviewLifecycleStage.WORKER_CLAIMED, item.worker_claimed_at),
         (ReviewLifecycleStage.REVIEW_STARTED, item.review_started_at),
@@ -193,7 +201,7 @@ def _review_lifecycle_events(item: ReviewWorkItem) -> list[WorkflowEvent]:
     return events
 
 
-def _terminal_status_events(item: ReviewWorkItem) -> list[WorkflowEvent]:
+def _terminal_status_events(item: ReviewWorkItemProjectionSource) -> list[WorkflowEvent]:
     occurred_at = item.updated_at or item.review_completed_at
     if occurred_at is None:
         return []
@@ -249,7 +257,7 @@ def _dedupe_events(events: list[WorkflowEvent]) -> list[WorkflowEvent]:
     return deduped
 
 
-def _initial_state_for_item(item: ReviewWorkItem) -> WorkflowState:
+def _initial_state_for_item(item: ReviewWorkItemProjectionSource) -> WorkflowState:
     if item.pr_number is not None or item.event_type == GitHubEventType.PULL_REQUEST:
         return WorkflowState.PR_OPENED
     if "agent-ready" in item.labels or "agent-next" in item.labels:
@@ -259,7 +267,7 @@ def _initial_state_for_item(item: ReviewWorkItem) -> WorkflowState:
     return WorkflowState.CREATED
 
 
-def _state_from_review_stage(stage: ReviewLifecycleStage, item: ReviewWorkItem) -> WorkflowState | None:
+def _state_from_review_stage(stage: ReviewLifecycleStage, item: ReviewWorkItemProjectionSource) -> WorkflowState | None:
     if stage == ReviewLifecycleStage.WORKER_CLAIMED:
         return WorkflowState.HERMES_VALIDATING
     if stage == ReviewLifecycleStage.REVIEW_STARTED:
@@ -339,7 +347,7 @@ def legacy_state_for(state: WorkflowState) -> LegacyWorkflowState:
 def _legacy_state_from_review_stage(
     stage: ReviewLifecycleStage,
     state: WorkflowState,
-    item: ReviewWorkItem,
+    item: ReviewWorkItemProjectionSource,
 ) -> LegacyWorkflowState:
     if stage == ReviewLifecycleStage.WORKER_CLAIMED:
         return LegacyWorkflowState.HERMES_VALIDATION_REQUESTED

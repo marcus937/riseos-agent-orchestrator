@@ -19,7 +19,7 @@ from app.config import get_settings
 from app.event_store import EventRecord, event_store
 from app.github_events import GitHubEventType
 from app.main import app
-from app.review_queue import ReviewWorkItem, review_queue
+from app.review_queue import ReviewWorkItem, ReviewWorkItemWorkflowSummary, review_queue
 from app.security import build_signature
 from app.storage import SQLiteStateStore
 from app.workflow_lifecycle import WorkflowState
@@ -73,11 +73,19 @@ class NoFullWorkflowListSQLiteAgentTaskStore(SQLiteAgentTaskStore):
 
 
 class SummaryOnlyWorkflowListSQLiteStateStore(NoFullWorkflowListSQLiteStateStore):
-    def _review_work_item_from_row(self, row):
-        row_keys = set(dict(row))
-        assert "runtime_validation_context" not in row_keys
-        assert "agent_bus_dispatch_error" not in row_keys
-        return super()._review_work_item_from_row(row)
+    def list_review_work_item_summary_records_for_workflow_collection(
+        self,
+        *args,
+        **kwargs,
+    ) -> list[ReviewWorkItemWorkflowSummary]:
+        summaries = super().list_review_work_item_summary_records_for_workflow_collection(
+            *args,
+            **kwargs,
+        )
+        assert all(isinstance(summary, ReviewWorkItemWorkflowSummary) for summary in summaries)
+        assert all(not hasattr(summary, "runtime_validation_context") for summary in summaries)
+        assert all(not hasattr(summary, "agent_bus_dispatch_error") for summary in summaries)
+        return summaries
 
 
 class SummaryOnlyWorkflowListSQLiteAgentTaskStore(NoFullWorkflowListSQLiteAgentTaskStore):

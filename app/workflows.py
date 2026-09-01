@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from app.agent_tasks import AgentTask, AgentTaskStatus, AgentTaskWorkflowSummary
 from app.event_store import EventRecord
-from app.review_queue import ReviewWorkItem
+from app.review_queue import ReviewWorkItem, ReviewWorkItemWorkflowSummary
 from app.workflow_lifecycle import (
     LegacyWorkflowState,
     WorkflowEvent,
@@ -103,8 +103,11 @@ def build_workflows(
     return sort_workflows(workflows)
 
 
+ReviewWorkflowSummarySource = ReviewWorkItem | ReviewWorkItemWorkflowSummary
+
+
 def build_workflow_summaries(
-    review_items: list[ReviewWorkItem],
+    review_items: list[ReviewWorkflowSummarySource],
     events: list[EventRecord],
     agent_tasks: list[AgentTask | AgentTaskWorkflowSummary] | None = None,
 ) -> list[WorkflowSummaryRecord]:
@@ -168,7 +171,7 @@ def build_workflow_collection(
 
 
 def build_workflow_collection_from_candidates(
-    review_items: list[ReviewWorkItem],
+    review_items: list[ReviewWorkflowSummarySource],
     events: list[EventRecord],
     agent_tasks: list[AgentTask | AgentTaskWorkflowSummary] | None = None,
     *,
@@ -290,7 +293,7 @@ def build_workflow_summary_counts(workflows: list[WorkflowSummaryRecord]) -> Wor
     )
 
 
-def workflow_summary_from_review_item(item: ReviewWorkItem) -> WorkflowSummaryRecord:
+def workflow_summary_from_review_item(item: ReviewWorkflowSummarySource) -> WorkflowSummaryRecord:
     projection = build_work_item_workflow_projection(item)
     timeline = projection.workflow_events
     current_state = projection.canonical_workflow_state or WorkflowState.CREATED
@@ -570,7 +573,7 @@ def _agent_task_last_actor(
 
 
 def _review_item_workflow_identity_key(
-    item: ReviewWorkItem,
+    item: ReviewWorkflowSummarySource,
 ) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
     return _github_workflow_identity_key(
         repo_full_name=item.repo_full_name,
@@ -633,7 +636,7 @@ def _latest_record_value(records: list[EventRecord], name: str) -> Any:
     return None
 
 
-def _assigned_agent(item: ReviewWorkItem | None, state: WorkflowState) -> str | None:
+def _assigned_agent(item: ReviewWorkflowSummarySource | None, state: WorkflowState) -> str | None:
     labels = set(item.labels if item is not None else [])
     if state in {WorkflowState.ASSIGNED, WorkflowState.CIRCUIT_WORKING} or labels & {"agent-ready", "agent-next"}:
         return "circuit-forge"
