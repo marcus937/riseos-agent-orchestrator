@@ -119,6 +119,7 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 
 - `workforce.agents`, `workforce.issues`, and `workforce.prs` return at most 50 records each.
 - `workforce.events` returns at most 25 records.
+- SQLite-backed snapshots use limited compact collection queries and separate aggregate totals for collection metadata.
 - Workforce records preserve compact workflow summary fields, including `workflow_id`, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
 - Workforce records intentionally do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
 - `labels` returns at most 20 labels per work item while preserving `label_count` and `labels_truncated`.
@@ -196,5 +197,6 @@ The contract is covered by endpoint tests that verify:
 - `GET /api/v1/orchestrator/snapshot` returns `schema_version: orchestrator.snapshot.v3`.
 - Existing webhook, event, queue, lifecycle, health, and runtime data are aggregated into one payload with JMC Workforce data under `workforce`.
 - Workforce list payloads are bounded and omit full workflow timeline arrays and runtime validation context payloads.
+- Storage-backed snapshot collection queries are bounded while `workforce.meta.*.total` remains accurate.
 - The endpoint follows the debug-read access policy when token protection is enabled.
 - Runtime status does not expose configured secret values.

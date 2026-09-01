@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.correlation import correlation_id_from_key
 from app.event_store import EventRecord, EventWorkflowSummary
@@ -19,6 +19,9 @@ from app.review_queue import (
     review_work_item_identity,
 )
 from app.workflow_chain_diagnostics import log_workflow_chain_availability
+
+if TYPE_CHECKING:
+    from app.workflows import WorkflowSummaryCounts
 
 
 class SQLiteStateStore:
@@ -564,15 +567,41 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._review_work_item_from_row(row) for row in rows]
 
-    def list_review_work_item_snapshot_records(self) -> list[ReviewWorkItem]:
+    def count_review_work_item_snapshot_records(self, *, collection: str | None = None) -> int:
+        where_sql = _review_work_item_snapshot_collection_where_sql(collection)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM review_work_items
+                {where_sql}
+                """
+            ).fetchone()
+        return int(row["count"])
+
+    def list_review_work_item_snapshot_records(
+        self,
+        *,
+        limit: int | None = None,
+        collection: str | None = None,
+    ) -> list[ReviewWorkItem]:
+        if limit is not None and limit <= 0:
+            return []
+        where_sql = _review_work_item_snapshot_collection_where_sql(collection)
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (limit,) if limit is not None else ()
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT
                     {_review_work_item_snapshot_select_sql()}
                 FROM review_work_items
-                ORDER BY created_at DESC
-                """
+                {where_sql}
+                ORDER BY created_at DESC,
+                         id ASC
+                {limit_sql}
+                """,
+                params,
             ).fetchall()
         return [self._review_work_item_snapshot_from_row(row) for row in rows]
 
@@ -792,6 +821,38 @@ class SQLiteStateStore:
             last_failure_at=_parse_dt(row["last_failure_at"]),
         )
 
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        from app.workflows import WorkflowSummaryCounts
+
+        queue_counters = self.review_queue_counters()
+        active_event_count = self.count_event_records_for_workflow_collection(workflow_filter="active")
+        blocked_event_count = self._count_event_workflows_for_snapshot_category("blocked")
+        reviewing_event_count = self._count_event_workflows_for_snapshot_category("reviewing")
+        return WorkflowSummaryCounts(
+            active=queue_counters.review_queue_count + active_event_count,
+            blocked=queue_counters.blocked_count + blocked_event_count,
+            reviewing=(
+                queue_counters.reviewing_count
+                + queue_counters.needs_changes_count
+                + reviewing_event_count
+            ),
+            verified=0,
+        )
+
+    def _count_event_workflows_for_snapshot_category(self, category: str) -> int:
+        where_sql, params = _latest_event_workflow_snapshot_category_filter_sql(category)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT COUNT(*) AS count
+                FROM ranked_event_workflows AS latest
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
     def list_recent_failures(self, *, limit: int = 20) -> list[RecentFailure]:
         if limit <= 0:
             return []
@@ -818,7 +879,11 @@ class SQLiteStateStore:
             ).fetchall()
         return [RecentFailure.model_validate(dict(row)) for row in rows]
 
-    def list_lifecycle_visibility_records(self) -> list[ReviewLifecycleVisibility]:
+    def list_lifecycle_visibility_records(self, *, limit: int | None = None) -> list[ReviewLifecycleVisibility]:
+        if limit is not None and limit <= 0:
+            return []
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (limit,) if limit is not None else ()
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -849,8 +914,11 @@ class SQLiteStateStore:
                     last_failure_at,
                     last_error
                 FROM review_work_items
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC,
+                         id ASC
                 """
+                + limit_sql,
+                params,
             ).fetchall()
         return [self._lifecycle_visibility_from_row(row) for row in rows]
 
@@ -1073,6 +1141,16 @@ def _review_workflow_filter_sql(workflow_filter: str, recent_since: datetime | N
     return f"WHERE ({active_sql}) OR ({recent_sql})", recent_params
 
 
+def _review_work_item_snapshot_collection_where_sql(collection: str | None) -> str:
+    if collection is None:
+        return ""
+    if collection == "issues":
+        return "WHERE issue_number IS NOT NULL AND pr_number IS NULL"
+    if collection == "prs":
+        return "WHERE pr_number IS NOT NULL"
+    raise ValueError(f"Unknown review work item snapshot collection: {collection}")
+
+
 def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
     predicates = [
         "latest.workflow_rank = 1",
@@ -1101,6 +1179,24 @@ def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: dateti
         f"({predicate})" for predicate in predicates
     )
     return where_sql, tuple(params)
+
+
+def _latest_event_workflow_snapshot_category_filter_sql(category: str) -> tuple[str, tuple[object, ...]]:
+    where_sql, params = _latest_event_workflow_filter_sql("all", None)
+    if category == "blocked":
+        category_sql = """
+        latest.github_event = 'pull_request'
+        AND latest.raw_action = 'closed'
+        AND COALESCE(latest.pr_merged, 0) = 0
+        """
+    elif category == "reviewing":
+        category_sql = """
+        latest.github_event = 'pull_request_review'
+        AND latest.raw_action = 'submitted'
+        """
+    else:
+        raise ValueError(f"Unknown event workflow snapshot category: {category}")
+    return f"{where_sql}\n                  AND ({category_sql})", params
 
 
 def _event_record_select_sql(alias: str) -> str:

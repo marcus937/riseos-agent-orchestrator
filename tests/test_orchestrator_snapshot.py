@@ -15,7 +15,13 @@ from app.orchestrator_snapshot import (
     ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION,
     ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT,
 )
-from app.review_queue import ReviewLifecycleStage, ReviewWorkItem, ReviewWorkItemStatus, review_queue
+from app.review_queue import (
+    ReviewLifecycleStage,
+    ReviewLifecycleVisibility,
+    ReviewWorkItem,
+    ReviewWorkItemStatus,
+    review_queue,
+)
 from app.security import build_signature
 from app.storage import SQLiteStateStore
 
@@ -49,6 +55,35 @@ class SnapshotCompactSQLiteStateStore(SQLiteStateStore):
 
     def _review_work_item_from_row(self, row):  # noqa: ANN001
         raise AssertionError("Snapshot must not deserialize full review work item rows")
+
+
+class SnapshotBoundedSQLiteStateStore(SnapshotCompactSQLiteStateStore):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.snapshot_record_calls: list[dict[str, object]] = []
+        self.lifecycle_limits: list[int | None] = []
+
+    def list_review_work_item_snapshot_records(
+        self,
+        *,
+        limit: int | None = None,
+        collection: str | None = None,
+    ) -> list[ReviewWorkItem]:
+        self.snapshot_record_calls.append({"limit": limit, "collection": collection})
+        assert limit == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+        return super().list_review_work_item_snapshot_records(
+            limit=limit,
+            collection=collection,
+        )
+
+    def list_lifecycle_visibility_records(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[ReviewLifecycleVisibility]:
+        self.lifecycle_limits.append(limit)
+        assert limit == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+        return super().list_lifecycle_visibility_records(limit=limit)
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -271,6 +306,67 @@ def test_orchestrator_snapshot_uses_sqlite_compact_records_without_detail_hydrat
     assert body["workforce"]["agents"][0]["canonical_workflow_state"] == "HERMES_VALIDATING"
     assert "runtime_validation_context" not in response.text
     assert huge_runtime_context not in response.text
+
+
+def test_orchestrator_snapshot_uses_bounded_sqlite_collection_queries(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotBoundedSQLiteStateStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    pr_total = ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT + 4
+    issue_total = ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT + 2
+
+    for index in range(pr_total):
+        storage.save_review_work_item(
+            ReviewWorkItem(
+                id=f"bounded-pr-{index}",
+                created_at=now,
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.PULL_REQUEST,
+                pr_number=index + 1,
+                status=ReviewWorkItemStatus.BLOCKED,
+                lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
+                last_failure_at=now,
+                last_error="blocked",
+            )
+        )
+    for index in range(issue_total):
+        storage.save_review_work_item(
+            ReviewWorkItem(
+                id=f"bounded-issue-{index}",
+                created_at=now,
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.ISSUES,
+                issue_number=index + 1,
+            )
+        )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.json()
+    total = pr_total + issue_total
+    assert storage.snapshot_record_calls == [
+        {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": None},
+        {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": "issues"},
+        {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": "prs"},
+    ]
+    assert storage.lifecycle_limits == [ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT]
+    assert body["workforce"]["meta"]["agents"] == {
+        "returned": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+        "total": total,
+        "limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+        "truncated": True,
+    }
+    assert body["workforce"]["meta"]["issues"]["total"] == issue_total
+    assert body["workforce"]["meta"]["prs"]["total"] == pr_total
+    assert len(body["workforce"]["issues"]) == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert len(body["workforce"]["prs"]) == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert body["queue"]["counters"]["review_queue_count"] == total
+    assert body["workflows"]["blocked"] == pr_total
 
 
 def test_orchestrator_snapshot_limits_before_work_item_projection(monkeypatch) -> None:
