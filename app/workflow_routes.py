@@ -213,7 +213,7 @@ def _build_bounded_storage_workflow_collection(
         if agent_store is not None
         else []
     )
-    event_candidates = storage.list_event_records_for_workflow_collection(
+    event_candidates = storage.list_event_workflow_summary_records_for_collection(
         limit=candidate_limit,
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
@@ -381,7 +381,7 @@ def _supports_bounded_workflow_storage(storage: object) -> bool:
             "count_event_records_for_workflow_collection",
             "count_review_work_items",
             "count_review_work_items_for_workflow_collection",
-            "list_event_records_for_workflow_collection",
+            "list_event_workflow_summary_records_for_collection",
             "list_review_work_item_summary_records_for_workflow_collection",
         )
     )

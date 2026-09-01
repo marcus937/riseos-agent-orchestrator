@@ -108,6 +108,9 @@ Correlated GitHub event records are collapsed into one event-backed workflow;
 event-backed workflows are de-duplicated against review work items by issue/PR
 subject when present, or by branch and commit for ref-only events. `pagination.total`
 and `pagination.unfiltered_total` count normalized workflows, not raw event rows.
+Correlated event workflow summaries preserve the first event as `created_at`
+and the latest event as `updated_at`/`last_activity_at`; full event sequences
+remain detail-only.
 `pagination` is additive metadata:
 
 ```json

@@ -112,6 +112,44 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
     assert data["runtime"]["hermes_dispatch"]["m2_dispatch_enabled"] is False
 
 
+def test_orchestrator_snapshot_preserves_workflow_scalars_without_embedded_timeline_detail() -> None:
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    review_queue.add_if_absent(
+        ReviewWorkItem(
+            id="snapshot-detail-owner",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            branch="feature/snapshot-detail-owner",
+            base_branch="main",
+            commit_sha="abc123",
+            pr_number=17,
+            status=ReviewWorkItemStatus.REVIEWING,
+            lifecycle_stage=ReviewLifecycleStage.REVIEW_STARTED,
+            review_started_at=now,
+        )
+    )
+
+    snapshot = client.get("/api/v1/orchestrator/snapshot")
+
+    assert snapshot.status_code == 200
+    agent = snapshot.json()["workforce"]["agents"][0]
+    assert agent["workflow_id"] == "wf-snapshot-detail-owner"
+    assert agent["workflow_state"] == "HERMES_VALIDATION_RUNNING"
+    assert agent["canonical_workflow_state"] == "HERMES_VALIDATING"
+    assert agent["current_owner"] == "Hermes"
+    assert agent["workflow_event_count"] >= 2
+    assert agent["workflow_events_truncated"] is True
+    assert "workflow_events" not in agent
+    assert "workflow_state_history" not in agent
+
+    detail = client.get("/api/v1/workflows/wf-snapshot-detail-owner")
+    assert detail.status_code == 200
+    assert len(detail.json()["timeline"]) == agent["workflow_event_count"]
+
+
 def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     client = client_with_secret()
     huge_historical_payload = "large-runtime-context-" + ("x" * 100_000)

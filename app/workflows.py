@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.agent_tasks import AgentTask, AgentTaskStatus, AgentTaskWorkflowSummary
-from app.event_store import EventRecord
+from app.event_store import EventRecord, EventWorkflowSummary
 from app.review_queue import ReviewWorkItem, ReviewWorkItemWorkflowSummary
 from app.workflow_lifecycle import (
     LegacyWorkflowState,
@@ -108,13 +108,13 @@ ReviewWorkflowSummarySource = ReviewWorkItem | ReviewWorkItemWorkflowSummary
 
 def build_workflow_summaries(
     review_items: list[ReviewWorkflowSummarySource],
-    events: list[EventRecord],
+    events: list[EventRecord | EventWorkflowSummary],
     agent_tasks: list[AgentTask | AgentTaskWorkflowSummary] | None = None,
 ) -> list[WorkflowSummaryRecord]:
     workflows = [workflow_summary_from_review_item(item) for item in review_items]
     workflows.extend(workflow_summary_from_agent_task(task) for task in (agent_tasks or []))
     review_item_keys = {_review_item_workflow_identity_key(item) for item in review_items}
-    event_records_by_workflow_id: dict[str, list[EventRecord]] = {}
+    event_records_by_workflow_id: dict[str, list[EventRecord | EventWorkflowSummary]] = {}
     for record in events:
         projection = build_event_workflow_projection(record)
         if not projection.canonical_workflow_state:
@@ -161,52 +161,6 @@ def build_workflow_collection(
             returned=len(page),
             total=len(filtered),
             unfiltered_total=len(workflows),
-            truncated=next_offset is not None,
-            has_next=next_offset is not None,
-            next_offset=next_offset,
-            filter=normalized_filter,
-            recent_days=bounded_recent_days,
-        ),
-    )
-
-
-def build_workflow_collection_from_candidates(
-    review_items: list[ReviewWorkflowSummarySource],
-    events: list[EventRecord],
-    agent_tasks: list[AgentTask | AgentTaskWorkflowSummary] | None = None,
-    *,
-    limit: int = WORKFLOW_LIST_DEFAULT_LIMIT,
-    offset: int = 0,
-    workflow_filter: WorkflowListFilter = WorkflowListFilter.ACTIVE_RECENT,
-    recent_days: int = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
-    total: int,
-    unfiltered_total: int,
-    now: datetime | None = None,
-) -> WorkflowCollection:
-    bounded_limit = min(max(limit, 1), WORKFLOW_LIST_MAX_LIMIT)
-    bounded_offset = max(offset, 0)
-    bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
-    normalized_filter = WorkflowListFilter(workflow_filter)
-    filtered_candidates = filter_workflow_summaries(
-        build_workflow_summaries(review_items, events, agent_tasks),
-        workflow_filter=normalized_filter,
-        recent_days=bounded_recent_days,
-        now=now,
-    )
-    page = filtered_candidates[bounded_offset : bounded_offset + bounded_limit]
-    next_offset = (
-        bounded_offset + bounded_limit
-        if bounded_offset + bounded_limit < total
-        else None
-    )
-    return WorkflowCollection(
-        workflows=page,
-        pagination=WorkflowPaginationMetadata(
-            limit=bounded_limit,
-            offset=bounded_offset,
-            returned=len(page),
-            total=total,
-            unfiltered_total=unfiltered_total,
             truncated=next_offset is not None,
             has_next=next_offset is not None,
             next_offset=next_offset,
@@ -338,12 +292,17 @@ def workflow_summary_from_agent_task(
     )
 
 
-def workflow_summary_from_event_records(records: list[EventRecord]) -> WorkflowSummaryRecord:
+def workflow_summary_from_event_records(
+    records: list[EventRecord | EventWorkflowSummary],
+) -> WorkflowSummaryRecord:
     ordered_records = sorted(records, key=lambda record: (record.received_at, record.event_id))
     projection = build_event_records_workflow_projection(ordered_records)
     current_state = projection.canonical_workflow_state or WorkflowState.CREATED
-    first_record = ordered_records[0]
     last_record = ordered_records[-1]
+    first_received_at = min(
+        (getattr(record, "first_received_at", record.received_at) for record in ordered_records),
+        key=_as_utc,
+    )
     return WorkflowSummaryRecord(
         workflow_id=_event_workflow_id(last_record),
         correlation_id=_latest_record_value(ordered_records, "correlation_id"),
@@ -353,7 +312,7 @@ def workflow_summary_from_event_records(records: list[EventRecord]) -> WorkflowS
         current_state=current_state,
         assigned_agent=_assigned_agent(None, current_state),
         last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
-        created_at=first_record.received_at,
+        created_at=first_received_at,
         updated_at=last_record.received_at,
         last_activity_at=last_record.received_at,
     )
@@ -625,6 +584,9 @@ def _github_workflow_identity_key(
 
 
 def _event_workflow_id(record: EventRecord) -> str:
+    workflow_id = getattr(record, "workflow_id", None)
+    if workflow_id:
+        return workflow_id
     return f"wf-{record.correlation_id or record.event_id}"
 
 

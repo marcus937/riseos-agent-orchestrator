@@ -673,6 +673,107 @@ def test_workflow_endpoint_bounded_sqlite_event_totals_are_deduplicated_by_workf
     assert body["pagination"]["next_offset"] == 2
 
 
+def test_workflow_endpoint_bounded_sqlite_fills_page_after_event_workflow_deduplication(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    for index in range(10):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"shared-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                correlation_id="orch-shared-page",
+                repo_full_name="riseos/example",
+                branch="agent-shared",
+                commit_sha=f"shared-sha-{index}",
+                received_at=base + timedelta(hours=1, minutes=index),
+            )
+        )
+    for index in range(4):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"unique-page-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch=f"agent-unique-page-{index}",
+                commit_sha=f"unique-page-sha-{index}",
+                received_at=base + timedelta(minutes=index),
+            )
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=3")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-orch-shared-page",
+        "wf-unique-page-event-3",
+        "wf-unique-page-event-2",
+    ]
+    assert body["pagination"]["returned"] == 3
+    assert body["pagination"]["total"] == 5
+    assert body["pagination"]["unfiltered_total"] == 5
+    assert body["pagination"]["has_next"] is True
+    assert body["pagination"]["next_offset"] == 3
+
+
+def test_workflow_endpoint_bounded_sqlite_event_summary_keeps_created_at_without_timeline(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    storage.save_event_record(
+        EventRecord(
+            event_id="event-created",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="orch-summary-created-at",
+            repo_full_name="riseos/example",
+            branch="agent-summary",
+            commit_sha="summary-sha",
+            received_at=base,
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="event-updated",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            correlation_id="orch-summary-created-at",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=2),
+            raw_action="submitted",
+        )
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    workflow = response.json()["workflows"][0]
+    assert workflow["workflow_id"] == "wf-orch-summary-created-at"
+    assert workflow["current_state"] == "BB2_REVIEWING"
+    assert datetime.fromisoformat(workflow["created_at"].replace("Z", "+00:00")) == base
+    assert datetime.fromisoformat(workflow["updated_at"].replace("Z", "+00:00")) == base + timedelta(minutes=2)
+    assert datetime.fromisoformat(workflow["last_activity_at"].replace("Z", "+00:00")) == base + timedelta(minutes=2)
+    assert "timeline" not in workflow
+    assert "route_history" not in workflow
+
+    detail = client.get("/api/v1/workflows/wf-orch-summary-created-at")
+    assert detail.status_code == 200
+    assert [event["source"] for event in detail.json()["timeline"]] == [
+        "github_webhook",
+        "github_webhook",
+    ]
+
+
 def test_workflow_endpoint_bounded_sqlite_event_duplicates_review_item_identity(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)

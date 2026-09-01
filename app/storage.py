@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.correlation import correlation_id_from_key
-from app.event_store import EventRecord
+from app.event_store import EventRecord, EventWorkflowSummary
 from app.operational_logging import log_event
 from app.review_queue import (
     ReviewQueueCounters,
@@ -228,6 +228,49 @@ class SQLiteStateStore:
                 (*params, limit),
             ).fetchall()
         return [self._event_record_from_row(row) for row in rows]
+
+    def list_event_workflow_summary_records_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[EventWorkflowSummary]:
+        if limit <= 0:
+            return []
+        where_sql, params = _latest_event_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT
+                    latest.workflow_id,
+                    latest.first_received_at,
+                    latest.event_id,
+                    latest.github_event,
+                    latest.diagnostic_stage,
+                    COALESCE(latest.correlation_id, identity.correlation_id) AS correlation_id,
+                    COALESCE(latest.correlation_key, identity.correlation_key) AS correlation_key,
+                    COALESCE(latest.repo_full_name, identity.repo_full_name) AS repo_full_name,
+                    COALESCE(latest.branch, identity.branch) AS branch,
+                    COALESCE(latest.commit_sha, identity.commit_sha) AS commit_sha,
+                    COALESCE(latest.issue_number, identity.issue_number) AS issue_number,
+                    COALESCE(latest.pr_number, identity.pr_number) AS pr_number,
+                    latest.pr_merged,
+                    latest.received_at,
+                    latest.raw_action
+                FROM ranked_event_workflows AS latest
+                JOIN ranked_event_workflows AS identity
+                  ON identity.workflow_id = latest.workflow_id
+                 AND identity.workflow_identity_rank = 1
+                {where_sql}
+                ORDER BY latest.received_at DESC,
+                         latest.workflow_id ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._event_workflow_summary_from_row(row) for row in rows]
 
     def get_event_record_for_workflow_id(self, workflow_id: str) -> EventRecord | None:
         records = self.list_event_records_for_workflow_id(workflow_id)
@@ -682,6 +725,12 @@ class SQLiteStateStore:
             data["pr_merged"] = bool(data["pr_merged"])
         return EventRecord.model_validate(data)
 
+    def _event_workflow_summary_from_row(self, row: sqlite3.Row) -> EventWorkflowSummary:
+        data = dict(row)
+        if data.get("pr_merged") is not None:
+            data["pr_merged"] = bool(data["pr_merged"])
+        return EventWorkflowSummary.model_validate(data)
+
     def _review_work_item_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
         data = dict(row)
         raw_runtime_validation_context = data.get("runtime_validation_context")
@@ -1020,7 +1069,10 @@ ranked_event_workflows AS (
                 END,
                 e.received_at DESC,
                 e.event_id DESC
-        ) AS workflow_identity_rank
+        ) AS workflow_identity_rank,
+        MIN(e.received_at) OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+        ) AS first_received_at
     FROM event_records AS e
     WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
 )

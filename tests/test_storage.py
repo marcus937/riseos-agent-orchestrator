@@ -3,7 +3,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from app.correlation import correlation_id_from_key
-from app.event_store import EventRecord, event_record_from_parsed
+from app.event_store import EventRecord, EventWorkflowSummary, event_record_from_parsed
 from app.github_events import GitHubEventType, parse_github_event
 from app.review_queue import ReviewWorkItemStatus, review_work_item_from_parsed
 from app.storage import SQLiteStateStore, build_sqlite_store
@@ -124,6 +124,49 @@ def test_event_records_for_workflow_id_return_full_correlated_timeline(tmp_path)
     assert [record.event_id for record in records] == ["event-1", "event-2"]
     assert latest is not None
     assert latest.event_id == "event-2"
+
+
+def test_event_workflow_summary_records_preserve_first_and_latest_activity(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    store = SQLiteStateStore(str(db_path))
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    store.save_event_record(
+        EventRecord(
+            event_id="event-1",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="orch-correlated-summary",
+            repo_full_name="riseos/example",
+            branch="agent-integration",
+            commit_sha="abc123",
+            received_at=base,
+        )
+    )
+    store.save_event_record(
+        EventRecord(
+            event_id="event-2",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            correlation_id="orch-correlated-summary",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=3),
+            raw_action="submitted",
+        )
+    )
+
+    summaries = store.list_event_workflow_summary_records_for_collection(
+        limit=10,
+        workflow_filter="all",
+    )
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert isinstance(summary, EventWorkflowSummary)
+    assert summary.workflow_id == "wf-orch-correlated-summary"
+    assert summary.first_received_at == base
+    assert summary.received_at == base + timedelta(minutes=3)
+    assert summary.event_id == "event-2"
+    assert summary.pr_number == 17
 
 
 def test_issue_dispatch_claim_is_single_owner(tmp_path) -> None:
