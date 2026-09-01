@@ -4,7 +4,13 @@ from datetime import UTC, datetime
 from fastapi.testclient import TestClient
 
 import app.orchestrator_snapshot as snapshot_module
-from app.agent_tasks import AgentTask, AgentTaskLifecycleEvent, AgentTaskStatus, SQLiteAgentTaskStore
+from app.agent_tasks import (
+    AgentTask,
+    AgentTaskLifecycleEvent,
+    AgentTaskStatus,
+    SQLiteAgentTaskStore,
+    agent_task_store,
+)
 from app.config import get_settings
 from app.event_store import EventRecord, event_store
 from app.github_events import GitHubEventType
@@ -36,6 +42,7 @@ def client_with_secret(
     get_settings.cache_clear()
     event_store.reset()
     review_queue.reset()
+    agent_task_store.reset()
     for state_key in ("storage", "agent_task_store", "workflow_v1_store"):
         if hasattr(app.state, state_key):
             delattr(app.state, state_key)
@@ -444,6 +451,41 @@ def test_orchestrator_snapshot_counts_sqlite_agent_task_workflows_without_detail
         "active": 3,
         "blocked": 1,
         "reviewing": 1,
+        "verified": 0,
+    }
+    assert detail_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_storage_path_does_not_count_global_agent_tasks(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    detail_sentinel = "global-agent-task-detail-" + ("x" * 10_000)
+
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="persisted-snapshot-review",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            pr_number=17,
+        )
+    )
+    agent_task_store.save_agent_task(
+        _agent_task("global-memory-agent", AgentTaskStatus.QUEUED, now, detail_sentinel)
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["workflows"] == {
+        "active": 1,
+        "blocked": 0,
+        "reviewing": 0,
         "verified": 0,
     }
     assert detail_sentinel not in response.text

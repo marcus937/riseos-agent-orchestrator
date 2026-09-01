@@ -384,13 +384,23 @@ def _review_work_item_for_workflow_id(
 
 
 def _agent_task_store_for_read(request: Request, settings: Settings) -> AgentTaskStore | None:
+    storage = _storage(request)
+    storage_db_path = getattr(storage, "db_path", None) if storage is not None else None
+    agent_task_db_path = settings.orchestrator_db_path or (
+        str(storage_db_path) if storage_db_path is not None else None
+    )
     store = getattr(request.app.state, "agent_task_store", None)
     if store is not None:
         store_db_path = getattr(store, "db_path", None)
-        if store_db_path is not None and str(store_db_path) != settings.orchestrator_db_path:
+        if store_db_path is not None and str(store_db_path) != agent_task_db_path:
             return None
         return store
-    return build_agent_task_store(settings.orchestrator_db_path)
+    if storage is not None and not agent_task_db_path:
+        return None
+    store = build_agent_task_store(agent_task_db_path)
+    if storage is not None and getattr(store, "db_path", None) is None:
+        return None
+    return store
 
 
 def _supports_bounded_workflow_storage(storage: object) -> bool:

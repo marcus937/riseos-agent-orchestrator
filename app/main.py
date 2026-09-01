@@ -405,13 +405,23 @@ def _snapshot_agent_task_workflow_counts(settings: Settings) -> WorkflowSummaryC
 
 
 def _snapshot_agent_task_store(settings: Settings) -> AgentTaskStore | None:
+    storage = _storage()
+    storage_db_path = getattr(storage, "db_path", None) if storage is not None else None
+    agent_task_db_path = settings.orchestrator_db_path or (
+        str(storage_db_path) if storage_db_path is not None else None
+    )
     store = getattr(app.state, "agent_task_store", None)
     if store is not None:
         store_db_path = getattr(store, "db_path", None)
-        if store_db_path is not None and str(store_db_path) != settings.orchestrator_db_path:
+        if store_db_path is not None and str(store_db_path) != agent_task_db_path:
             return None
         return store
-    return build_agent_task_store(settings.orchestrator_db_path)
+    if storage is not None and not agent_task_db_path:
+        return None
+    store = build_agent_task_store(agent_task_db_path)
+    if storage is not None and getattr(store, "db_path", None) is None:
+        return None
+    return store
 
 
 def _merge_workflow_summary_counts(

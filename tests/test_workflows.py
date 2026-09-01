@@ -427,6 +427,28 @@ def test_workflow_endpoint_uses_bounded_sqlite_queries_for_collection(tmp_path) 
     }
 
 
+def test_workflow_endpoint_storage_path_does_not_merge_global_agent_tasks(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    client = client_with_secret()
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    storage.save_review_work_item(_review_item("persisted-review", base))
+    agent_task_store.save_agent_task(
+        _agent_task("global-memory-agent", AgentTaskStatus.QUEUED, base + timedelta(minutes=1))
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == ["wf-persisted-review"]
+    assert body["pagination"]["returned"] == 1
+    assert body["pagination"]["total"] == 1
+    assert body["pagination"]["unfiltered_total"] == 1
+
+
 def test_workflow_endpoint_uses_summary_records_without_detail_payloads(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = SummaryOnlyWorkflowListSQLiteStateStore(db_path)
