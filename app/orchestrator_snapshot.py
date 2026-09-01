@@ -26,7 +26,7 @@ from app.workflow_lifecycle import (
 )
 from app.workflows import WorkflowSummaryCounts, build_workflow_summary_counts, build_workflows
 
-ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v1"
+ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v2"
 ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT = 50
 ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT = 25
 ORCHESTRATOR_SNAPSHOT_RECENT_FAILURE_LIMIT = 20
@@ -404,7 +404,12 @@ def _workflow_event_snapshot(event: EventRecord) -> WorkflowEventRecordSnapshot:
 
 
 def _workflow_fields(projection: WorkflowStateProjection) -> dict[str, Any]:
-    events = _limit_workflow_events(projection.workflow_events, ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT)
+    events = _bounded_workflow_events(
+        _limit_workflow_events(
+            projection.workflow_events,
+            ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
+        )
+    )
     return {
         "workflow_events": events,
         "workflow_state": projection.workflow_state,
@@ -447,6 +452,34 @@ def _limit_collection(items: list[Any], limit: int) -> list[Any]:
 
 def _limit_workflow_events(events: list[WorkflowEvent], limit: int) -> list[WorkflowEvent]:
     return events[-limit:]
+
+
+def _bounded_workflow_events(events: list[WorkflowEvent]) -> list[WorkflowEvent]:
+    return [_bounded_workflow_event(event) for event in events]
+
+
+def _bounded_workflow_event(event: WorkflowEvent) -> WorkflowEvent:
+    return event.model_copy(
+        deep=True,
+        update={"metadata": _bounded_workflow_event_metadata(event.metadata)},
+    )
+
+
+def _bounded_workflow_event_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(metadata)
+    labels = bounded.get("labels")
+    if isinstance(labels, list):
+        bounded["labels"] = _limit_collection(labels, ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT)
+        bounded["label_count"] = len(labels)
+        bounded["labels_truncated"] = len(labels) > ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
+    for key, value in list(bounded.items()):
+        if not isinstance(value, str):
+            continue
+        bounded_value, truncated = _bounded_string(value)
+        bounded[key] = bounded_value
+        if truncated:
+            bounded[f"{key}_truncated"] = True
+    return bounded
 
 
 def _bounded_string(value: str | None, *, limit: int = ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT) -> tuple[str | None, bool]:
