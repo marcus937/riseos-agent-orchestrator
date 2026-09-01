@@ -1,7 +1,7 @@
 import hmac
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from starlette.routing import Match
 
 from app.admin_auth import require_orchestrator_admin_token
@@ -14,7 +14,19 @@ from app.config import Settings, get_settings
 from app.event_store import event_store
 from app.review_queue import review_queue
 from app.storage import SQLiteStateStore
-from app.workflows import WorkflowCollection, WorkflowRecord, WorkflowTimeline, build_workflows, find_workflow
+from app.workflows import (
+    WORKFLOW_LIST_DEFAULT_LIMIT,
+    WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    WORKFLOW_LIST_MAX_LIMIT,
+    WORKFLOW_LIST_MAX_RECENT_DAYS,
+    WorkflowCollection,
+    WorkflowListFilter,
+    WorkflowRecord,
+    WorkflowTimeline,
+    build_workflow_collection,
+    build_workflows,
+    find_workflow,
+)
 from app.workflow_orchestration import (
     WorkflowCreateRequest,
     WorkflowResponse,
@@ -97,9 +109,19 @@ async def create_workflow_endpoint(
 @router.get("", response_model=WorkflowCollection)
 async def list_workflows(
     request: Request,
+    limit: Annotated[int, Query(ge=1, le=WORKFLOW_LIST_MAX_LIMIT)] = WORKFLOW_LIST_DEFAULT_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    workflow_filter: Annotated[WorkflowListFilter, Query(alias="filter")] = WorkflowListFilter.ACTIVE_RECENT,
+    recent_days: Annotated[int, Query(ge=1, le=WORKFLOW_LIST_MAX_RECENT_DAYS)] = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     _: None = Depends(_require_workflow_read_access),
 ) -> WorkflowCollection:
-    return WorkflowCollection(workflows=_build_request_workflows(request))
+    return build_workflow_collection(
+        _build_request_workflows(request),
+        limit=limit,
+        offset=offset,
+        workflow_filter=workflow_filter,
+        recent_days=recent_days,
+    )
 
 
 @router.get("/{workflow_id}")

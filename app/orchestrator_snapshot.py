@@ -5,11 +5,14 @@ from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.event_store import DebugHealth, EventRecord
+from app.github_events import GitHubEventType
 from app.review_queue import (
     RecentFailure,
+    ReviewLifecycleStage,
     ReviewLifecycleVisibility,
     ReviewQueueStats,
     ReviewWorkItem,
+    ReviewWorkItemStatus,
     WorkerStats,
 )
 from app.workflow_lifecycle import (
@@ -17,12 +20,20 @@ from app.workflow_lifecycle import (
     WorkflowEvent,
     WorkflowOwner,
     WorkflowState,
+    WorkflowStateProjection,
     build_event_workflow_projection,
     build_work_item_workflow_projection,
 )
 from app.workflows import WorkflowSummaryCounts, build_workflow_summary_counts, build_workflows
 
-ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v1"
+ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v2"
+ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT = 50
+ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT = 25
+ORCHESTRATOR_SNAPSHOT_RECENT_FAILURE_LIMIT = 20
+ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT = 8
+ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT = 20
+ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT = 2048
+_TRUNCATED_SUFFIX = "... [truncated]"
 
 
 class OrchestratorSnapshotOverview(BaseModel):
@@ -48,22 +59,125 @@ class WorkflowFields(BaseModel):
     workflow_state_history: list[WorkflowEvent] = Field(default_factory=list)
     workflow_duration_seconds: float | None = None
     current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
+    workflow_event_count: int = 0
+    workflow_events_truncated: bool = False
 
 
-class WorkflowWorkItemSnapshot(ReviewWorkItem, WorkflowFields):
-    pass
+class WorkflowWorkItemSnapshot(WorkflowFields):
+    id: str
+    created_at: datetime
+    updated_at: datetime | None = None
+    repo_full_name: str | None = None
+    event_type: GitHubEventType
+    branch: str | None = None
+    base_branch: str | None = None
+    commit_sha: str | None = None
+    issue_number: int | None = None
+    pr_number: int | None = None
+    labels: list[str] = Field(default_factory=list)
+    label_count: int = 0
+    labels_truncated: bool = False
+    status: ReviewWorkItemStatus
+    lifecycle_stage: ReviewLifecycleStage
+    worker_claimed_at: datetime | None = None
+    review_started_at: datetime | None = None
+    openai_review_attempted_at: datetime | None = None
+    openai_review_completed_at: datetime | None = None
+    review_completed_at: datetime | None = None
+    github_writeback_started_at: datetime | None = None
+    github_writeback_completed_at: datetime | None = None
+    github_writeback_success: bool | None = None
+    agent_bus_dispatch_started_at: datetime | None = None
+    agent_bus_dispatch_completed_at: datetime | None = None
+    agent_bus_dispatch_success: bool | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
+    agent_bus_dispatch_error_truncated: bool = False
+    runtime_validation_id: str | None = None
+    runtime_validation_status: str | None = None
+    runtime_validation_digest: str | None = None
+    runtime_validation_completed_at: datetime | None = None
+    failure_count: int = 0
+    last_failure_at: datetime | None = None
+    last_error: str | None = None
+    last_error_truncated: bool = False
 
 
-class WorkflowLifecycleVisibilitySnapshot(ReviewLifecycleVisibility, WorkflowFields):
-    pass
+class WorkflowLifecycleVisibilitySnapshot(WorkflowFields):
+    item_id: str
+    repo_full_name: str | None = None
+    event_type: GitHubEventType
+    status: ReviewWorkItemStatus
+    lifecycle_stage: ReviewLifecycleStage
+    queued_at: datetime
+    worker_claimed_at: datetime | None = None
+    review_started_at: datetime | None = None
+    openai_review_attempted_at: datetime | None = None
+    openai_review_completed_at: datetime | None = None
+    review_completed_at: datetime | None = None
+    github_writeback_started_at: datetime | None = None
+    github_writeback_completed_at: datetime | None = None
+    github_writeback_success: bool | None = None
+    agent_bus_dispatch_started_at: datetime | None = None
+    agent_bus_dispatch_completed_at: datetime | None = None
+    agent_bus_dispatch_success: bool | None = None
+    agent_bus_work_item_id: str | None = None
+    agent_bus_dispatch_error: str | None = None
+    agent_bus_dispatch_error_truncated: bool = False
+    runtime_validation_id: str | None = None
+    runtime_validation_status: str | None = None
+    runtime_validation_completed_at: datetime | None = None
+    failure_count: int
+    last_failure_at: datetime | None = None
+    last_error: str | None = None
+    last_error_truncated: bool = False
 
 
-class WorkflowEventRecordSnapshot(EventRecord, WorkflowFields):
-    pass
+class WorkflowEventRecordSnapshot(WorkflowFields):
+    event_id: str
+    github_event: GitHubEventType
+    diagnostic_stage: str = "webhook_accepted"
+    correlation_id: str | None = None
+    correlation_key: str | None = None
+    repo_full_name: str | None = None
+    branch: str | None = None
+    commit_sha: str | None = None
+    issue_number: int | None = None
+    pr_number: int | None = None
+    pr_merged: bool | None = None
+    received_at: datetime
+    raw_action: str | None = None
+
+
+class RecentFailureSnapshot(BaseModel):
+    item_id: str
+    repo_full_name: str | None = None
+    event_type: GitHubEventType
+    status: ReviewWorkItemStatus
+    lifecycle_stage: ReviewLifecycleStage
+    failure_count: int
+    last_failure_at: datetime
+    last_error: str
+    last_error_truncated: bool = False
+
+
+class SnapshotCollectionMeta(BaseModel):
+    returned: int
+    total: int
+    limit: int
+    truncated: bool
+
+
+class OrchestratorWorkforceSnapshotMeta(BaseModel):
+    agents: SnapshotCollectionMeta
+    issues: SnapshotCollectionMeta
+    prs: SnapshotCollectionMeta
+    events: SnapshotCollectionMeta
 
 
 class OrchestratorWorkforceSnapshot(BaseModel):
     overview: OrchestratorSnapshotOverview
+    meta: OrchestratorWorkforceSnapshotMeta
     agents: list[WorkflowLifecycleVisibilitySnapshot]
     issues: list[WorkflowWorkItemSnapshot]
     prs: list[WorkflowWorkItemSnapshot]
@@ -95,7 +209,7 @@ class OrchestratorSnapshot(BaseModel):
     queue: ReviewQueueStats
     health: DebugHealth
     runtime: OrchestratorRuntime
-    recent_failures: list[RecentFailure] = Field(default_factory=list)
+    recent_failures: list[RecentFailureSnapshot] = Field(default_factory=list)
 
 
 def build_orchestrator_snapshot(
@@ -110,6 +224,11 @@ def build_orchestrator_snapshot(
     recent_failures: list[RecentFailure],
 ) -> OrchestratorSnapshot:
     workflow_items = [_workflow_work_item_snapshot(item) for item in review_items]
+    workflow_items_by_id = {item.id: item for item in workflow_items}
+    agents = [_workflow_lifecycle_snapshot(item, workflow_items_by_id) for item in lifecycle]
+    issues = [item for item in workflow_items if item.issue_number is not None and item.pr_number is None]
+    prs = [item for item in workflow_items if item.pr_number is not None]
+    event_snapshots = [_workflow_event_snapshot(event) for event in events]
     workflows = build_workflows(review_items, events)
     return OrchestratorSnapshot(
         workforce=OrchestratorWorkforceSnapshot(
@@ -128,10 +247,16 @@ def build_orchestrator_snapshot(
                 blocked_count=health.blocked_count,
                 recent_failure_count=queue.recent_failure_count,
             ),
-            agents=[_workflow_lifecycle_snapshot(item, workflow_items) for item in lifecycle],
-            issues=[item for item in workflow_items if item.issue_number is not None and item.pr_number is None],
-            prs=[item for item in workflow_items if item.pr_number is not None],
-            events=[_workflow_event_snapshot(event) for event in events],
+            meta=OrchestratorWorkforceSnapshotMeta(
+                agents=_collection_meta(agents, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+                issues=_collection_meta(issues, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+                prs=_collection_meta(prs, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+                events=_collection_meta(event_snapshots, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
+            ),
+            agents=_limit_collection(agents, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+            issues=_limit_collection(issues, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+            prs=_limit_collection(prs, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+            events=_limit_collection(event_snapshots, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
         ),
         workflows=build_workflow_summary_counts(workflows),
         queue=queue,
@@ -144,7 +269,10 @@ def build_orchestrator_snapshot(
             debug_reads_require_admin_token=settings.require_admin_token_for_debug_reads,
             hermes_dispatch=build_hermes_dispatch_status(settings),
         ),
-        recent_failures=recent_failures,
+        recent_failures=[
+            _recent_failure_snapshot(failure)
+            for failure in _limit_collection(recent_failures, ORCHESTRATOR_SNAPSHOT_RECENT_FAILURE_LIMIT)
+        ],
     )
 
 
@@ -164,23 +292,90 @@ def snapshot_schema() -> dict[str, Any]:
 
 def _workflow_work_item_snapshot(item: ReviewWorkItem) -> WorkflowWorkItemSnapshot:
     projection = build_work_item_workflow_projection(item)
+    labels = _limit_collection(item.labels, ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT)
+    last_error, last_error_truncated = _bounded_string(item.last_error)
+    agent_bus_dispatch_error, agent_bus_dispatch_error_truncated = _bounded_string(item.agent_bus_dispatch_error)
     return WorkflowWorkItemSnapshot.model_validate(
         {
-            **item.model_dump(),
-            **projection.model_dump(),
+            "id": item.id,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "repo_full_name": item.repo_full_name,
+            "event_type": item.event_type,
+            "branch": item.branch,
+            "base_branch": item.base_branch,
+            "commit_sha": item.commit_sha,
+            "issue_number": item.issue_number,
+            "pr_number": item.pr_number,
+            "labels": labels,
+            "label_count": len(item.labels),
+            "labels_truncated": len(item.labels) > ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT,
+            "status": item.status,
+            "lifecycle_stage": item.lifecycle_stage,
+            "worker_claimed_at": item.worker_claimed_at,
+            "review_started_at": item.review_started_at,
+            "openai_review_attempted_at": item.openai_review_attempted_at,
+            "openai_review_completed_at": item.openai_review_completed_at,
+            "review_completed_at": item.review_completed_at,
+            "github_writeback_started_at": item.github_writeback_started_at,
+            "github_writeback_completed_at": item.github_writeback_completed_at,
+            "github_writeback_success": item.github_writeback_success,
+            "agent_bus_dispatch_started_at": item.agent_bus_dispatch_started_at,
+            "agent_bus_dispatch_completed_at": item.agent_bus_dispatch_completed_at,
+            "agent_bus_dispatch_success": item.agent_bus_dispatch_success,
+            "agent_bus_work_item_id": item.agent_bus_work_item_id,
+            "agent_bus_dispatch_error": agent_bus_dispatch_error,
+            "agent_bus_dispatch_error_truncated": agent_bus_dispatch_error_truncated,
+            "runtime_validation_id": item.runtime_validation_id,
+            "runtime_validation_status": item.runtime_validation_status,
+            "runtime_validation_digest": item.runtime_validation_digest,
+            "runtime_validation_completed_at": item.runtime_validation_completed_at,
+            "failure_count": item.failure_count,
+            "last_failure_at": item.last_failure_at,
+            "last_error": last_error,
+            "last_error_truncated": last_error_truncated,
+            **_workflow_fields(projection),
         }
     )
 
 
 def _workflow_lifecycle_snapshot(
     item: ReviewLifecycleVisibility,
-    workflow_items: list[WorkflowWorkItemSnapshot],
+    workflow_items: dict[str, WorkflowWorkItemSnapshot],
 ) -> WorkflowLifecycleVisibilitySnapshot:
-    matching_item = next((workflow_item for workflow_item in workflow_items if workflow_item.id == item.item_id), None)
+    matching_item = workflow_items.get(item.item_id)
     workflow_fields = matching_item.model_dump(include=set(WorkflowFields.model_fields)) if matching_item else {}
+    last_error, last_error_truncated = _bounded_string(item.last_error)
+    agent_bus_dispatch_error, agent_bus_dispatch_error_truncated = _bounded_string(item.agent_bus_dispatch_error)
     return WorkflowLifecycleVisibilitySnapshot.model_validate(
         {
-            **item.model_dump(),
+            "item_id": item.item_id,
+            "repo_full_name": item.repo_full_name,
+            "event_type": item.event_type,
+            "status": item.status,
+            "lifecycle_stage": item.lifecycle_stage,
+            "queued_at": item.queued_at,
+            "worker_claimed_at": item.worker_claimed_at,
+            "review_started_at": item.review_started_at,
+            "openai_review_attempted_at": item.openai_review_attempted_at,
+            "openai_review_completed_at": item.openai_review_completed_at,
+            "review_completed_at": item.review_completed_at,
+            "github_writeback_started_at": item.github_writeback_started_at,
+            "github_writeback_completed_at": item.github_writeback_completed_at,
+            "github_writeback_success": item.github_writeback_success,
+            "agent_bus_dispatch_started_at": item.agent_bus_dispatch_started_at,
+            "agent_bus_dispatch_completed_at": item.agent_bus_dispatch_completed_at,
+            "agent_bus_dispatch_success": item.agent_bus_dispatch_success,
+            "agent_bus_work_item_id": item.agent_bus_work_item_id,
+            "agent_bus_dispatch_error": agent_bus_dispatch_error,
+            "agent_bus_dispatch_error_truncated": agent_bus_dispatch_error_truncated,
+            "runtime_validation_id": item.runtime_validation_id,
+            "runtime_validation_status": item.runtime_validation_status,
+            "runtime_validation_completed_at": item.runtime_validation_completed_at,
+            "failure_count": item.failure_count,
+            "last_failure_at": item.last_failure_at,
+            "last_error": last_error,
+            "last_error_truncated": last_error_truncated,
             **workflow_fields,
         }
     )
@@ -190,10 +385,109 @@ def _workflow_event_snapshot(event: EventRecord) -> WorkflowEventRecordSnapshot:
     projection = build_event_workflow_projection(event)
     return WorkflowEventRecordSnapshot.model_validate(
         {
-            **event.model_dump(),
-            **projection.model_dump(),
+            "event_id": event.event_id,
+            "github_event": event.github_event,
+            "diagnostic_stage": event.diagnostic_stage,
+            "correlation_id": event.correlation_id,
+            "correlation_key": event.correlation_key,
+            "repo_full_name": event.repo_full_name,
+            "branch": event.branch,
+            "commit_sha": event.commit_sha,
+            "issue_number": event.issue_number,
+            "pr_number": event.pr_number,
+            "pr_merged": event.pr_merged,
+            "received_at": event.received_at,
+            "raw_action": event.raw_action,
+            **_workflow_fields(projection),
         }
     )
+
+
+def _workflow_fields(projection: WorkflowStateProjection) -> dict[str, Any]:
+    events = _bounded_workflow_events(
+        _limit_workflow_events(
+            projection.workflow_events,
+            ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
+        )
+    )
+    return {
+        "workflow_events": events,
+        "workflow_state": projection.workflow_state,
+        "canonical_workflow_state": projection.canonical_workflow_state,
+        "workflow_state_history": events,
+        "workflow_duration_seconds": projection.workflow_duration_seconds,
+        "current_owner": projection.current_owner,
+        "workflow_event_count": len(projection.workflow_events),
+        "workflow_events_truncated": len(projection.workflow_events) > ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
+    }
+
+
+def _recent_failure_snapshot(failure: RecentFailure) -> RecentFailureSnapshot:
+    last_error, last_error_truncated = _bounded_string(failure.last_error)
+    return RecentFailureSnapshot(
+        item_id=failure.item_id,
+        repo_full_name=failure.repo_full_name,
+        event_type=failure.event_type,
+        status=failure.status,
+        lifecycle_stage=failure.lifecycle_stage,
+        failure_count=failure.failure_count,
+        last_failure_at=failure.last_failure_at,
+        last_error=last_error or "Unknown review failure.",
+        last_error_truncated=last_error_truncated,
+    )
+
+
+def _collection_meta(items: list[Any], limit: int) -> SnapshotCollectionMeta:
+    return SnapshotCollectionMeta(
+        returned=min(len(items), limit),
+        total=len(items),
+        limit=limit,
+        truncated=len(items) > limit,
+    )
+
+
+def _limit_collection(items: list[Any], limit: int) -> list[Any]:
+    return items[:limit]
+
+
+def _limit_workflow_events(events: list[WorkflowEvent], limit: int) -> list[WorkflowEvent]:
+    return events[-limit:]
+
+
+def _bounded_workflow_events(events: list[WorkflowEvent]) -> list[WorkflowEvent]:
+    return [_bounded_workflow_event(event) for event in events]
+
+
+def _bounded_workflow_event(event: WorkflowEvent) -> WorkflowEvent:
+    return event.model_copy(
+        deep=True,
+        update={"metadata": _bounded_workflow_event_metadata(event.metadata)},
+    )
+
+
+def _bounded_workflow_event_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(metadata)
+    labels = bounded.get("labels")
+    if isinstance(labels, list):
+        bounded["labels"] = _limit_collection(labels, ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT)
+        bounded["label_count"] = len(labels)
+        bounded["labels_truncated"] = len(labels) > ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
+    for key, value in list(bounded.items()):
+        if not isinstance(value, str):
+            continue
+        bounded_value, truncated = _bounded_string(value)
+        bounded[key] = bounded_value
+        if truncated:
+            bounded[f"{key}_truncated"] = True
+    return bounded
+
+
+def _bounded_string(value: str | None, *, limit: int = ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT) -> tuple[str | None, bool]:
+    if value is None or len(value) <= limit:
+        return value, False
+    if limit <= len(_TRUNCATED_SUFFIX):
+        return _TRUNCATED_SUFFIX[:limit], True
+    return f"{value[: limit - len(_TRUNCATED_SUFFIX)]}{_TRUNCATED_SUFFIX}", True
 
 
 def _configured_url(value: str | None) -> bool:

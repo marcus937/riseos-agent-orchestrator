@@ -1,15 +1,27 @@
 import json
+from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.agent_tasks import agent_task_store
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
 from app.event_store import event_store
+from app.github_events import GitHubEventType
 from app.main import app
-from app.review_queue import review_queue
+from app.review_queue import ReviewWorkItem, review_queue
 from app.security import build_signature
+from app.workflow_lifecycle import WorkflowState
 from app.workflow_routes import register_workflow_routes
+from app.workflows import (
+    WORKFLOW_LIST_DEFAULT_LIMIT,
+    WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    WORKFLOW_LIST_MAX_LIMIT,
+    WorkflowListFilter,
+    WorkflowRecord,
+    build_workflow_collection,
+)
 
 
 def client_with_secret(
@@ -20,6 +32,10 @@ def client_with_secret(
     get_settings.cache_clear()
     event_store.reset()
     review_queue.reset()
+    agent_task_store.reset()
+    for state_key in ("storage", "agent_task_store", "workflow_v1_store"):
+        if hasattr(app.state, state_key):
+            delattr(app.state, state_key)
     app.dependency_overrides[get_settings] = lambda: get_settings().__class__(
         github_webhook_secret=secret,
         orchestrator_admin_token=admin_token,
@@ -131,6 +147,91 @@ def test_workflow_endpoints_return_canonical_record_and_timeline() -> None:
     assert timeline.json()["events"][0]["new_state"] == "CIRCUIT_WORKING"
 
 
+def test_workflow_collection_defaults_to_bounded_active_recent_page() -> None:
+    now = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    active_workflows = [
+        _workflow_record(
+            f"wf-active-{index:02d}",
+            WorkflowState.ASSIGNED,
+            now - timedelta(minutes=index + 1),
+        )
+        for index in range(WORKFLOW_LIST_DEFAULT_LIMIT + 5)
+    ]
+    recent_terminal = _workflow_record("wf-terminal-recent", WorkflowState.MERGED, now - timedelta(seconds=30))
+    stale_terminal = _workflow_record(
+        "wf-terminal-stale",
+        WorkflowState.MERGED,
+        now - timedelta(days=WORKFLOW_LIST_DEFAULT_RECENT_DAYS + 1),
+    )
+
+    collection = build_workflow_collection(
+        [*active_workflows, recent_terminal, stale_terminal],
+        now=now,
+    )
+
+    workflow_ids = [workflow.workflow_id for workflow in collection.workflows]
+    assert len(workflow_ids) == WORKFLOW_LIST_DEFAULT_LIMIT
+    assert workflow_ids[0] == "wf-terminal-recent"
+    assert "wf-terminal-stale" not in workflow_ids
+    assert collection.pagination is not None
+    assert collection.pagination.filter == WorkflowListFilter.ACTIVE_RECENT
+    assert collection.pagination.returned == WORKFLOW_LIST_DEFAULT_LIMIT
+    assert collection.pagination.total == WORKFLOW_LIST_DEFAULT_LIMIT + 6
+    assert collection.pagination.unfiltered_total == WORKFLOW_LIST_DEFAULT_LIMIT + 7
+    assert collection.pagination.truncated is True
+    assert collection.pagination.has_next is True
+    assert collection.pagination.next_offset == WORKFLOW_LIST_DEFAULT_LIMIT
+
+
+def test_workflow_collection_uses_stable_id_tiebreaker_for_equal_activity() -> None:
+    now = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    collection = build_workflow_collection(
+        [
+            _workflow_record("wf-charlie", WorkflowState.ASSIGNED, now),
+            _workflow_record("wf-alpha", WorkflowState.ASSIGNED, now),
+            _workflow_record("wf-bravo", WorkflowState.ASSIGNED, now),
+        ],
+        workflow_filter=WorkflowListFilter.ALL,
+        now=now,
+    )
+
+    assert [workflow.workflow_id for workflow in collection.workflows] == ["wf-alpha", "wf-bravo", "wf-charlie"]
+
+
+def test_workflow_endpoint_honors_pagination_query_params() -> None:
+    client = client_with_secret()
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    review_queue.add_if_absent(_review_item("old", base))
+    review_queue.add_if_absent(_review_item("middle", base + timedelta(minutes=1)))
+    review_queue.add_if_absent(_review_item("new", base + timedelta(minutes=2)))
+
+    response = client.get("/api/v1/workflows?filter=all&limit=2&offset=1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == ["wf-middle", "wf-old"]
+    assert body["pagination"] == {
+        "limit": 2,
+        "offset": 1,
+        "returned": 2,
+        "total": 3,
+        "unfiltered_total": 3,
+        "truncated": False,
+        "has_next": False,
+        "next_offset": None,
+        "filter": "all",
+        "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    }
+
+
+def test_workflow_endpoint_rejects_unbounded_limit() -> None:
+    client = client_with_secret()
+
+    response = client.get(f"/api/v1/workflows?limit={WORKFLOW_LIST_MAX_LIMIT + 1}")
+
+    assert response.status_code == 422
+
+
 def test_workflow_endpoints_use_debug_read_access_policy() -> None:
     client = client_with_secret(require_debug_read_token=True)
 
@@ -163,3 +264,26 @@ def test_pull_request_closed_merged_is_explicitly_merged() -> None:
     workflows = collection.json()["workflows"]
     assert workflows[0]["current_state"] == "MERGED"
     assert workflows[0]["timeline"][0]["state"] == "MERGED"
+
+
+def _workflow_record(workflow_id: str, state: WorkflowState, last_activity_at: datetime) -> WorkflowRecord:
+    return WorkflowRecord(
+        workflow_id=workflow_id,
+        current_state=state,
+        last_actor="Orchestrator",
+        created_at=last_activity_at,
+        updated_at=last_activity_at,
+        last_activity_at=last_activity_at,
+    )
+
+
+def _review_item(item_id: str, created_at: datetime) -> ReviewWorkItem:
+    return ReviewWorkItem(
+        id=item_id,
+        created_at=created_at,
+        updated_at=created_at,
+        repo_full_name="riseos/example",
+        event_type=GitHubEventType.PUSH,
+        branch=f"agent-{item_id}",
+        commit_sha=f"sha-{item_id}",
+    )
