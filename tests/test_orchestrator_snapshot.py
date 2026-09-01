@@ -17,24 +17,38 @@ from app.orchestrator_snapshot import (
 )
 from app.review_queue import ReviewLifecycleStage, ReviewWorkItem, ReviewWorkItemStatus, review_queue
 from app.security import build_signature
+from app.storage import SQLiteStateStore
 
 
 def client_with_secret(
     secret: str = "test-secret",
     admin_token: str = "admin-token",
     require_debug_read_token: bool = False,
+    db_path: str | None = None,
 ) -> TestClient:
     get_settings.cache_clear()
     event_store.reset()
     review_queue.reset()
+    for state_key in ("storage", "agent_task_store", "workflow_v1_store"):
+        if hasattr(app.state, state_key):
+            delattr(app.state, state_key)
     app.dependency_overrides[get_settings] = lambda: get_settings().__class__(
         github_webhook_secret=secret,
+        orchestrator_db_path=db_path,
         orchestrator_admin_token=admin_token,
         require_admin_token_for_debug_reads=require_debug_read_token,
         hermes_m2_token="hermes-m2-secret",
         hermes_dgx_token="hermes-dgx-secret",
     )
     return TestClient(app)
+
+
+class SnapshotCompactSQLiteStateStore(SQLiteStateStore):
+    def list_review_work_items(self) -> list[ReviewWorkItem]:
+        raise AssertionError("Snapshot must not hydrate full review work items")
+
+    def _review_work_item_from_row(self, row):  # noqa: ANN001
+        raise AssertionError("Snapshot must not deserialize full review work item rows")
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -216,6 +230,46 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     assert f"label-{ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT}" not in response.text
     assert "historical_payload" not in response.text
     assert huge_historical_payload not in response.text
+
+
+def test_orchestrator_snapshot_uses_sqlite_compact_records_without_detail_hydration(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    huge_runtime_context = "snapshot-runtime-context-" + ("x" * 100_000)
+    now = datetime.now(UTC)
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="sqlite-compact-snapshot",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            branch="feature/sqlite-compact-snapshot",
+            base_branch="main",
+            commit_sha="abc123",
+            pr_number=17,
+            status=ReviewWorkItemStatus.REVIEWING,
+            lifecycle_stage=ReviewLifecycleStage.REVIEW_STARTED,
+            review_started_at=now,
+            runtime_validation_context={"large_payload": huge_runtime_context},
+        )
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["queue"]["counters"]["review_queue_count"] == 1
+    assert body["queue"]["counters"]["reviewing_count"] == 1
+    assert body["workflows"]["reviewing"] == 1
+    assert body["workforce"]["meta"]["agents"]["total"] == 1
+    assert body["workforce"]["meta"]["prs"]["total"] == 1
+    assert body["workforce"]["agents"][0]["workflow_id"] == "wf-sqlite-compact-snapshot"
+    assert body["workforce"]["agents"][0]["canonical_workflow_state"] == "HERMES_VALIDATING"
+    assert "runtime_validation_context" not in response.text
+    assert huge_runtime_context not in response.text
 
 
 def test_orchestrator_snapshot_limits_before_work_item_projection(monkeypatch) -> None:

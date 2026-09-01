@@ -8,11 +8,14 @@ from app.correlation import correlation_id_from_key
 from app.event_store import EventRecord, EventWorkflowSummary
 from app.operational_logging import log_event
 from app.review_queue import (
+    RecentFailure,
+    ReviewLifecycleVisibility,
     ReviewQueueCounters,
+    ReviewQueueStats,
     ReviewWorkItem,
     ReviewWorkItemStatus,
     ReviewWorkItemWorkflowSummary,
-    review_queue_counters,
+    WorkerStats,
     review_work_item_identity,
 )
 from app.workflow_chain_diagnostics import log_workflow_chain_availability
@@ -345,6 +348,7 @@ class SQLiteStateStore:
                     commit_sha,
                     issue_number,
                     pr_number,
+                    labels,
                     status,
                     lifecycle_stage,
                     worker_claimed_at,
@@ -368,7 +372,7 @@ class SQLiteStateStore:
                     failure_count,
                     last_failure_at,
                     last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
@@ -381,6 +385,7 @@ class SQLiteStateStore:
                     item.commit_sha,
                     item.issue_number,
                     item.pr_number,
+                    json.dumps(item.labels),
                     str(item.status),
                     str(item.lifecycle_stage),
                     _dt(item.worker_claimed_at),
@@ -559,6 +564,18 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._review_work_item_from_row(row) for row in rows]
 
+    def list_review_work_item_snapshot_records(self) -> list[ReviewWorkItem]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    {_review_work_item_snapshot_select_sql()}
+                FROM review_work_items
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [self._review_work_item_snapshot_from_row(row) for row in rows]
+
     def count_review_work_items(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS count FROM review_work_items").fetchone()
@@ -631,6 +648,7 @@ class SQLiteStateStore:
                     commit_sha,
                     issue_number,
                     pr_number,
+                    labels,
                     status,
                     lifecycle_stage,
                     worker_claimed_at,
@@ -690,7 +708,151 @@ class SQLiteStateStore:
         return self._review_work_item_from_row(row)
 
     def review_queue_counters(self) -> ReviewQueueCounters:
-        return review_queue_counters(self.list_review_work_items())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS review_queue_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS pending_review_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS reviewing_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS needs_changes_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS approved_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS blocked_count
+                FROM review_work_items
+                """,
+                (
+                    ReviewWorkItemStatus.PENDING_REVIEW.value,
+                    ReviewWorkItemStatus.REVIEWING.value,
+                    ReviewWorkItemStatus.NEEDS_CHANGES.value,
+                    ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW.value,
+                    ReviewWorkItemStatus.BLOCKED.value,
+                ),
+            ).fetchone()
+        approved_count = _int(row["approved_count"])
+        return ReviewQueueCounters(
+            review_queue_count=_int(row["review_queue_count"]),
+            pending_review_count=_int(row["pending_review_count"]),
+            reviewing_count=_int(row["reviewing_count"]),
+            needs_changes_count=_int(row["needs_changes_count"]),
+            approved_count=approved_count,
+            approved_for_human_review_count=approved_count,
+            blocked_count=_int(row["blocked_count"]),
+        )
+
+    def review_queue_stats(self) -> ReviewQueueStats:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    MIN(CASE WHEN status = ? THEN created_at ELSE NULL END) AS oldest_pending_at,
+                    MAX(created_at) AS newest_created_at,
+                    SUM(failure_count) AS failure_count,
+                    SUM(CASE WHEN last_failure_at IS NOT NULL THEN 1 ELSE 0 END) AS recent_failure_count,
+                    MAX(last_failure_at) AS last_failure_at
+                FROM review_work_items
+                """,
+                (ReviewWorkItemStatus.PENDING_REVIEW.value,),
+            ).fetchone()
+        now = datetime.now(UTC)
+        oldest_pending_at = _parse_dt(row["oldest_pending_at"])
+        newest_created_at = _parse_dt(row["newest_created_at"])
+        return ReviewQueueStats(
+            counters=self.review_queue_counters(),
+            oldest_pending_age_seconds=_age_seconds(oldest_pending_at, now),
+            newest_item_age_seconds=_age_seconds(newest_created_at, now),
+            failure_count=_int(row["failure_count"]),
+            recent_failure_count=_int(row["recent_failure_count"]),
+            last_failure_at=_parse_dt(row["last_failure_at"]),
+        )
+
+    def worker_stats(self, *, auto_processing_enabled: bool) -> WorkerStats:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN worker_claimed_at IS NOT NULL THEN 1 ELSE 0 END) AS claimed_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS active_reviewing_count,
+                    SUM(CASE WHEN review_completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed_count,
+                    SUM(failure_count) AS failed_count,
+                    MAX(worker_claimed_at) AS last_claimed_at,
+                    MAX(review_completed_at) AS last_review_completed_at,
+                    MAX(last_failure_at) AS last_failure_at
+                FROM review_work_items
+                """,
+                (ReviewWorkItemStatus.REVIEWING.value,),
+            ).fetchone()
+        return WorkerStats(
+            auto_processing_enabled=auto_processing_enabled,
+            claimed_count=_int(row["claimed_count"]),
+            active_reviewing_count=_int(row["active_reviewing_count"]),
+            completed_count=_int(row["completed_count"]),
+            failed_count=_int(row["failed_count"]),
+            last_claimed_at=_parse_dt(row["last_claimed_at"]),
+            last_review_completed_at=_parse_dt(row["last_review_completed_at"]),
+            last_failure_at=_parse_dt(row["last_failure_at"]),
+        )
+
+    def list_recent_failures(self, *, limit: int = 20) -> list[RecentFailure]:
+        if limit <= 0:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id AS item_id,
+                    repo_full_name,
+                    event_type,
+                    status,
+                    lifecycle_stage,
+                    failure_count,
+                    last_failure_at,
+                    last_error
+                FROM review_work_items
+                WHERE last_failure_at IS NOT NULL
+                  AND last_error IS NOT NULL
+                  AND last_error <> ''
+                ORDER BY last_failure_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [RecentFailure.model_validate(dict(row)) for row in rows]
+
+    def list_lifecycle_visibility_records(self) -> list[ReviewLifecycleVisibility]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id AS item_id,
+                    repo_full_name,
+                    event_type,
+                    status,
+                    lifecycle_stage,
+                    created_at AS queued_at,
+                    worker_claimed_at,
+                    review_started_at,
+                    openai_review_attempted_at,
+                    openai_review_completed_at,
+                    review_completed_at,
+                    github_writeback_started_at,
+                    github_writeback_completed_at,
+                    github_writeback_success,
+                    agent_bus_dispatch_started_at,
+                    agent_bus_dispatch_completed_at,
+                    agent_bus_dispatch_success,
+                    agent_bus_work_item_id,
+                    agent_bus_dispatch_error,
+                    runtime_validation_id,
+                    runtime_validation_status,
+                    runtime_validation_completed_at,
+                    failure_count,
+                    last_failure_at,
+                    last_error
+                FROM review_work_items
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [self._lifecycle_visibility_from_row(row) for row in rows]
 
     def prune_processed_review_items(self, max_items: int | None = None) -> int:
         limit = max_items or self.max_review_items
@@ -733,6 +895,7 @@ class SQLiteStateStore:
 
     def _review_work_item_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
         data = dict(row)
+        data["labels"] = _labels(data.get("labels"))
         raw_runtime_validation_context = data.get("runtime_validation_context")
         _log_review_work_item_persistence_json(
             "wf_chain_metadata_storage_before_deserialize_json",
@@ -769,9 +932,28 @@ class SQLiteStateStore:
 
     def _review_work_item_workflow_summary_from_row(self, row: sqlite3.Row) -> ReviewWorkItemWorkflowSummary:
         data = dict(row)
+        data["labels"] = _labels(data.get("labels"))
         if data.get("github_writeback_success") is not None:
             data["github_writeback_success"] = bool(data["github_writeback_success"])
         return ReviewWorkItemWorkflowSummary.model_validate(data)
+
+    def _review_work_item_snapshot_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
+        data = dict(row)
+        data["labels"] = _labels(data.get("labels"))
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        if data.get("agent_bus_dispatch_success") is not None:
+            data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
+        data["runtime_validation_context"] = {}
+        return ReviewWorkItem.model_validate(data)
+
+    def _lifecycle_visibility_from_row(self, row: sqlite3.Row) -> ReviewLifecycleVisibility:
+        data = dict(row)
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        if data.get("agent_bus_dispatch_success") is not None:
+            data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
+        return ReviewLifecycleVisibility.model_validate(data)
 
 
 def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> SQLiteStateStore | None:
@@ -832,6 +1014,40 @@ def _json(value: object | None) -> str:
     return json.dumps(value or {}, sort_keys=True, default=str)
 
 
+def _labels(value: object | None) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    try:
+        loaded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _int(value: object | None) -> int:
+    return int(value or 0)
+
+
+def _parse_dt(value: object | None) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _age_seconds(value: datetime | None, now: datetime) -> float | None:
+    if value is None:
+        return None
+    return round((now - value).total_seconds(), 3)
+
+
 def _load_json(value: object | None) -> dict[str, object]:
     if not value:
         return {}
@@ -889,6 +1105,10 @@ def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: dateti
 
 def _event_record_select_sql(alias: str) -> str:
     return ", ".join(f"{alias}.{column}" for column in _EVENT_RECORD_COLUMNS)
+
+
+def _review_work_item_snapshot_select_sql() -> str:
+    return ", ".join(_REVIEW_WORK_ITEM_SNAPSHOT_COLUMNS)
 
 
 def _event_workflow_not_review_duplicate_sql(alias: str) -> str:
@@ -1004,6 +1224,7 @@ def _first_dict(*values: Any) -> dict[str, Any]:
 
 _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("base_branch", "TEXT"),
+    ("labels", "TEXT NOT NULL DEFAULT '[]'"),
     ("updated_at", "TEXT"),
     ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'review_queued'"),
     ("worker_claimed_at", "TEXT"),
@@ -1109,4 +1330,40 @@ _EVENT_RECORD_COLUMNS = (
     "pr_merged",
     "received_at",
     "raw_action",
+)
+
+_REVIEW_WORK_ITEM_SNAPSHOT_COLUMNS = (
+    "id",
+    "created_at",
+    "updated_at",
+    "repo_full_name",
+    "event_type",
+    "branch",
+    "base_branch",
+    "commit_sha",
+    "issue_number",
+    "pr_number",
+    "labels",
+    "status",
+    "lifecycle_stage",
+    "worker_claimed_at",
+    "review_started_at",
+    "openai_review_attempted_at",
+    "openai_review_completed_at",
+    "review_completed_at",
+    "github_writeback_started_at",
+    "github_writeback_completed_at",
+    "github_writeback_success",
+    "agent_bus_dispatch_started_at",
+    "agent_bus_dispatch_completed_at",
+    "agent_bus_dispatch_success",
+    "agent_bus_work_item_id",
+    "agent_bus_dispatch_error",
+    "runtime_validation_id",
+    "runtime_validation_status",
+    "runtime_validation_digest",
+    "runtime_validation_completed_at",
+    "failure_count",
+    "last_failure_at",
+    "last_error",
 )

@@ -291,11 +291,48 @@ def _recent_events() -> list[EventRecord]:
     return event_store.recent_events()
 
 
-def _review_queue_stats(items: list[ReviewWorkItem]) -> ReviewQueueStats:
+def _review_queue_stats(items: list[ReviewWorkItem] | None = None) -> ReviewQueueStats:
     storage = _storage()
     if storage is not None:
+        if hasattr(storage, "review_queue_stats"):
+            return storage.review_queue_stats()
+        items = items if items is not None else storage.list_review_work_items()
         return build_queue_stats(items, counters=storage.review_queue_counters())
+    items = items if items is not None else review_queue.list_items()
     return build_queue_stats(items, counters=review_queue.counters())
+
+
+def _worker_stats(
+    items: list[ReviewWorkItem] | None = None,
+    *,
+    auto_processing_enabled: bool,
+) -> WorkerStats:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "worker_stats"):
+        return storage.worker_stats(auto_processing_enabled=auto_processing_enabled)
+    items = items if items is not None else _review_items()
+    return build_worker_stats(items, auto_processing_enabled=auto_processing_enabled)
+
+
+def _snapshot_review_items() -> list[ReviewWorkItem]:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "list_review_work_item_snapshot_records"):
+        return storage.list_review_work_item_snapshot_records()
+    return _review_items()
+
+
+def _lifecycle_visibility(items: list[ReviewWorkItem]) -> list[ReviewLifecycleVisibility]:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "list_lifecycle_visibility_records"):
+        return storage.list_lifecycle_visibility_records()
+    return build_lifecycle_visibility(items)
+
+
+def _recent_failures(items: list[ReviewWorkItem]) -> list[RecentFailure]:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "list_recent_failures"):
+        return storage.list_recent_failures()
+    return build_recent_failures(items)
 
 
 def _debug_health() -> DebugHealth:
@@ -362,16 +399,16 @@ async def orchestrator_snapshot(
     _: None = Depends(_require_debug_read_access),
     settings: Settings = Depends(get_settings),
 ) -> OrchestratorSnapshot:
-    items = _review_items()
+    items = _snapshot_review_items()
     return build_orchestrator_snapshot(
         settings=settings,
         health=_debug_health(),
         queue=_review_queue_stats(items),
-        worker_stats=build_worker_stats(items, auto_processing_enabled=settings.enable_auto_review_processing),
-        lifecycle=build_lifecycle_visibility(items),
+        worker_stats=_worker_stats(items, auto_processing_enabled=settings.enable_auto_review_processing),
+        lifecycle=_lifecycle_visibility(items),
         review_items=items,
         events=_recent_events(),
-        recent_failures=build_recent_failures(items),
+        recent_failures=_recent_failures(items),
     )
 
 
@@ -414,12 +451,12 @@ async def debug_review_queue(_: None = Depends(_require_debug_read_access)) -> l
 
 @app.get("/debug/review-queue/stats", response_model=ReviewQueueStats)
 async def debug_review_queue_stats(_: None = Depends(_require_debug_read_access)) -> ReviewQueueStats:
-    return _review_queue_stats(_review_items())
+    return _review_queue_stats()
 
 
 @app.get("/debug/workers/stats", response_model=WorkerStats)
 async def debug_worker_stats(_: None = Depends(_require_debug_read_access), settings: Settings = Depends(get_settings)) -> WorkerStats:
-    return build_worker_stats(_review_items(), auto_processing_enabled=settings.enable_auto_review_processing)
+    return _worker_stats(auto_processing_enabled=settings.enable_auto_review_processing)
 
 
 @app.get("/debug/review-lifecycle", response_model=list[ReviewLifecycleVisibility])

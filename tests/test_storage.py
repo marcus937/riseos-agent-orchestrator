@@ -202,6 +202,34 @@ def test_queue_item_persists_and_reloads(tmp_path) -> None:
     assert reloaded.status == "pending_review"
 
 
+def test_queue_item_labels_persist_into_workflow_summary_records(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    parsed = parse_github_event(
+        "issues",
+        {
+            "action": "labeled",
+            "repository": {"full_name": "riseos/example"},
+            "issue": {
+                "number": 7,
+                "labels": [{"name": "agent-ready"}, {"name": "frontend"}],
+            },
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    store = SQLiteStateStore(str(db_path))
+
+    store.save_review_work_item(item)
+    reloaded = store.get_review_work_item(item.id)
+    summaries = store.list_review_work_item_summary_records_for_workflow_collection(
+        limit=10,
+        workflow_filter="all",
+    )
+
+    assert reloaded is not None
+    assert reloaded.labels == ["agent-ready", "frontend"]
+    assert summaries[0].labels == ["agent-ready", "frontend"]
+
+
 def test_queue_item_runtime_validation_context_preserves_workflow_chain(tmp_path) -> None:
     db_path = tmp_path / "orchestrator.db"
     parsed = parse_github_event(
