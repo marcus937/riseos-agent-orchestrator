@@ -1,8 +1,10 @@
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
-from app.event_store import event_record_from_parsed
-from app.github_events import parse_github_event
+from app.correlation import correlation_id_from_key
+from app.event_store import EventRecord, EventWorkflowSummary, event_record_from_parsed
+from app.github_events import GitHubEventType, parse_github_event
 from app.review_queue import ReviewWorkItemStatus, review_work_item_from_parsed
 from app.storage import SQLiteStateStore, build_sqlite_store
 
@@ -49,6 +51,125 @@ def test_duplicate_event_record_is_ignored(tmp_path) -> None:
     assert store.event_count() == 1
 
 
+def test_event_record_correlation_id_backfills_existing_rows(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    correlation_key = "riseos/example:commit:abc123"
+    workflow_id = f"wf-{correlation_id_from_key(correlation_key)}"
+    SQLiteStateStore(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO event_records (
+                event_id,
+                github_event,
+                diagnostic_stage,
+                correlation_key,
+                repo_full_name,
+                branch,
+                commit_sha,
+                received_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-event",
+                "push",
+                "webhook_accepted",
+                correlation_key,
+                "riseos/example",
+                "agent-integration",
+                "abc123",
+                "2026-01-20T12:00:00+00:00",
+            ),
+        )
+
+    reloaded = SQLiteStateStore(str(db_path)).get_event_record_for_workflow_id(workflow_id)
+
+    assert reloaded is not None
+    assert reloaded.event_id == "legacy-event"
+    assert reloaded.correlation_id == correlation_id_from_key(correlation_key)
+
+
+def test_event_records_for_workflow_id_return_full_correlated_timeline(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    store = SQLiteStateStore(str(db_path))
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    workflow_id = "wf-orch-correlated-events"
+
+    store.save_event_record(
+        EventRecord(
+            event_id="event-1",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="orch-correlated-events",
+            repo_full_name="riseos/example",
+            branch="agent-integration",
+            commit_sha="abc123",
+            received_at=base,
+        )
+    )
+    store.save_event_record(
+        EventRecord(
+            event_id="event-2",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            correlation_id="orch-correlated-events",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=1),
+            raw_action="submitted",
+        )
+    )
+
+    records = store.list_event_records_for_workflow_id(workflow_id)
+    latest = store.get_event_record_for_workflow_id(workflow_id)
+
+    assert [record.event_id for record in records] == ["event-1", "event-2"]
+    assert latest is not None
+    assert latest.event_id == "event-2"
+
+
+def test_event_workflow_summary_records_preserve_first_and_latest_activity(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    store = SQLiteStateStore(str(db_path))
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    store.save_event_record(
+        EventRecord(
+            event_id="event-1",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="orch-correlated-summary",
+            repo_full_name="riseos/example",
+            branch="agent-integration",
+            commit_sha="abc123",
+            received_at=base,
+        )
+    )
+    store.save_event_record(
+        EventRecord(
+            event_id="event-2",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            correlation_id="orch-correlated-summary",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=3),
+            raw_action="submitted",
+        )
+    )
+
+    summaries = store.list_event_workflow_summary_records_for_collection(
+        limit=10,
+        workflow_filter="all",
+    )
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert isinstance(summary, EventWorkflowSummary)
+    assert summary.workflow_id == "wf-orch-correlated-summary"
+    assert summary.first_received_at == base
+    assert summary.received_at == base + timedelta(minutes=3)
+    assert summary.event_id == "event-2"
+    assert summary.pr_number == 17
+    assert summary.workflow_event_count == 2
+
+
 def test_issue_dispatch_claim_is_single_owner(tmp_path) -> None:
     db_path = tmp_path / "orchestrator.db"
     store = SQLiteStateStore(str(db_path))
@@ -80,6 +201,34 @@ def test_queue_item_persists_and_reloads(tmp_path) -> None:
     assert reloaded.id == item.id
     assert reloaded.pr_number == 7
     assert reloaded.status == "pending_review"
+
+
+def test_queue_item_labels_persist_into_workflow_summary_records(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    parsed = parse_github_event(
+        "issues",
+        {
+            "action": "labeled",
+            "repository": {"full_name": "riseos/example"},
+            "issue": {
+                "number": 7,
+                "labels": [{"name": "agent-ready"}, {"name": "frontend"}],
+            },
+        },
+    )
+    item = review_work_item_from_parsed(parsed)
+    store = SQLiteStateStore(str(db_path))
+
+    store.save_review_work_item(item)
+    reloaded = store.get_review_work_item(item.id)
+    summaries = store.list_review_work_item_summary_records_for_workflow_collection(
+        limit=10,
+        workflow_filter="all",
+    )
+
+    assert reloaded is not None
+    assert reloaded.labels == ["agent-ready", "frontend"]
+    assert summaries[0].labels == ["agent-ready", "frontend"]
 
 
 def test_queue_item_runtime_validation_context_preserves_workflow_chain(tmp_path) -> None:

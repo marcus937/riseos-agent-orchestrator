@@ -1,10 +1,18 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
+import app.orchestrator_snapshot as snapshot_module
+from app.agent_tasks import (
+    AgentTask,
+    AgentTaskLifecycleEvent,
+    AgentTaskStatus,
+    SQLiteAgentTaskStore,
+    agent_task_store,
+)
 from app.config import get_settings
-from app.event_store import event_store
+from app.event_store import EventRecord, event_store
 from app.github_events import GitHubEventType
 from app.main import app
 from app.orchestrator_snapshot import (
@@ -14,26 +22,87 @@ from app.orchestrator_snapshot import (
     ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION,
     ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT,
 )
-from app.review_queue import ReviewLifecycleStage, ReviewWorkItem, ReviewWorkItemStatus, review_queue
+from app.review_queue import (
+    ReviewLifecycleStage,
+    ReviewLifecycleVisibility,
+    ReviewWorkItem,
+    ReviewWorkItemStatus,
+    review_queue,
+)
 from app.security import build_signature
+from app.storage import SQLiteStateStore
 
 
 def client_with_secret(
     secret: str = "test-secret",
     admin_token: str = "admin-token",
     require_debug_read_token: bool = False,
+    db_path: str | None = None,
 ) -> TestClient:
     get_settings.cache_clear()
     event_store.reset()
     review_queue.reset()
+    agent_task_store.reset()
+    for state_key in ("storage", "agent_task_store", "workflow_v1_store"):
+        if hasattr(app.state, state_key):
+            delattr(app.state, state_key)
     app.dependency_overrides[get_settings] = lambda: get_settings().__class__(
         github_webhook_secret=secret,
+        orchestrator_db_path=db_path,
         orchestrator_admin_token=admin_token,
         require_admin_token_for_debug_reads=require_debug_read_token,
         hermes_m2_token="hermes-m2-secret",
         hermes_dgx_token="hermes-dgx-secret",
     )
     return TestClient(app)
+
+
+class SnapshotCompactSQLiteStateStore(SQLiteStateStore):
+    def list_review_work_items(self) -> list[ReviewWorkItem]:
+        raise AssertionError("Snapshot must not hydrate full review work items")
+
+    def _review_work_item_from_row(self, row):  # noqa: ANN001
+        raise AssertionError("Snapshot must not deserialize full review work item rows")
+
+
+class SnapshotBoundedSQLiteStateStore(SnapshotCompactSQLiteStateStore):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.snapshot_record_calls: list[dict[str, object]] = []
+        self.lifecycle_limits: list[int | None] = []
+        self.recent_event_limits: list[int | None] = []
+
+    def recent_events(self, limit: int = 50) -> list[EventRecord]:
+        self.recent_event_limits.append(limit)
+        assert limit == ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT
+        return super().recent_events(limit=limit)
+
+    def list_review_work_item_snapshot_records(
+        self,
+        *,
+        limit: int | None = None,
+        collection: str | None = None,
+    ) -> list[ReviewWorkItem]:
+        self.snapshot_record_calls.append({"limit": limit, "collection": collection})
+        assert limit == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+        return super().list_review_work_item_snapshot_records(
+            limit=limit,
+            collection=collection,
+        )
+
+    def list_lifecycle_visibility_records(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[ReviewLifecycleVisibility]:
+        self.lifecycle_limits.append(limit)
+        assert limit == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+        return super().list_lifecycle_visibility_records(limit=limit)
+
+
+class SnapshotCompactSQLiteAgentTaskStore(SQLiteAgentTaskStore):
+    def list_agent_tasks(self) -> list[AgentTask]:
+        raise AssertionError("Snapshot must not hydrate full agent task rows")
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -61,7 +130,8 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
 
     assert snapshot.status_code == 200
     data = snapshot.json()
-    assert data["schema_version"] == ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION
+    assert ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION == "orchestrator.snapshot.v3"
+    assert data["schema_version"] == "orchestrator.snapshot.v3"
     assert data["generated_at"]
     assert set(data) >= {"workforce", "workflows", "queue", "health", "runtime", "recent_failures"}
     assert data["workflows"] == {"active": 1, "blocked": 0, "reviewing": 0, "verified": 0}
@@ -88,29 +158,77 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
     assert data["queue"]["counters"]["pending_review_count"] == 1
     assert data["health"]["accepted_count"] == 1
     assert workforce["agents"][0]["item_id"]
+    assert workforce["agents"][0]["workflow_id"].startswith("wf-")
     assert workforce["agents"][0]["repo_full_name"] == "riseos/example"
+    assert workforce["agents"][0]["branch"] == "agent-integration"
+    assert workforce["agents"][0]["commit_sha"] == "abc123"
     assert workforce["agents"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
     assert workforce["agents"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
     assert workforce["agents"][0]["current_owner"] == "Circuit"
     assert workforce["agents"][0]["workflow_duration_seconds"] >= 0
-    assert workforce["agents"][0]["workflow_state_history"][0]["state"] == "CIRCUIT_IN_PROGRESS"
-    assert workforce["agents"][0]["workflow_state_history"][0]["canonical_state"] == "CIRCUIT_WORKING"
-    assert workforce["agents"][0]["workflow_events"][0]["source"] == "review_work_item"
+    assert workforce["agents"][0]["workflow_event_count"] == 1
+    assert workforce["agents"][0]["workflow_events_truncated"] is True
+    assert "workflow_state_history" not in workforce["agents"][0]
+    assert "workflow_events" not in workforce["agents"][0]
     assert workforce["events"][0]["repo_full_name"] == "riseos/example"
     assert workforce["events"][0]["commit_sha"] == "abc123"
     assert workforce["events"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
     assert workforce["events"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
-    assert workforce["events"][0]["workflow_state_history"][0]["source"] == "github_webhook"
+    assert workforce["events"][0]["workflow_event_count"] == 1
+    assert "workflow_state_history" not in workforce["events"][0]
+    assert "workflow_events" not in workforce["events"][0]
     assert workforce["issues"] == []
     assert workforce["prs"] == []
     assert data["runtime"]["auto_processing_enabled"] is False
     assert data["runtime"]["hermes_dispatch"]["m2_dispatch_enabled"] is False
 
 
+def test_orchestrator_snapshot_preserves_workflow_scalars_without_embedded_timeline_detail() -> None:
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    review_queue.add_if_absent(
+        ReviewWorkItem(
+            id="snapshot-detail-owner",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            branch="feature/snapshot-detail-owner",
+            base_branch="main",
+            commit_sha="abc123",
+            pr_number=17,
+            status=ReviewWorkItemStatus.REVIEWING,
+            lifecycle_stage=ReviewLifecycleStage.REVIEW_STARTED,
+            review_started_at=now,
+        )
+    )
+
+    snapshot = client.get("/api/v1/orchestrator/snapshot")
+
+    assert snapshot.status_code == 200
+    agent = snapshot.json()["workforce"]["agents"][0]
+    assert agent["workflow_id"] == "wf-snapshot-detail-owner"
+    assert agent["workflow_state"] == "HERMES_VALIDATION_RUNNING"
+    assert agent["canonical_workflow_state"] == "HERMES_VALIDATING"
+    assert agent["current_owner"] == "Hermes"
+    assert agent["workflow_event_count"] >= 2
+    assert agent["workflow_events_truncated"] is True
+    assert "workflow_events" not in agent
+    assert "workflow_state_history" not in agent
+
+    detail = client.get("/api/v1/workflows/wf-snapshot-detail-owner")
+    assert detail.status_code == 200
+    assert len(detail.json()["timeline"]) == agent["workflow_event_count"]
+
+
 def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     client = client_with_secret()
     huge_historical_payload = "large-runtime-context-" + ("x" * 100_000)
     huge_error = "review failed: " + ("e" * (ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT + 100))
+    secret_sentinel = "snapshot-secret-must-not-leak"
+    prompt_sentinel = "snapshot-prompt-must-not-leak"
+    raw_packet_sentinel = "snapshot-raw-review-packet-must-not-leak"
+    workflow_chain_sentinel = "snapshot-workflow-chain-object-must-not-repeat"
     labels = [f"label-{index}" for index in range(ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT + 5)]
     now = datetime.now(UTC)
 
@@ -128,7 +246,16 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
             labels=labels,
             status=ReviewWorkItemStatus.BLOCKED,
             lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
-            runtime_validation_context={"historical_payload": huge_historical_payload},
+            runtime_validation_context={
+                "historical_payload": huge_historical_payload,
+                "secret": secret_sentinel,
+                "review_dispatch": {
+                    "prompt": prompt_sentinel,
+                    "review_packet": {"raw": raw_packet_sentinel},
+                    "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+                },
+                "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+            },
             failure_count=1,
             last_failure_at=now,
             last_error=huge_error,
@@ -162,25 +289,414 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     assert pr["labels_truncated"] is True
     assert pr["last_error_truncated"] is True
     assert len(pr["last_error"]) == ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT
-    pr_initial_event = next(
-        event for event in pr["workflow_events"] if event["source"] == "review_work_item"
-    )
-    assert len(pr_initial_event["metadata"]["labels"]) == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
-    assert pr_initial_event["metadata"]["label_count"] == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT + 5
-    assert pr_initial_event["metadata"]["labels_truncated"] is True
-    agent_initial_event = next(
-        event
-        for event in workforce["agents"][0]["workflow_state_history"]
-        if event["source"] == "review_work_item"
-    )
-    assert len(agent_initial_event["metadata"]["labels"]) == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
-    assert agent_initial_event["metadata"]["label_count"] == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT + 5
-    assert agent_initial_event["metadata"]["labels_truncated"] is True
+    assert "workflow_events" not in pr
+    assert "workflow_state_history" not in pr
+    assert pr["workflow_event_count"] >= 1
+    assert pr["workflow_events_truncated"] is True
     assert workforce["agents"][0]["last_error_truncated"] is True
+    assert "workflow_events" not in workforce["agents"][0]
+    assert "workflow_state_history" not in workforce["agents"][0]
     assert data["recent_failures"][0]["last_error_truncated"] is True
     assert f"label-{ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT}" not in response.text
     assert "historical_payload" not in response.text
     assert huge_historical_payload not in response.text
+    assert secret_sentinel not in response.text
+    assert prompt_sentinel not in response.text
+    assert raw_packet_sentinel not in response.text
+    assert workflow_chain_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_v3_is_materially_smaller_than_v2_shape() -> None:
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    workflow_chain_sentinel = "legacy-v2-workflow-chain-repeat"
+    raw_packet_sentinel = "legacy-v2-review-packet-repeat"
+    diagnostic_sentinel = "legacy-v2-diagnostic-text-" + ("x" * 512)
+
+    for index in range(ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT):
+        review_queue.add_if_absent(
+            ReviewWorkItem(
+                id=f"production-shaped-{index}",
+                created_at=now - timedelta(minutes=index + 4),
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.PULL_REQUEST,
+                branch=f"feature/production-shaped-{index}",
+                base_branch="main",
+                commit_sha=f"sha-{index}",
+                pr_number=index + 1,
+                status=ReviewWorkItemStatus.BLOCKED,
+                lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
+                worker_claimed_at=now - timedelta(minutes=index + 3),
+                review_started_at=now - timedelta(minutes=index + 2),
+                openai_review_attempted_at=now - timedelta(minutes=index + 1),
+                openai_review_completed_at=now - timedelta(seconds=index + 30),
+                failure_count=1,
+                last_failure_at=now - timedelta(seconds=index),
+                last_error=diagnostic_sentinel,
+                runtime_validation_context={
+                    "review_dispatch": {
+                        "prompt": "legacy prompt",
+                        "review_packet": {"raw": raw_packet_sentinel},
+                    },
+                    "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+                },
+            )
+        )
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    v3_payload = response.json()
+    v2_payload = _legacy_v2_snapshot_shape(v3_payload, diagnostic_sentinel, workflow_chain_sentinel)
+    v3_size = len(json.dumps(v3_payload, sort_keys=True))
+    v2_size = len(json.dumps(v2_payload, sort_keys=True))
+
+    assert v3_payload["schema_version"] == "orchestrator.snapshot.v3"
+    assert v3_payload["workforce"]["meta"]["agents"]["returned"] == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert v3_payload["workforce"]["agents"][0]["workflow_id"]
+    assert v3_payload["workforce"]["agents"][0]["canonical_workflow_state"]
+    assert v3_payload["workforce"]["agents"][0]["current_owner"]
+    assert v3_payload["workforce"]["agents"][0]["workflow_event_count"] >= 1
+    assert v3_payload["workforce"]["agents"][0]["workflow_events_truncated"] is True
+    for collection_name in ("agents", "issues", "prs", "events"):
+        assert all("workflow_events" not in record for record in v3_payload["workforce"][collection_name])
+        assert all("workflow_state_history" not in record for record in v3_payload["workforce"][collection_name])
+    assert raw_packet_sentinel not in response.text
+    assert workflow_chain_sentinel not in response.text
+    assert v3_size < int(v2_size * 0.6)
+
+
+def test_orchestrator_snapshot_memory_event_meta_uses_total_before_payload_limit() -> None:
+    client = client_with_secret()
+    total_events = ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT + 3
+
+    for index in range(total_events):
+        payload = {
+            "repository": {"full_name": "riseos/example"},
+            "sender": {"login": "agent"},
+            "ref": f"refs/heads/agent-integration-{index}",
+            "after": f"abc{index}",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        response = client.post(
+            "/webhooks/github",
+            content=body,
+            headers=signed_headers("test-secret", "push", body),
+        )
+        assert response.status_code == 200
+
+    snapshot = client.get("/api/v1/orchestrator/snapshot")
+
+    assert snapshot.status_code == 200
+    workforce = snapshot.json()["workforce"]
+    assert len(workforce["events"]) == ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT
+    assert workforce["meta"]["events"] == {
+        "returned": ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT,
+        "total": total_events,
+        "limit": ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT,
+        "truncated": True,
+    }
+
+
+def test_orchestrator_snapshot_uses_sqlite_compact_records_without_detail_hydration(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    huge_runtime_context = "snapshot-runtime-context-" + ("x" * 100_000)
+    now = datetime.now(UTC)
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="sqlite-compact-snapshot",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            branch="feature/sqlite-compact-snapshot",
+            base_branch="main",
+            commit_sha="abc123",
+            pr_number=17,
+            status=ReviewWorkItemStatus.REVIEWING,
+            lifecycle_stage=ReviewLifecycleStage.REVIEW_STARTED,
+            review_started_at=now,
+            runtime_validation_context={"large_payload": huge_runtime_context},
+        )
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["queue"]["counters"]["review_queue_count"] == 1
+    assert body["queue"]["counters"]["reviewing_count"] == 1
+    assert body["workflows"]["reviewing"] == 1
+    assert body["workforce"]["meta"]["agents"]["total"] == 1
+    assert body["workforce"]["meta"]["prs"]["total"] == 1
+    assert body["workforce"]["agents"][0]["workflow_id"] == "wf-sqlite-compact-snapshot"
+    assert body["workforce"]["agents"][0]["canonical_workflow_state"] == "HERMES_VALIDATING"
+    assert "runtime_validation_context" not in response.text
+    assert huge_runtime_context not in response.text
+
+
+def test_orchestrator_snapshot_uses_bounded_sqlite_collection_queries(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotBoundedSQLiteStateStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    pr_total = ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT + 4
+    issue_total = ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT + 2
+
+    for index in range(pr_total):
+        storage.save_review_work_item(
+            ReviewWorkItem(
+                id=f"bounded-pr-{index}",
+                created_at=now,
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.PULL_REQUEST,
+                pr_number=index + 1,
+                status=ReviewWorkItemStatus.BLOCKED,
+                lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
+                last_failure_at=now,
+                last_error="blocked",
+            )
+        )
+    for index in range(issue_total):
+        storage.save_review_work_item(
+            ReviewWorkItem(
+                id=f"bounded-issue-{index}",
+                created_at=now,
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.ISSUES,
+                issue_number=index + 1,
+            )
+        )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.json()
+    total = pr_total + issue_total
+    assert storage.snapshot_record_calls == [
+        {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": None},
+        {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": "issues"},
+        {"limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, "collection": "prs"},
+    ]
+    assert storage.lifecycle_limits == [ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT]
+    assert storage.recent_event_limits == [ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT]
+    assert body["workforce"]["meta"]["agents"] == {
+        "returned": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+        "total": total,
+        "limit": ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+        "truncated": True,
+    }
+    assert body["workforce"]["meta"]["issues"]["total"] == issue_total
+    assert body["workforce"]["meta"]["prs"]["total"] == pr_total
+    assert len(body["workforce"]["issues"]) == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert len(body["workforce"]["prs"]) == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert body["queue"]["counters"]["review_queue_count"] == total
+    assert body["workflows"]["blocked"] == pr_total
+
+
+def test_orchestrator_snapshot_counts_sqlite_agent_task_workflows_without_detail_hydration(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    task_store = SnapshotCompactSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    detail_sentinel = "agent-task-detail-sentinel-" + ("x" * 10_000)
+
+    task_store.save_agent_task(
+        _agent_task("queued-agent", AgentTaskStatus.QUEUED, now, detail_sentinel)
+    )
+    task_store.save_agent_task(
+        _agent_task("ready-agent", AgentTaskStatus.READY_FOR_REVIEW, now, detail_sentinel)
+    )
+    task_store.save_agent_task(
+        _agent_task("failed-agent", AgentTaskStatus.FAILED, now, detail_sentinel)
+    )
+    task_store.save_agent_task(
+        _agent_task("completed-agent", AgentTaskStatus.COMPLETED, now, detail_sentinel)
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["workflows"] == {
+        "active": 3,
+        "blocked": 1,
+        "reviewing": 1,
+        "verified": 0,
+    }
+    assert detail_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_sqlite_workflow_counts_deduplicate_event_backed_review_items(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="duplicate-review-pr",
+            created_at=base,
+            updated_at=base,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            pr_number=17,
+            status=ReviewWorkItemStatus.BLOCKED,
+            lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
+            last_failure_at=base,
+            last_error="blocked",
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="duplicate-closed-pr-event",
+            github_event=GitHubEventType.PULL_REQUEST,
+            correlation_id="duplicate-closed-pr",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            pr_merged=False,
+            received_at=base + timedelta(minutes=1),
+            raw_action="closed",
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="unique-review-event",
+            github_event=GitHubEventType.PULL_REQUEST_REVIEW,
+            repo_full_name="riseos/example",
+            pr_number=18,
+            received_at=base + timedelta(minutes=2),
+            raw_action="submitted",
+        )
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["workflows"] == {
+        "active": 2,
+        "blocked": 1,
+        "reviewing": 1,
+        "verified": 0,
+    }
+
+
+def test_orchestrator_snapshot_storage_path_does_not_count_global_agent_tasks(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    detail_sentinel = "global-agent-task-detail-" + ("x" * 10_000)
+
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="persisted-snapshot-review",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            pr_number=17,
+        )
+    )
+    agent_task_store.save_agent_task(
+        _agent_task("global-memory-agent", AgentTaskStatus.QUEUED, now, detail_sentinel)
+    )
+    app.state.storage = storage
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["workflows"] == {
+        "active": 1,
+        "blocked": 0,
+        "reviewing": 0,
+        "verified": 0,
+    }
+    assert detail_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_storage_path_ignores_in_memory_agent_task_store(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    persisted_task_store = SQLiteAgentTaskStore(db_path)
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    detail_sentinel = "state-agent-task-detail-" + ("x" * 10_000)
+    persisted_detail_sentinel = "persisted-agent-task-detail-" + ("x" * 10_000)
+
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="persisted-snapshot-review",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            pr_number=17,
+        )
+    )
+    persisted_task_store.save_agent_task(
+        _agent_task("persisted-agent", AgentTaskStatus.QUEUED, now, persisted_detail_sentinel)
+    )
+    agent_task_store.save_agent_task(
+        _agent_task("in-memory-agent", AgentTaskStatus.QUEUED, now, detail_sentinel)
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = agent_task_store
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["workflows"] == {
+        "active": 2,
+        "blocked": 0,
+        "reviewing": 0,
+        "verified": 0,
+    }
+    assert detail_sentinel not in response.text
+    assert persisted_detail_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_limits_before_work_item_projection(monkeypatch) -> None:
+    client = client_with_secret()
+    now = datetime.now(UTC)
+
+    for index in range(ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT + 5):
+        review_queue.add_if_absent(
+            ReviewWorkItem(
+                id=f"projection-item-{index}",
+                created_at=now,
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.PULL_REQUEST,
+                pr_number=index + 1,
+            )
+        )
+
+    projected_ids: list[str] = []
+    original_snapshot = snapshot_module._workflow_work_item_snapshot
+
+    def record_projection(item: ReviewWorkItem):
+        projected_ids.append(item.id)
+        return original_snapshot(item)
+
+    monkeypatch.setattr(snapshot_module, "_workflow_work_item_snapshot", record_projection)
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert len(projected_ids) == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert response.json()["workforce"]["meta"]["prs"]["truncated"] is True
 
 
 def test_orchestrator_snapshot_uses_debug_read_access_policy() -> None:
@@ -193,7 +709,7 @@ def test_orchestrator_snapshot_uses_debug_read_access_policy() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION
+    assert response.json()["schema_version"] == "orchestrator.snapshot.v3"
 
 
 def test_orchestrator_snapshot_runtime_status_does_not_expose_secret_values() -> None:
@@ -213,3 +729,78 @@ def test_orchestrator_snapshot_runtime_status_does_not_expose_secret_values() ->
         "dgx_dispatch_enabled",
         "dgx_configured",
     }
+
+
+def _legacy_v2_snapshot_shape(
+    v3_payload: dict[str, object],
+    diagnostic_sentinel: str,
+    workflow_chain_sentinel: str,
+) -> dict[str, object]:
+    v2_payload = json.loads(json.dumps(v3_payload))
+    v2_payload["schema_version"] = "orchestrator.snapshot.v2"
+    workforce = v2_payload["workforce"]
+    for collection_name in ("agents", "issues", "prs", "events"):
+        for record in workforce[collection_name]:
+            events = _legacy_v2_workflow_events(record, diagnostic_sentinel, workflow_chain_sentinel)
+            record["workflow_events"] = events
+            record["workflow_state_history"] = events
+    return v2_payload
+
+
+def _legacy_v2_workflow_events(
+    record: dict[str, object],
+    diagnostic_sentinel: str,
+    workflow_chain_sentinel: str,
+) -> list[dict[str, object]]:
+    event_count = max(int(record.get("workflow_event_count") or 1), 8)
+    return [
+        {
+            "event_type": "workflow.lifecycle.changed",
+            "state": record.get("workflow_state"),
+            "canonical_state": record.get("canonical_workflow_state"),
+            "previous_state": record.get("workflow_state"),
+            "new_state": record.get("canonical_workflow_state"),
+            "actor": record.get("current_owner"),
+            "timestamp": record.get("queued_at") or record.get("created_at") or record.get("received_at"),
+            "metadata": {
+                "diagnostic_text": diagnostic_sentinel,
+                "workflow_chain": {
+                    "workflow_chain_id": workflow_chain_sentinel,
+                    "workflow_step": f"step-{index}",
+                },
+            },
+        }
+        for index in range(event_count)
+    ]
+
+
+def _agent_task(
+    task_id: str,
+    status: AgentTaskStatus,
+    activity_at: datetime,
+    detail_sentinel: str,
+) -> AgentTask:
+    return AgentTask(
+        task_id=task_id,
+        repo_full_name="riseos/example",
+        title=f"Task {task_id}",
+        objective=f"Run task {task_id}.",
+        body=detail_sentinel,
+        instructions=[detail_sentinel],
+        execution_evidence={"large_payload": detail_sentinel},
+        target_agent="codex-m2",
+        status=status,
+        created_at=activity_at,
+        updated_at=activity_at,
+        queued_at=activity_at if status == AgentTaskStatus.QUEUED else None,
+        completed_at=activity_at if status == AgentTaskStatus.COMPLETED else None,
+        failed_at=activity_at if status == AgentTaskStatus.FAILED else None,
+        lifecycle_events=[
+            AgentTaskLifecycleEvent(event="created", occurred_at=activity_at),
+            AgentTaskLifecycleEvent(
+                event=status.value,
+                occurred_at=activity_at,
+                metadata={"large_payload": detail_sentinel},
+            ),
+        ],
+    )

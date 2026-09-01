@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+import pytest
+
 from app.config import Settings
 from app.github_events import parse_github_event
 from app.hermes_dispatch import HermesEvidenceArtifact, HermesEvidenceSnapshot
@@ -21,6 +23,15 @@ REPO = "marcus937/jarvis-mission-control"
 BRANCH = "codex-m2/wf20"
 SHA = "abcdef1234567890"
 PREVIEW_URL = "https://jmc-preview.vercel.app"
+PUBLIC_DNS_RESULT = [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture(autouse=True)
+def resolve_fake_preview_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.circuit_runtime_validation.socket.getaddrinfo",
+        lambda *_args, **_kwargs: PUBLIC_DNS_RESULT,
+    )
 
 
 class FakeAgentBusClient:

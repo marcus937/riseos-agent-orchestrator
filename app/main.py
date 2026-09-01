@@ -1,5 +1,6 @@
 import hmac
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
@@ -37,6 +38,7 @@ runtime_validation_store = AgentBusRuntimeValidationStore()
 from app.circuit_runtime_validation_routes import (
     register_circuit_runtime_validation_routes,
 )
+from app.agent_tasks import AgentTaskStore, build_agent_task_store
 from app.agent_task_review_gate import finalize_review_gated_agent_task
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
@@ -63,14 +65,22 @@ from app.operational_logging import (
     log_hermes_dispatch_result,
     log_openai_review_attempted,
     log_openai_review_result,
+    log_polling_endpoint_response,
     log_queue_item_created,
     log_review_completed,
     log_review_processing_started,
     log_slack_issue_dispatch_result,
     log_webhook_accepted,
     log_webhook_duplicate_suppressed,
+    serialized_json_bytes,
 )
-from app.orchestrator_snapshot import OrchestratorSnapshot, build_orchestrator_snapshot
+from app.orchestrator_snapshot import (
+    ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+    ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT,
+    OrchestratorSnapshot,
+    OrchestratorSnapshotWorkforceTotals,
+    build_orchestrator_snapshot,
+)
 from app.repository_discovery import (
     RepositoryDiscoveryResult,
     RepositoryRegistryStore,
@@ -114,6 +124,7 @@ from app.storage import SQLiteStateStore, build_sqlite_store
 from app.task_dispatch import dispatch_next_agent_task, dispatch_workflow_chain_continuation, resume_workflow_continuations
 from app.workflow_continuation import SQLiteWorkflowContinuationStore, build_workflow_continuation_store
 from app.workflow_routes import register_workflow_routes
+from app.workflows import WorkflowSummaryCounts, build_workflow_summaries, build_workflow_summary_counts
 
 
 class AgentTaskSubmission(BaseModel):
@@ -284,18 +295,161 @@ def _review_items() -> list[ReviewWorkItem]:
     return review_queue.list_items()
 
 
-def _recent_events() -> list[EventRecord]:
+def _recent_events(*, limit: int | None = None) -> list[EventRecord]:
     storage = _storage()
     if storage is not None:
-        return storage.recent_events()
-    return event_store.recent_events()
+        return storage.recent_events(limit=limit) if limit is not None else storage.recent_events()
+    events = event_store.recent_events()
+    return events[:limit] if limit is not None else events
 
 
-def _review_queue_stats(items: list[ReviewWorkItem]) -> ReviewQueueStats:
+def _review_queue_stats(items: list[ReviewWorkItem] | None = None) -> ReviewQueueStats:
     storage = _storage()
     if storage is not None:
+        if hasattr(storage, "review_queue_stats"):
+            return storage.review_queue_stats()
+        items = items if items is not None else storage.list_review_work_items()
         return build_queue_stats(items, counters=storage.review_queue_counters())
+    items = items if items is not None else review_queue.list_items()
     return build_queue_stats(items, counters=review_queue.counters())
+
+
+def _worker_stats(
+    items: list[ReviewWorkItem] | None = None,
+    *,
+    auto_processing_enabled: bool,
+) -> WorkerStats:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "worker_stats"):
+        return storage.worker_stats(auto_processing_enabled=auto_processing_enabled)
+    items = items if items is not None else _review_items()
+    return build_worker_stats(items, auto_processing_enabled=auto_processing_enabled)
+
+
+def _snapshot_review_items(
+    *,
+    limit: int | None = None,
+    collection: str | None = None,
+) -> list[ReviewWorkItem]:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "list_review_work_item_snapshot_records"):
+        return storage.list_review_work_item_snapshot_records(
+            limit=limit,
+            collection=collection,
+        )
+    items = _review_items()
+    if collection == "issues":
+        items = [item for item in items if item.issue_number is not None and item.pr_number is None]
+    elif collection == "prs":
+        items = [item for item in items if item.pr_number is not None]
+    elif collection is not None:
+        raise ValueError(f"Unknown snapshot review item collection: {collection}")
+    return items[:limit] if limit is not None else items
+
+
+def _lifecycle_visibility(
+    items: list[ReviewWorkItem],
+    *,
+    limit: int | None = None,
+) -> list[ReviewLifecycleVisibility]:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "list_lifecycle_visibility_records"):
+        return storage.list_lifecycle_visibility_records(limit=limit)
+    lifecycle = build_lifecycle_visibility(items)
+    return lifecycle[:limit] if limit is not None else lifecycle
+
+
+def _snapshot_workforce_totals() -> OrchestratorSnapshotWorkforceTotals | None:
+    storage = _storage()
+    if storage is None:
+        items = review_queue.list_items()
+        return OrchestratorSnapshotWorkforceTotals(
+            agents=len(items),
+            issues=sum(1 for item in items if item.issue_number is not None and item.pr_number is None),
+            prs=sum(1 for item in items if item.pr_number is not None),
+            events=len(event_store.recent_events()),
+        )
+    if not hasattr(storage, "count_review_work_item_snapshot_records"):
+        return None
+    event_total = storage.event_count() if hasattr(storage, "event_count") else None
+    return OrchestratorSnapshotWorkforceTotals(
+        agents=storage.count_review_work_item_snapshot_records(),
+        issues=storage.count_review_work_item_snapshot_records(collection="issues"),
+        prs=storage.count_review_work_item_snapshot_records(collection="prs"),
+        events=event_total,
+    )
+
+
+def _snapshot_workflow_counts(settings: Settings) -> WorkflowSummaryCounts:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "workflow_summary_counts_for_snapshot"):
+        return _merge_workflow_summary_counts(
+            storage.workflow_summary_counts_for_snapshot(),
+            _snapshot_agent_task_workflow_counts(settings),
+        )
+    review_event_counts = build_workflow_summary_counts(
+        build_workflow_summaries(_review_items(), _recent_events())
+    )
+    return _merge_workflow_summary_counts(
+        review_event_counts,
+        _snapshot_agent_task_workflow_counts(settings),
+    )
+
+
+def _snapshot_agent_task_workflow_counts(settings: Settings) -> WorkflowSummaryCounts | None:
+    store = _snapshot_agent_task_store(settings)
+    if store is None:
+        return None
+    if hasattr(store, "workflow_summary_counts_for_snapshot"):
+        return store.workflow_summary_counts_for_snapshot()
+    if hasattr(store, "list_agent_tasks"):
+        return build_workflow_summary_counts(build_workflow_summaries([], [], store.list_agent_tasks()))
+    return None
+
+
+def _snapshot_agent_task_store(settings: Settings) -> AgentTaskStore | None:
+    storage = _storage()
+    storage_db_path = getattr(storage, "db_path", None) if storage is not None else None
+    agent_task_db_path = settings.orchestrator_db_path or (
+        str(storage_db_path) if storage_db_path is not None else None
+    )
+    store = getattr(app.state, "agent_task_store", None)
+    if store is not None:
+        store_db_path = getattr(store, "db_path", None)
+        if store_db_path is None:
+            if storage is None:
+                return store
+        elif str(store_db_path) == agent_task_db_path:
+            return store
+        elif storage is None:
+            return None
+    if storage is not None and not agent_task_db_path:
+        return None
+    store = build_agent_task_store(agent_task_db_path)
+    if storage is not None and getattr(store, "db_path", None) is None:
+        return None
+    return store
+
+
+def _merge_workflow_summary_counts(
+    first: WorkflowSummaryCounts | None,
+    second: WorkflowSummaryCounts | None,
+) -> WorkflowSummaryCounts:
+    first = first or WorkflowSummaryCounts()
+    second = second or WorkflowSummaryCounts()
+    return WorkflowSummaryCounts(
+        active=first.active + second.active,
+        blocked=first.blocked + second.blocked,
+        reviewing=first.reviewing + second.reviewing,
+        verified=first.verified + second.verified,
+    )
+
+
+def _recent_failures(items: list[ReviewWorkItem]) -> list[RecentFailure]:
+    storage = _storage()
+    if storage is not None and hasattr(storage, "list_recent_failures"):
+        return storage.list_recent_failures()
+    return build_recent_failures(items)
 
 
 def _debug_health() -> DebugHealth:
@@ -362,17 +516,53 @@ async def orchestrator_snapshot(
     _: None = Depends(_require_debug_read_access),
     settings: Settings = Depends(get_settings),
 ) -> OrchestratorSnapshot:
-    items = _review_items()
-    return build_orchestrator_snapshot(
+    started_at = perf_counter()
+    storage = _storage()
+    snapshot_limit = ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT if storage is not None else None
+    items = _snapshot_review_items(limit=snapshot_limit)
+    snapshot = build_orchestrator_snapshot(
         settings=settings,
         health=_debug_health(),
         queue=_review_queue_stats(items),
-        worker_stats=build_worker_stats(items, auto_processing_enabled=settings.enable_auto_review_processing),
-        lifecycle=build_lifecycle_visibility(items),
+        worker_stats=_worker_stats(items, auto_processing_enabled=settings.enable_auto_review_processing),
+        lifecycle=_lifecycle_visibility(items, limit=snapshot_limit),
         review_items=items,
-        events=_recent_events(),
-        recent_failures=build_recent_failures(items),
+        issue_items=(
+            _snapshot_review_items(limit=ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, collection="issues")
+            if storage is not None
+            else None
+        ),
+        pr_items=(
+            _snapshot_review_items(limit=ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT, collection="prs")
+            if storage is not None
+            else None
+        ),
+        workforce_totals=_snapshot_workforce_totals(),
+        workflow_counts=_snapshot_workflow_counts(settings),
+        events=_recent_events(limit=ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
+        recent_failures=_recent_failures(items),
     )
+    snapshot_meta = snapshot.workforce.meta
+    returned_count = (
+        snapshot_meta.agents.returned
+        + snapshot_meta.issues.returned
+        + snapshot_meta.prs.returned
+        + snapshot_meta.events.returned
+    )
+    total_count = (
+        snapshot_meta.agents.total
+        + snapshot_meta.issues.total
+        + snapshot_meta.prs.total
+        + snapshot_meta.events.total
+    )
+    log_polling_endpoint_response(
+        endpoint="/api/v1/orchestrator/snapshot",
+        duration_seconds=perf_counter() - started_at,
+        returned_count=returned_count,
+        total_count=total_count,
+        serialized_bytes=serialized_json_bytes(snapshot),
+    )
+    return snapshot
 
 
 @app.get("/debug/repositories")
@@ -414,12 +604,12 @@ async def debug_review_queue(_: None = Depends(_require_debug_read_access)) -> l
 
 @app.get("/debug/review-queue/stats", response_model=ReviewQueueStats)
 async def debug_review_queue_stats(_: None = Depends(_require_debug_read_access)) -> ReviewQueueStats:
-    return _review_queue_stats(_review_items())
+    return _review_queue_stats()
 
 
 @app.get("/debug/workers/stats", response_model=WorkerStats)
 async def debug_worker_stats(_: None = Depends(_require_debug_read_access), settings: Settings = Depends(get_settings)) -> WorkerStats:
-    return build_worker_stats(_review_items(), auto_processing_enabled=settings.enable_auto_review_processing)
+    return _worker_stats(auto_processing_enabled=settings.enable_auto_review_processing)
 
 
 @app.get("/debug/review-lifecycle", response_model=list[ReviewLifecycleVisibility])

@@ -1,7 +1,4 @@
-# Orchestrator Snapshot Contract v2
-
-This is the previous snapshot contract. The current compact polling contract is
-`orchestrator.snapshot.v3`; see `docs/orchestrator_snapshot_contract_v3.md`.
+# Orchestrator Snapshot Contract v3
 
 ## Endpoint
 
@@ -13,13 +10,13 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 
 ## Schema Version
 
-`orchestrator.snapshot.v2`
+`orchestrator.snapshot.v3`
 
 ## Canonical Payload
 
 ```json
 {
-  "schema_version": "orchestrator.snapshot.v2",
+  "schema_version": "orchestrator.snapshot.v3",
   "generated_at": "2026-06-07T19:45:00.000000Z",
   "workforce": {
     "overview": {
@@ -78,7 +75,7 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 
 | Field | Type | Definition |
 | --- | --- | --- |
-| `schema_version` | string | Stable contract identifier for this previous contract version. Value: `orchestrator.snapshot.v2`. |
+| `schema_version` | string | Stable contract identifier. Current value is `orchestrator.snapshot.v3`. |
 | `generated_at` | datetime | UTC timestamp when the snapshot was assembled. |
 | `workforce` | object | JMC Workforce section payload. Contains `overview`, `agents`, `issues`, `prs`, and `events`. |
 | `workflows` | object | Canonical workflow summary counts. Detailed workflow records are owned by the workflow endpoints. |
@@ -122,12 +119,21 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 
 - `workforce.agents`, `workforce.issues`, and `workforce.prs` return at most 50 records each.
 - `workforce.events` returns at most 25 records.
-- Embedded `workflow_events` and `workflow_state_history` return at most the 8 most recent lifecycle events per record while preserving `workflow_event_count` and `workflow_events_truncated`.
+- SQLite-backed snapshots use limited compact collection queries and separate aggregate totals for collection metadata.
+- SQLite-backed snapshots merge AgentTask workflow counts only from a matching
+  SQLite AgentTask store; in-memory AgentTask state is ignored when persisted
+  storage is active.
+- Snapshot workflow summary counts use aggregate count queries and the same
+  event-backed workflow de-duplication identity as `/api/v1/workflows`, so raw
+  correlated event rows do not inflate dashboard counts.
+- Workforce records preserve compact workflow summary fields, including `workflow_id`, repository, issue/PR number, branch/base/commit refs, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
+- Workforce records intentionally do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
+- Top-level `workflows` counts include review work items, AgentTask workflows, and de-duplicated event-backed workflows using summary/count records only.
 - `labels` returns at most 20 labels per work item while preserving `label_count` and `labels_truncated`.
-- Embedded workflow event metadata uses the same 20-label cap for `metadata.labels` and includes `metadata.label_count` plus `metadata.labels_truncated` when labels are present.
 - `recent_failures` returns at most 20 records.
 - Error strings in workforce records and `recent_failures` are capped at 2048 characters and expose a matching `*_truncated` boolean.
 - Full `runtime_validation_context` payloads are not included in the snapshot. Runtime status remains available through bounded fields such as `runtime_validation_id`, `runtime_validation_status`, `runtime_validation_digest`, and `runtime_validation_completed_at`.
+- Prompt text, raw review packets, raw execution evidence, repeated `workflow_chain` objects, and unbounded diagnostic bodies are detail/evidence data and are not part of snapshot workforce summaries.
 
 Collection metadata uses this shape:
 
@@ -152,7 +158,7 @@ The snapshot intentionally reuses existing Orchestrator telemetry sources and ca
 - `ReviewLifecycleVisibility` contributes compact fields to `workforce.agents`.
 - Hermes dispatch configuration is normalized into `runtime.hermes_dispatch` as `HermesDispatchStatus`.
 
-Canonical ownership remains in the workflow lifecycle layer. Snapshot records expose `workflow_state`, `canonical_workflow_state`, `current_owner`, and bounded lifecycle events derived from those canonical builders. Detailed workflow cards, detail views, and full timelines should use `/api/v1/workflows`, `/api/v1/workflows/{workflow_id}`, and `/api/v1/workflows/{workflow_id}/timeline`.
+Canonical ownership remains in the workflow lifecycle layer. Snapshot records expose compact workflow summary fields derived from those canonical builders. Workflow lists should use `/api/v1/workflows`; detail views and full timelines should use `/api/v1/workflows/{workflow_id}` and `/api/v1/workflows/{workflow_id}/timeline`.
 
 ## Access And Security
 
@@ -184,20 +190,23 @@ Jarvis Brain may enrich JMC with product or reasoning context, but Brain is not 
 
 ## Future Extension Strategy
 
-- This compact bounded contract is published as `orchestrator.snapshot.v2` because it changes existing list semantics and omits full `runtime_validation_context` payloads from workforce records.
+- This compact summary-only contract is published as `orchestrator.snapshot.v3` because it removes v2's bounded embedded `workflow_events` and `workflow_state_history` from workforce records.
 - Keep `schema_version` stable for additive fields that do not change existing field meaning.
 - Add new optional fields rather than changing existing field types.
 - Use nested objects for new domains, for example `runtime.hermes_dispatch` or a future `runtime.openai_review`.
-- `orchestrator.snapshot.v3` supersedes this contract because it removes v2's bounded embedded workflow event arrays from workforce records.
+- Introduce `orchestrator.snapshot.v4` only for breaking changes after v3.
 - Prefer reusing existing internal models and builders before adding new snapshot-only business logic.
 - Keep frontend compatibility by treating unknown fields as safe to ignore.
 
 ## Verification Notes
 
-The v2 contract was covered by endpoint tests that verified:
+The contract is covered by endpoint tests that verify:
 
-- `GET /api/v1/orchestrator/snapshot` returned `schema_version: orchestrator.snapshot.v2`.
+- `GET /api/v1/orchestrator/snapshot` returns `schema_version: orchestrator.snapshot.v3`.
 - Existing webhook, event, queue, lifecycle, health, and runtime data are aggregated into one payload with JMC Workforce data under `workforce`.
-- Workforce list payloads are bounded and omit full runtime validation context payloads.
+- Workforce list payloads are bounded and omit full workflow timeline arrays and runtime validation context payloads.
+- Storage-backed snapshot collection queries are bounded while `workforce.meta.*.total` remains accurate.
+- Snapshot workflow counts include AgentTask workflows without hydrating full AgentTask detail payloads.
+- Snapshot workflow counts de-duplicate event-backed workflows that match persisted review work item identities.
 - The endpoint follows the debug-read access policy when token protection is enabled.
 - Runtime status does not expose configured secret values.

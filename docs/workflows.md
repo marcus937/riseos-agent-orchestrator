@@ -5,9 +5,10 @@ JMC should render workflow cards, workflow detail views, timelines, state badges
 assigned agents, Hermes status, BB2 status, and routing history from these read-only
 workflow payloads instead of reconstructing lifecycle state from GitHub labels.
 
-This contract is additive. Existing snapshot-facing lifecycle fields keep their
-legacy values, and canonical workflow state is layered on top through explicit
-canonical fields and the workflow API resources.
+Existing snapshot-facing lifecycle summary fields keep their legacy values, and
+canonical workflow state is layered on top through explicit canonical fields and
+the workflow API resources. Timeline detail is exposed only by workflow detail
+and timeline resources.
 
 ## States
 
@@ -22,6 +23,7 @@ canonical fields and the workflow API resources.
 - `BB2_REVIEWING`
 - `CHANGES_REQUESTED`
 - `APPROVED`
+- `COMPLETED`
 - `MERGED`
 - `CLOSED_UNMERGED`
 - `ABANDONED`
@@ -31,8 +33,8 @@ canonical fields and the workflow API resources.
 
 ## Legacy Snapshot Compatibility
 
-Snapshot consumers that already read `workflow_state`, `workflow_state_history[].state`,
-or `workflow_events[].state` continue receiving the legacy lifecycle values, including:
+Snapshot consumers that already read `workflow_state` continue receiving the
+legacy lifecycle values, including:
 
 - `ISSUE_CREATED`
 - `AGENT_READY`
@@ -60,6 +62,11 @@ Canonical workflow state is derived deterministically from durable orchestrator 
 | Issue labeled, edited, or reopened | `ASSIGNED` |
 | Push event | `CIRCUIT_WORKING` |
 | Pull request opened, reopened, or synchronized | `PR_OPENED` |
+| AgentTask queued or assigned | `ASSIGNED` |
+| AgentTask claimed, running, or in progress | `CIRCUIT_WORKING` |
+| AgentTask ready for review | `BB2_REVIEWING` |
+| AgentTask completed | `COMPLETED` |
+| AgentTask failed or cancelled | `BLOCKED` |
 | Worker claimed or review started | `HERMES_VALIDATING` |
 | OpenAI/BB2 review attempted or GitHub writeback started | `BB2_REVIEWING` |
 | OpenAI review failed or review failed | `HERMES_FAILED` |
@@ -72,8 +79,8 @@ Canonical workflow state is derived deterministically from durable orchestrator 
 | Review item is blocked | `BLOCKED` |
 
 `APPROVED` is active and awaiting human merge. It is not terminal because only Marcus may
-merge and deploy. `MERGED`, `CLOSED_UNMERGED`, `ABANDONED`, `DEPLOYED`, and `VERIFIED`
-are terminal workflow states for summary-count purposes.
+merge and deploy. `COMPLETED`, `MERGED`, `CLOSED_UNMERGED`, `ABANDONED`, `DEPLOYED`,
+and `VERIFIED` are terminal workflow states for summary-count purposes.
 
 `HERMES_FAILED` is entered when the automated validation/review path records an OpenAI
 review failure or review failure lifecycle timestamp. It is counted as blocked evidence
@@ -87,7 +94,7 @@ summary contract, but does not infer verification from approval or merge events.
 
 ### `GET /api/v1/workflows`
 
-Returns a bounded page of normalized workflow records. By default, the endpoint
+Returns a bounded page of normalized workflow summary records. By default, the endpoint
 returns active workflows plus terminal workflows with activity in the last 14 days,
 sorted by most recent activity with a stable `workflow_id` tie-breaker.
 
@@ -96,12 +103,42 @@ Query parameters:
 | Parameter | Default | Notes |
 | --- | --- | --- |
 | `limit` | `50` | Page size. Must be between `1` and `100`. |
-| `offset` | `0` | Zero-based offset into the filtered workflow list. |
+| `offset` | `0` | Zero-based offset into the filtered workflow list. Must be between `0` and `1000` so storage-backed polling remains query-bounded. |
 | `filter` | `active_recent` | One of `active_recent`, `active`, `recent`, or `all`. |
 | `recent_days` | `14` | Recent activity window. Must be between `1` and `90`. |
 
-The `workflows` array remains the canonical record list. `pagination` is additive
-metadata for polling clients:
+The `workflows` array is intentionally compact for polling clients. It omits
+`timeline` and `route_history`; fetch `GET /api/v1/workflows/{workflow_id}` or
+`GET /api/v1/workflows/{workflow_id}/timeline` when a view needs full detail.
+Summary records keep only the scalar fields JMC needs for cards and tables:
+stable workflow/correlation/task identifiers, repository and issue/PR numbers,
+branch/base/commit refs, canonical state, current owner, assigned agent,
+timestamps, and `workflow_event_count`/`workflow_events_truncated`.
+They do not include prompts, raw review packets, execution evidence, embedded
+workflow-chain objects, or long diagnostic bodies.
+Correlated GitHub event records are collapsed into one event-backed workflow;
+event-backed workflows are de-duplicated against review work items by issue/PR
+subject when present, by branch and commit for ref-only events, or by fallback
+workflow record ID when neither subject nor ref is available. `pagination.total`
+and `pagination.unfiltered_total` count normalized workflows, not raw event rows.
+Correlated event workflow summaries preserve the first event as `created_at`
+and the latest event as `updated_at`/`last_activity_at`; full event sequences
+remain detail-only.
+When SQLite storage is active, AgentTask workflows are merged into the list only
+from a matching SQLite AgentTask store. In-memory AgentTask stores are ignored
+for storage-backed polling so global process state cannot inflate or leak into
+the persisted workflow collection.
+Storage-backed list assembly fetches at most `offset + limit` compact summary
+rows from each workflow source, computes totals with count queries, merges the
+candidate summaries by activity, then slices the requested page. This keeps the
+polling payload and query result sets bounded while preserving cross-source
+ordering. Full workflow and timeline hydration is reserved for
+`GET /api/v1/workflows/{workflow_id}` and
+`GET /api/v1/workflows/{workflow_id}/timeline`.
+`pagination.truncated` means more filtered workflows exist beyond the returned
+page. `pagination.has_next` is true only when `next_offset` is within the
+bounded offset window.
+`pagination` is additive metadata:
 
 ```json
 {
@@ -112,15 +149,20 @@ metadata for polling clients:
       "repo_full_name": "owner/repo",
       "issue_number": 42,
       "pr_number": 17,
+      "agent_task_id": null,
+      "branch": "feature/example",
+      "base_branch": "main",
+      "commit_sha": "abc123",
       "current_state": "BB2_REVIEWING",
+      "current_owner": "BB2",
       "assigned_agent": "circuit-forge",
       "hermes_job_id": null,
       "last_actor": "BB2",
       "created_at": "...",
       "updated_at": "...",
       "last_activity_at": "...",
-      "timeline": [],
-      "route_history": []
+      "workflow_event_count": 4,
+      "workflow_events_truncated": true
     }
   ],
   "pagination": {
@@ -140,7 +182,10 @@ metadata for polling clients:
 
 ### `GET /api/v1/workflows/{workflow_id}`
 
-Returns one workflow record or `404` when the workflow is unknown.
+Returns one full workflow record, including `timeline` and `route_history`, or
+`404` when the workflow is unknown. Full workflow records keep the same scalar
+fields as list summaries, but `workflow_events_truncated` is false because the
+timeline is included in the detail payload.
 
 ### `GET /api/v1/workflows/{workflow_id}/timeline`
 
@@ -165,7 +210,7 @@ Returns canonical lifecycle events for one workflow while preserving legacy even
 
 ## Snapshot Integration
 
-`GET /api/v1/orchestrator/snapshot` includes workflow summary counts:
+`GET /api/v1/orchestrator/snapshot` schema `orchestrator.snapshot.v3` includes workflow summary counts:
 
 ```json
 {
@@ -182,10 +227,22 @@ Workforce entries include both legacy and canonical values:
 
 ```json
 {
+  "workflow_id": "wf-...",
   "workflow_state": "CIRCUIT_IN_PROGRESS",
-  "canonical_workflow_state": "CIRCUIT_WORKING"
+  "canonical_workflow_state": "CIRCUIT_WORKING",
+  "workflow_event_count": 1,
+  "workflow_events_truncated": true
 }
 ```
 
-These counts are dashboard summaries. Detailed UI surfaces should use the workflow
-endpoints above.
+Snapshot v3 workforce entries omit `workflow_events` and `workflow_state_history`.
+These fields are dashboard summaries. Detailed UI surfaces should use the
+workflow endpoints above.
+Snapshot workforce summaries also omit prompts, raw review packets, execution
+evidence, repeated `workflow_chain` objects, and unbounded diagnostic text.
+Where diagnostics are retained for current JMC summary panels, they are capped
+and paired with a truncation flag.
+
+Snapshot `workflows` counts use the same normalized summary semantics as the
+workflow list: review work items, AgentTask workflows, and de-duplicated
+event-backed workflows are counted without embedding timeline detail.

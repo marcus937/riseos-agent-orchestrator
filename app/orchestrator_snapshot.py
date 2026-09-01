@@ -17,20 +17,19 @@ from app.review_queue import (
 )
 from app.workflow_lifecycle import (
     LegacyWorkflowState,
-    WorkflowEvent,
     WorkflowOwner,
     WorkflowState,
     WorkflowStateProjection,
     build_event_workflow_projection,
     build_work_item_workflow_projection,
 )
-from app.workflows import WorkflowSummaryCounts, build_workflow_summary_counts, build_workflows
+from app.workflows import WorkflowSummaryCounts, build_workflow_summaries, build_workflow_summary_counts
 
-ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v2"
+ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v3"
 ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT = 50
 ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT = 25
 ORCHESTRATOR_SNAPSHOT_RECENT_FAILURE_LIMIT = 20
-ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT = 8
+ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT = 0
 ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT = 20
 ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT = 2048
 _TRUNCATED_SUFFIX = "... [truncated]"
@@ -53,10 +52,9 @@ class OrchestratorSnapshotOverview(BaseModel):
 
 
 class WorkflowFields(BaseModel):
-    workflow_events: list[WorkflowEvent] = Field(default_factory=list)
+    workflow_id: str | None = None
     workflow_state: LegacyWorkflowState | None = None
     canonical_workflow_state: WorkflowState | None = None
-    workflow_state_history: list[WorkflowEvent] = Field(default_factory=list)
     workflow_duration_seconds: float | None = None
     current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
     workflow_event_count: int = 0
@@ -107,6 +105,11 @@ class WorkflowLifecycleVisibilitySnapshot(WorkflowFields):
     item_id: str
     repo_full_name: str | None = None
     event_type: GitHubEventType
+    branch: str | None = None
+    base_branch: str | None = None
+    commit_sha: str | None = None
+    issue_number: int | None = None
+    pr_number: int | None = None
     status: ReviewWorkItemStatus
     lifecycle_stage: ReviewLifecycleStage
     queued_at: datetime
@@ -168,6 +171,13 @@ class SnapshotCollectionMeta(BaseModel):
     truncated: bool
 
 
+class OrchestratorSnapshotWorkforceTotals(BaseModel):
+    agents: int | None = None
+    issues: int | None = None
+    prs: int | None = None
+    events: int | None = None
+
+
 class OrchestratorWorkforceSnapshotMeta(BaseModel):
     agents: SnapshotCollectionMeta
     issues: SnapshotCollectionMeta
@@ -222,14 +232,46 @@ def build_orchestrator_snapshot(
     review_items: list[ReviewWorkItem],
     events: list[EventRecord],
     recent_failures: list[RecentFailure],
+    issue_items: list[ReviewWorkItem] | None = None,
+    pr_items: list[ReviewWorkItem] | None = None,
+    workforce_totals: OrchestratorSnapshotWorkforceTotals | None = None,
+    workflow_counts: WorkflowSummaryCounts | None = None,
 ) -> OrchestratorSnapshot:
-    workflow_items = [_workflow_work_item_snapshot(item) for item in review_items]
-    workflow_items_by_id = {item.id: item for item in workflow_items}
-    agents = [_workflow_lifecycle_snapshot(item, workflow_items_by_id) for item in lifecycle]
-    issues = [item for item in workflow_items if item.issue_number is not None and item.pr_number is None]
-    prs = [item for item in workflow_items if item.pr_number is not None]
-    event_snapshots = [_workflow_event_snapshot(event) for event in events]
-    workflows = build_workflows(review_items, events)
+    issue_items = (
+        issue_items
+        if issue_items is not None
+        else [item for item in review_items if item.issue_number is not None and item.pr_number is None]
+    )
+    pr_items = pr_items if pr_items is not None else [item for item in review_items if item.pr_number is not None]
+    limited_lifecycle = _limit_collection(lifecycle, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT)
+    limited_issue_items = _limit_collection(issue_items, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT)
+    limited_pr_items = _limit_collection(pr_items, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT)
+    review_items_by_id = {
+        item.id: item
+        for item in (
+            *review_items,
+            *limited_issue_items,
+            *limited_pr_items,
+        )
+    }
+    workflow_item_ids = {
+        *(item.item_id for item in limited_lifecycle),
+        *(item.id for item in limited_issue_items),
+        *(item.id for item in limited_pr_items),
+    }
+    workflow_items_by_id = {
+        item_id: _workflow_work_item_snapshot(review_items_by_id[item_id])
+        for item_id in workflow_item_ids
+        if item_id in review_items_by_id
+    }
+    agents = [_workflow_lifecycle_snapshot(item, workflow_items_by_id) for item in limited_lifecycle]
+    issues = [workflow_items_by_id[item.id] for item in limited_issue_items if item.id in workflow_items_by_id]
+    prs = [workflow_items_by_id[item.id] for item in limited_pr_items if item.id in workflow_items_by_id]
+    event_snapshots = [
+        _workflow_event_snapshot(event)
+        for event in _limit_collection(events, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT)
+    ]
+    workflows = build_workflow_summaries(review_items, events) if workflow_counts is None else []
     return OrchestratorSnapshot(
         workforce=OrchestratorWorkforceSnapshot(
             overview=OrchestratorSnapshotOverview(
@@ -248,17 +290,29 @@ def build_orchestrator_snapshot(
                 recent_failure_count=queue.recent_failure_count,
             ),
             meta=OrchestratorWorkforceSnapshotMeta(
-                agents=_collection_meta(agents, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-                issues=_collection_meta(issues, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-                prs=_collection_meta(prs, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-                events=_collection_meta(event_snapshots, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
+                agents=_collection_meta_from_total(
+                    _snapshot_total(workforce_totals.agents if workforce_totals else None, lifecycle),
+                    ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+                ),
+                issues=_collection_meta_from_total(
+                    _snapshot_total(workforce_totals.issues if workforce_totals else None, issue_items),
+                    ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+                ),
+                prs=_collection_meta_from_total(
+                    _snapshot_total(workforce_totals.prs if workforce_totals else None, pr_items),
+                    ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
+                ),
+                events=_collection_meta_from_total(
+                    _snapshot_total(workforce_totals.events if workforce_totals else None, events),
+                    ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT,
+                ),
             ),
-            agents=_limit_collection(agents, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-            issues=_limit_collection(issues, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-            prs=_limit_collection(prs, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-            events=_limit_collection(event_snapshots, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
+            agents=agents,
+            issues=issues,
+            prs=prs,
+            events=event_snapshots,
         ),
-        workflows=build_workflow_summary_counts(workflows),
+        workflows=workflow_counts or build_workflow_summary_counts(workflows),
         queue=queue,
         health=health,
         runtime=OrchestratorRuntime(
@@ -334,7 +388,7 @@ def _workflow_work_item_snapshot(item: ReviewWorkItem) -> WorkflowWorkItemSnapsh
             "last_failure_at": item.last_failure_at,
             "last_error": last_error,
             "last_error_truncated": last_error_truncated,
-            **_workflow_fields(projection),
+            **_workflow_fields(projection, workflow_id=f"wf-{item.id}"),
         }
     )
 
@@ -345,6 +399,11 @@ def _workflow_lifecycle_snapshot(
 ) -> WorkflowLifecycleVisibilitySnapshot:
     matching_item = workflow_items.get(item.item_id)
     workflow_fields = matching_item.model_dump(include=set(WorkflowFields.model_fields)) if matching_item else {}
+    identity_fields = (
+        matching_item.model_dump(include={"branch", "base_branch", "commit_sha", "issue_number", "pr_number"})
+        if matching_item
+        else {}
+    )
     last_error, last_error_truncated = _bounded_string(item.last_error)
     agent_bus_dispatch_error, agent_bus_dispatch_error_truncated = _bounded_string(item.agent_bus_dispatch_error)
     return WorkflowLifecycleVisibilitySnapshot.model_validate(
@@ -352,6 +411,7 @@ def _workflow_lifecycle_snapshot(
             "item_id": item.item_id,
             "repo_full_name": item.repo_full_name,
             "event_type": item.event_type,
+            **identity_fields,
             "status": item.status,
             "lifecycle_stage": item.lifecycle_stage,
             "queued_at": item.queued_at,
@@ -376,6 +436,7 @@ def _workflow_lifecycle_snapshot(
             "last_failure_at": item.last_failure_at,
             "last_error": last_error,
             "last_error_truncated": last_error_truncated,
+            "workflow_id": f"wf-{item.item_id}",
             **workflow_fields,
         }
     )
@@ -398,27 +459,21 @@ def _workflow_event_snapshot(event: EventRecord) -> WorkflowEventRecordSnapshot:
             "pr_merged": event.pr_merged,
             "received_at": event.received_at,
             "raw_action": event.raw_action,
-            **_workflow_fields(projection),
+            **_workflow_fields(projection, workflow_id=f"wf-{event.correlation_id or event.event_id}"),
         }
     )
 
 
-def _workflow_fields(projection: WorkflowStateProjection) -> dict[str, Any]:
-    events = _bounded_workflow_events(
-        _limit_workflow_events(
-            projection.workflow_events,
-            ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
-        )
-    )
+def _workflow_fields(projection: WorkflowStateProjection, *, workflow_id: str | None) -> dict[str, Any]:
+    workflow_event_count = len(projection.workflow_events)
     return {
-        "workflow_events": events,
+        "workflow_id": workflow_id,
         "workflow_state": projection.workflow_state,
         "canonical_workflow_state": projection.canonical_workflow_state,
-        "workflow_state_history": events,
         "workflow_duration_seconds": projection.workflow_duration_seconds,
         "current_owner": projection.current_owner,
-        "workflow_event_count": len(projection.workflow_events),
-        "workflow_events_truncated": len(projection.workflow_events) > ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
+        "workflow_event_count": workflow_event_count,
+        "workflow_events_truncated": workflow_event_count > ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
     }
 
 
@@ -438,48 +493,24 @@ def _recent_failure_snapshot(failure: RecentFailure) -> RecentFailureSnapshot:
 
 
 def _collection_meta(items: list[Any], limit: int) -> SnapshotCollectionMeta:
+    return _collection_meta_from_total(len(items), limit)
+
+
+def _snapshot_total(explicit_total: int | None, items: list[Any]) -> int:
+    return len(items) if explicit_total is None else explicit_total
+
+
+def _collection_meta_from_total(total: int, limit: int) -> SnapshotCollectionMeta:
     return SnapshotCollectionMeta(
-        returned=min(len(items), limit),
-        total=len(items),
+        returned=min(total, limit),
+        total=total,
         limit=limit,
-        truncated=len(items) > limit,
+        truncated=total > limit,
     )
 
 
 def _limit_collection(items: list[Any], limit: int) -> list[Any]:
     return items[:limit]
-
-
-def _limit_workflow_events(events: list[WorkflowEvent], limit: int) -> list[WorkflowEvent]:
-    return events[-limit:]
-
-
-def _bounded_workflow_events(events: list[WorkflowEvent]) -> list[WorkflowEvent]:
-    return [_bounded_workflow_event(event) for event in events]
-
-
-def _bounded_workflow_event(event: WorkflowEvent) -> WorkflowEvent:
-    return event.model_copy(
-        deep=True,
-        update={"metadata": _bounded_workflow_event_metadata(event.metadata)},
-    )
-
-
-def _bounded_workflow_event_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    bounded = dict(metadata)
-    labels = bounded.get("labels")
-    if isinstance(labels, list):
-        bounded["labels"] = _limit_collection(labels, ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT)
-        bounded["label_count"] = len(labels)
-        bounded["labels_truncated"] = len(labels) > ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
-    for key, value in list(bounded.items()):
-        if not isinstance(value, str):
-            continue
-        bounded_value, truncated = _bounded_string(value)
-        bounded[key] = bounded_value
-        if truncated:
-            bounded[f"{key}_truncated"] = True
-    return bounded
 
 
 def _bounded_string(value: str | None, *, limit: int = ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT) -> tuple[str | None, bool]:

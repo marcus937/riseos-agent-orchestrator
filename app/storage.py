@@ -2,12 +2,26 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from app.event_store import EventRecord
+from app.correlation import correlation_id_from_key
+from app.event_store import EventRecord, EventWorkflowSummary
 from app.operational_logging import log_event
-from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
+from app.review_queue import (
+    RecentFailure,
+    ReviewLifecycleVisibility,
+    ReviewQueueCounters,
+    ReviewQueueStats,
+    ReviewWorkItem,
+    ReviewWorkItemStatus,
+    ReviewWorkItemWorkflowSummary,
+    WorkerStats,
+    review_work_item_identity,
+)
 from app.workflow_chain_diagnostics import log_workflow_chain_availability
+
+if TYPE_CHECKING:
+    from app.workflows import WorkflowSummaryCounts
 
 
 class SQLiteStateStore:
@@ -30,6 +44,7 @@ class SQLiteStateStore:
                     event_id TEXT PRIMARY KEY,
                     github_event TEXT NOT NULL,
                     diagnostic_stage TEXT NOT NULL DEFAULT 'webhook_accepted',
+                    correlation_id TEXT,
                     correlation_key TEXT,
                     repo_full_name TEXT,
                     branch TEXT,
@@ -43,8 +58,22 @@ class SQLiteStateStore:
                 """
             )
             _ensure_column(conn, "event_records", "diagnostic_stage", "TEXT NOT NULL DEFAULT 'webhook_accepted'")
+            _ensure_column(conn, "event_records", "correlation_id", "TEXT")
             _ensure_column(conn, "event_records", "correlation_key", "TEXT")
             _ensure_column(conn, "event_records", "pr_merged", "INTEGER")
+            _backfill_event_record_correlation_ids(conn)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_event_records_received_at
+                ON event_records (received_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_event_records_workflow_lookup
+                ON event_records (correlation_id, event_id, received_at DESC)
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issue_dispatch_claims (
@@ -70,6 +99,18 @@ class SQLiteStateStore:
             )
             for column_name, column_type in _REVIEW_WORK_ITEM_EXTRA_COLUMNS:
                 _ensure_column(conn, "review_work_items", column_name, column_type)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_review_work_items_workflow_identity
+                ON review_work_items (repo_full_name, issue_number, pr_number)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_review_work_items_workflow_dates
+                ON review_work_items (status, updated_at DESC, created_at DESC, id)
+                """
+            )
 
     def has_event_record(self, event_id: str) -> bool:
         with self._connect() as conn:
@@ -84,6 +125,7 @@ class SQLiteStateStore:
                     event_id,
                     github_event,
                     diagnostic_stage,
+                    correlation_id,
                     correlation_key,
                     repo_full_name,
                     branch,
@@ -93,12 +135,13 @@ class SQLiteStateStore:
                     pr_merged,
                     received_at,
                     raw_action
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.event_id,
                     str(record.github_event),
                     record.diagnostic_stage,
+                    record.correlation_id,
                     record.correlation_key,
                     record.repo_full_name,
                     record.branch,
@@ -148,6 +191,199 @@ class SQLiteStateStore:
             row = conn.execute("SELECT COUNT(*) AS count FROM event_records").fetchone()
         return int(row["count"])
 
+    def count_event_records_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        where_sql, params = _latest_event_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT COUNT(*) AS count
+                FROM ranked_event_workflows AS latest
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_event_records_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[EventRecord]:
+        if limit <= 0:
+            return []
+        where_sql, params = _latest_event_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT {_event_record_select_sql("latest")}
+                FROM ranked_event_workflows AS latest
+                {where_sql}
+                ORDER BY latest.received_at DESC,
+                         latest.workflow_id ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._event_record_from_row(row) for row in rows]
+
+    def list_event_workflow_summary_records_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[EventWorkflowSummary]:
+        if limit <= 0:
+            return []
+        where_sql, params = _latest_event_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT
+                    latest.workflow_id,
+                    latest.first_received_at,
+                    latest.workflow_event_count,
+                    latest.event_id,
+                    latest.github_event,
+                    latest.diagnostic_stage,
+                    COALESCE(latest.correlation_id, identity.correlation_id) AS correlation_id,
+                    COALESCE(latest.correlation_key, identity.correlation_key) AS correlation_key,
+                    COALESCE(
+                        latest.repo_full_name,
+                        identity.repo_full_name,
+                        (
+                            SELECT candidate.repo_full_name
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.repo_full_name IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS repo_full_name,
+                    COALESCE(
+                        latest.branch,
+                        (
+                            SELECT candidate.branch
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.branch IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS branch,
+                    COALESCE(
+                        latest.commit_sha,
+                        (
+                            SELECT candidate.commit_sha
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.commit_sha IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS commit_sha,
+                    COALESCE(
+                        identity.issue_number,
+                        latest.issue_number,
+                        (
+                            SELECT candidate.issue_number
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.issue_number IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS issue_number,
+                    COALESCE(
+                        identity.pr_number,
+                        latest.pr_number,
+                        (
+                            SELECT candidate.pr_number
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.pr_number IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS pr_number,
+                    latest.pr_merged,
+                    latest.received_at,
+                    latest.raw_action
+                FROM ranked_event_workflows AS latest
+                JOIN ranked_event_workflows AS identity
+                  ON identity.workflow_id = latest.workflow_id
+                 AND identity.workflow_identity_rank = 1
+                {where_sql}
+                ORDER BY latest.received_at DESC,
+                         latest.workflow_id ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._event_workflow_summary_from_row(row) for row in rows]
+
+    def get_event_record_for_workflow_id(self, workflow_id: str) -> EventRecord | None:
+        records = self.list_event_records_for_workflow_id(workflow_id)
+        return records[-1] if records else None
+
+    def list_event_records_for_workflow_id(self, workflow_id: str) -> list[EventRecord]:
+        if not workflow_id.startswith("wf-"):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH ranked_event_workflow AS (
+                    SELECT
+                        e.*,
+                        ('wf-' || COALESCE(e.correlation_id, e.event_id)) AS workflow_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+                            ORDER BY e.received_at DESC, e.event_id DESC
+                        ) AS workflow_rank,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+                            ORDER BY
+                                CASE
+                                    WHEN e.issue_number IS NOT NULL OR e.pr_number IS NOT NULL THEN 0
+                                    ELSE 1
+                                END,
+                                e.received_at DESC,
+                                e.event_id DESC
+                        ) AS workflow_identity_rank
+                    FROM event_records AS e
+                    WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
+                      AND ('wf-' || COALESCE(e.correlation_id, e.event_id)) = ?
+                )
+                SELECT {_event_record_select_sql("e")}
+                FROM ranked_event_workflow AS e
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM ranked_event_workflow AS identity
+                    WHERE identity.workflow_identity_rank = 1
+                      AND ({_event_workflow_not_review_duplicate_sql("identity")})
+                )
+                ORDER BY e.received_at ASC,
+                         e.event_id ASC
+                """,
+                (workflow_id,),
+            ).fetchall()
+        return [self._event_record_from_row(row) for row in rows]
+
     def save_review_work_item(self, item: ReviewWorkItem) -> None:
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_save_review_work_item_input",
@@ -174,6 +410,7 @@ class SQLiteStateStore:
                     commit_sha,
                     issue_number,
                     pr_number,
+                    labels,
                     status,
                     lifecycle_stage,
                     worker_claimed_at,
@@ -197,7 +434,7 @@ class SQLiteStateStore:
                     failure_count,
                     last_failure_at,
                     last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
@@ -210,6 +447,7 @@ class SQLiteStateStore:
                     item.commit_sha,
                     item.issue_number,
                     item.pr_number,
+                    json.dumps(item.labels),
                     str(item.status),
                     str(item.lifecycle_stage),
                     _dt(item.worker_claimed_at),
@@ -388,6 +626,168 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._review_work_item_from_row(row) for row in rows]
 
+    def count_review_work_item_snapshot_records(self, *, collection: str | None = None) -> int:
+        where_sql = _review_work_item_snapshot_collection_where_sql(collection)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM review_work_items
+                {where_sql}
+                """
+            ).fetchone()
+        return int(row["count"])
+
+    def list_review_work_item_snapshot_records(
+        self,
+        *,
+        limit: int | None = None,
+        collection: str | None = None,
+    ) -> list[ReviewWorkItem]:
+        if limit is not None and limit <= 0:
+            return []
+        where_sql = _review_work_item_snapshot_collection_where_sql(collection)
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (limit,) if limit is not None else ()
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    {_review_work_item_snapshot_select_sql()}
+                FROM review_work_items
+                {where_sql}
+                ORDER BY created_at DESC,
+                         id ASC
+                {limit_sql}
+                """,
+                params,
+            ).fetchall()
+        return [self._review_work_item_snapshot_from_row(row) for row in rows]
+
+    def count_review_work_items(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM review_work_items").fetchone()
+        return int(row["count"])
+
+    def count_review_work_items_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM review_work_items
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_review_work_items_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[ReviewWorkItem]:
+        if limit <= 0:
+            return []
+        where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM review_work_items
+                {where_sql}
+                ORDER BY {_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         COALESCE(updated_at, created_at) DESC,
+                         created_at DESC,
+                         ('wf-' || id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._review_work_item_from_row(row) for row in rows]
+
+    def list_review_work_item_summary_records_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[ReviewWorkItemWorkflowSummary]:
+        if limit <= 0:
+            return []
+        where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    created_at,
+                    updated_at,
+                    repo_full_name,
+                    event_type,
+                    branch,
+                    base_branch,
+                    commit_sha,
+                    issue_number,
+                    pr_number,
+                    labels,
+                    status,
+                    lifecycle_stage,
+                    worker_claimed_at,
+                    review_started_at,
+                    openai_review_attempted_at,
+                    openai_review_completed_at,
+                    review_completed_at,
+                    github_writeback_started_at,
+                    github_writeback_completed_at,
+                    github_writeback_success,
+                    last_failure_at
+                FROM review_work_items
+                {where_sql}
+                ORDER BY {_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         COALESCE(updated_at, created_at) DESC,
+                         created_at DESC,
+                         ('wf-' || id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._review_work_item_workflow_summary_from_row(row) for row in rows]
+
+    def has_review_workflow_identity(
+        self,
+        *,
+        repo_full_name: str | None,
+        issue_number: int | None,
+        pr_number: int | None,
+    ) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM review_work_items
+                WHERE (repo_full_name = ? OR (repo_full_name IS NULL AND ? IS NULL))
+                  AND (issue_number = ? OR (issue_number IS NULL AND ? IS NULL))
+                  AND (pr_number = ? OR (pr_number IS NULL AND ? IS NULL))
+                LIMIT 1
+                """,
+                (
+                    repo_full_name,
+                    repo_full_name,
+                    issue_number,
+                    issue_number,
+                    pr_number,
+                    pr_number,
+                ),
+            ).fetchone()
+        return row is not None
+
     def get_review_work_item(self, item_id: str) -> ReviewWorkItem | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM review_work_items WHERE id = ?", (item_id,)).fetchone()
@@ -396,7 +796,190 @@ class SQLiteStateStore:
         return self._review_work_item_from_row(row)
 
     def review_queue_counters(self) -> ReviewQueueCounters:
-        return review_queue_counters(self.list_review_work_items())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS review_queue_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS pending_review_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS reviewing_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS needs_changes_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS approved_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS blocked_count
+                FROM review_work_items
+                """,
+                (
+                    ReviewWorkItemStatus.PENDING_REVIEW.value,
+                    ReviewWorkItemStatus.REVIEWING.value,
+                    ReviewWorkItemStatus.NEEDS_CHANGES.value,
+                    ReviewWorkItemStatus.APPROVED_FOR_HUMAN_REVIEW.value,
+                    ReviewWorkItemStatus.BLOCKED.value,
+                ),
+            ).fetchone()
+        approved_count = _int(row["approved_count"])
+        return ReviewQueueCounters(
+            review_queue_count=_int(row["review_queue_count"]),
+            pending_review_count=_int(row["pending_review_count"]),
+            reviewing_count=_int(row["reviewing_count"]),
+            needs_changes_count=_int(row["needs_changes_count"]),
+            approved_count=approved_count,
+            approved_for_human_review_count=approved_count,
+            blocked_count=_int(row["blocked_count"]),
+        )
+
+    def review_queue_stats(self) -> ReviewQueueStats:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    MIN(CASE WHEN status = ? THEN created_at ELSE NULL END) AS oldest_pending_at,
+                    MAX(created_at) AS newest_created_at,
+                    SUM(failure_count) AS failure_count,
+                    SUM(CASE WHEN last_failure_at IS NOT NULL THEN 1 ELSE 0 END) AS recent_failure_count,
+                    MAX(last_failure_at) AS last_failure_at
+                FROM review_work_items
+                """,
+                (ReviewWorkItemStatus.PENDING_REVIEW.value,),
+            ).fetchone()
+        now = datetime.now(UTC)
+        oldest_pending_at = _parse_dt(row["oldest_pending_at"])
+        newest_created_at = _parse_dt(row["newest_created_at"])
+        return ReviewQueueStats(
+            counters=self.review_queue_counters(),
+            oldest_pending_age_seconds=_age_seconds(oldest_pending_at, now),
+            newest_item_age_seconds=_age_seconds(newest_created_at, now),
+            failure_count=_int(row["failure_count"]),
+            recent_failure_count=_int(row["recent_failure_count"]),
+            last_failure_at=_parse_dt(row["last_failure_at"]),
+        )
+
+    def worker_stats(self, *, auto_processing_enabled: bool) -> WorkerStats:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN worker_claimed_at IS NOT NULL THEN 1 ELSE 0 END) AS claimed_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS active_reviewing_count,
+                    SUM(CASE WHEN review_completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed_count,
+                    SUM(failure_count) AS failed_count,
+                    MAX(worker_claimed_at) AS last_claimed_at,
+                    MAX(review_completed_at) AS last_review_completed_at,
+                    MAX(last_failure_at) AS last_failure_at
+                FROM review_work_items
+                """,
+                (ReviewWorkItemStatus.REVIEWING.value,),
+            ).fetchone()
+        return WorkerStats(
+            auto_processing_enabled=auto_processing_enabled,
+            claimed_count=_int(row["claimed_count"]),
+            active_reviewing_count=_int(row["active_reviewing_count"]),
+            completed_count=_int(row["completed_count"]),
+            failed_count=_int(row["failed_count"]),
+            last_claimed_at=_parse_dt(row["last_claimed_at"]),
+            last_review_completed_at=_parse_dt(row["last_review_completed_at"]),
+            last_failure_at=_parse_dt(row["last_failure_at"]),
+        )
+
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        from app.workflows import WorkflowSummaryCounts
+
+        queue_counters = self.review_queue_counters()
+        active_event_count = self.count_event_records_for_workflow_collection(workflow_filter="active")
+        blocked_event_count = self._count_event_workflows_for_snapshot_category("blocked")
+        reviewing_event_count = self._count_event_workflows_for_snapshot_category("reviewing")
+        return WorkflowSummaryCounts(
+            active=queue_counters.review_queue_count + active_event_count,
+            blocked=queue_counters.blocked_count + blocked_event_count,
+            reviewing=(
+                queue_counters.reviewing_count
+                + queue_counters.needs_changes_count
+                + reviewing_event_count
+            ),
+            verified=0,
+        )
+
+    def _count_event_workflows_for_snapshot_category(self, category: str) -> int:
+        where_sql, params = _latest_event_workflow_snapshot_category_filter_sql(category)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                WITH {_RANKED_EVENT_WORKFLOWS_CTE_SQL}
+                SELECT COUNT(*) AS count
+                FROM ranked_event_workflows AS latest
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_recent_failures(self, *, limit: int = 20) -> list[RecentFailure]:
+        if limit <= 0:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id AS item_id,
+                    repo_full_name,
+                    event_type,
+                    status,
+                    lifecycle_stage,
+                    failure_count,
+                    last_failure_at,
+                    last_error
+                FROM review_work_items
+                WHERE last_failure_at IS NOT NULL
+                  AND last_error IS NOT NULL
+                  AND last_error <> ''
+                ORDER BY last_failure_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [RecentFailure.model_validate(dict(row)) for row in rows]
+
+    def list_lifecycle_visibility_records(self, *, limit: int | None = None) -> list[ReviewLifecycleVisibility]:
+        if limit is not None and limit <= 0:
+            return []
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (limit,) if limit is not None else ()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id AS item_id,
+                    repo_full_name,
+                    event_type,
+                    status,
+                    lifecycle_stage,
+                    created_at AS queued_at,
+                    worker_claimed_at,
+                    review_started_at,
+                    openai_review_attempted_at,
+                    openai_review_completed_at,
+                    review_completed_at,
+                    github_writeback_started_at,
+                    github_writeback_completed_at,
+                    github_writeback_success,
+                    agent_bus_dispatch_started_at,
+                    agent_bus_dispatch_completed_at,
+                    agent_bus_dispatch_success,
+                    agent_bus_work_item_id,
+                    agent_bus_dispatch_error,
+                    runtime_validation_id,
+                    runtime_validation_status,
+                    runtime_validation_completed_at,
+                    failure_count,
+                    last_failure_at,
+                    last_error
+                FROM review_work_items
+                ORDER BY created_at DESC,
+                         id ASC
+                """
+                + limit_sql,
+                params,
+            ).fetchall()
+        return [self._lifecycle_visibility_from_row(row) for row in rows]
 
     def prune_processed_review_items(self, max_items: int | None = None) -> int:
         limit = max_items or self.max_review_items
@@ -431,8 +1014,15 @@ class SQLiteStateStore:
             data["pr_merged"] = bool(data["pr_merged"])
         return EventRecord.model_validate(data)
 
+    def _event_workflow_summary_from_row(self, row: sqlite3.Row) -> EventWorkflowSummary:
+        data = dict(row)
+        if data.get("pr_merged") is not None:
+            data["pr_merged"] = bool(data["pr_merged"])
+        return EventWorkflowSummary.model_validate(data)
+
     def _review_work_item_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
         data = dict(row)
+        data["labels"] = _labels(data.get("labels"))
         raw_runtime_validation_context = data.get("runtime_validation_context")
         _log_review_work_item_persistence_json(
             "wf_chain_metadata_storage_before_deserialize_json",
@@ -467,6 +1057,31 @@ class SQLiteStateStore:
         )
         return item
 
+    def _review_work_item_workflow_summary_from_row(self, row: sqlite3.Row) -> ReviewWorkItemWorkflowSummary:
+        data = dict(row)
+        data["labels"] = _labels(data.get("labels"))
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        return ReviewWorkItemWorkflowSummary.model_validate(data)
+
+    def _review_work_item_snapshot_from_row(self, row: sqlite3.Row) -> ReviewWorkItem:
+        data = dict(row)
+        data["labels"] = _labels(data.get("labels"))
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        if data.get("agent_bus_dispatch_success") is not None:
+            data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
+        data["runtime_validation_context"] = {}
+        return ReviewWorkItem.model_validate(data)
+
+    def _lifecycle_visibility_from_row(self, row: sqlite3.Row) -> ReviewLifecycleVisibility:
+        data = dict(row)
+        if data.get("github_writeback_success") is not None:
+            data["github_writeback_success"] = bool(data["github_writeback_success"])
+        if data.get("agent_bus_dispatch_success") is not None:
+            data["agent_bus_dispatch_success"] = bool(data["agent_bus_dispatch_success"])
+        return ReviewLifecycleVisibility.model_validate(data)
+
 
 def build_sqlite_store(db_path: str | None, *, max_review_items: int = 500) -> SQLiteStateStore | None:
     if not db_path:
@@ -484,6 +1099,28 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, 
     if column_name in columns:
         return
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _backfill_event_record_correlation_ids(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT event_id, correlation_key
+        FROM event_records
+        WHERE correlation_id IS NULL
+          AND correlation_key IS NOT NULL
+        """
+    ).fetchall()
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        correlation_id = correlation_id_from_key(str(row["correlation_key"]))
+        if correlation_id is not None:
+            updates.append((correlation_id, str(row["event_id"])))
+    if not updates:
+        return
+    conn.executemany(
+        "UPDATE event_records SET correlation_id = ? WHERE event_id = ?",
+        updates,
+    )
 
 
 def _dt(value: object | None) -> str | None:
@@ -504,6 +1141,40 @@ def _json(value: object | None) -> str:
     return json.dumps(value or {}, sort_keys=True, default=str)
 
 
+def _labels(value: object | None) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    try:
+        loaded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _int(value: object | None) -> int:
+    return int(value or 0)
+
+
+def _parse_dt(value: object | None) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _age_seconds(value: datetime | None, now: datetime) -> float | None:
+    if value is None:
+        return None
+    return round((now - value).total_seconds(), 3)
+
+
 def _load_json(value: object | None) -> dict[str, object]:
     if not value:
         return {}
@@ -514,6 +1185,147 @@ def _load_json(value: object | None) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _review_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    recent_sql = f"{_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} >= ?"
+    recent_params = (_dt(recent_since),)
+    active_sql = _REVIEW_WORKFLOW_ACTIVE_SQL
+    if workflow_filter == "all":
+        return "", ()
+    if workflow_filter == "active":
+        return f"WHERE {active_sql}", ()
+    if workflow_filter == "recent":
+        return f"WHERE {recent_sql}", recent_params
+    return f"WHERE ({active_sql}) OR ({recent_sql})", recent_params
+
+
+def _review_work_item_snapshot_collection_where_sql(collection: str | None) -> str:
+    if collection is None:
+        return ""
+    if collection == "issues":
+        return "WHERE issue_number IS NOT NULL AND pr_number IS NULL"
+    if collection == "prs":
+        return "WHERE pr_number IS NOT NULL"
+    raise ValueError(f"Unknown review work item snapshot collection: {collection}")
+
+
+def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    predicates = [
+        "latest.workflow_rank = 1",
+        f"""
+        EXISTS (
+            SELECT 1
+            FROM ranked_event_workflows AS identity
+            WHERE identity.workflow_id = latest.workflow_id
+              AND identity.workflow_identity_rank = 1
+              AND ({_event_workflow_not_review_duplicate_sql("identity")})
+        )
+        """,
+    ]
+    params: list[object] = []
+    recent_sql = "latest.received_at >= ?"
+    active_sql = "NOT (latest.github_event = 'pull_request' AND latest.raw_action = 'closed')"
+    if workflow_filter == "active":
+        predicates.append(active_sql)
+    elif workflow_filter == "recent":
+        predicates.append(recent_sql)
+        params.append(_dt(recent_since))
+    elif workflow_filter != "all":
+        predicates.append(f"({active_sql}) OR ({recent_sql})")
+        params.append(_dt(recent_since))
+    where_sql = "WHERE " + "\n                  AND ".join(
+        f"({predicate})" for predicate in predicates
+    )
+    return where_sql, tuple(params)
+
+
+def _latest_event_workflow_snapshot_category_filter_sql(category: str) -> tuple[str, tuple[object, ...]]:
+    where_sql, params = _latest_event_workflow_filter_sql("all", None)
+    if category == "blocked":
+        category_sql = """
+        latest.github_event = 'pull_request'
+        AND latest.raw_action = 'closed'
+        AND COALESCE(latest.pr_merged, 0) = 0
+        """
+    elif category == "reviewing":
+        category_sql = """
+        latest.github_event = 'pull_request_review'
+        AND latest.raw_action = 'submitted'
+        """
+    else:
+        raise ValueError(f"Unknown event workflow snapshot category: {category}")
+    return f"{where_sql}\n                  AND ({category_sql})", params
+
+
+def _event_record_select_sql(alias: str) -> str:
+    return ", ".join(f"{alias}.{column}" for column in _EVENT_RECORD_COLUMNS)
+
+
+def _review_work_item_snapshot_select_sql() -> str:
+    return ", ".join(_REVIEW_WORK_ITEM_SNAPSHOT_COLUMNS)
+
+
+def _event_workflow_not_review_duplicate_sql(alias: str) -> str:
+    return f"""
+NOT EXISTS (
+    SELECT 1
+    FROM review_work_items AS r
+    WHERE (
+        r.repo_full_name = {alias}.repo_full_name
+        OR (r.repo_full_name IS NULL AND {alias}.repo_full_name IS NULL)
+    )
+      AND (
+        (
+            (
+                {alias}.issue_number IS NOT NULL
+                OR {alias}.pr_number IS NOT NULL
+                OR r.issue_number IS NOT NULL
+                OR r.pr_number IS NOT NULL
+            )
+            AND (
+                r.issue_number = {alias}.issue_number
+                OR (r.issue_number IS NULL AND {alias}.issue_number IS NULL)
+            )
+            AND (
+                r.pr_number = {alias}.pr_number
+                OR (r.pr_number IS NULL AND {alias}.pr_number IS NULL)
+            )
+        )
+        OR (
+            {alias}.issue_number IS NULL
+            AND {alias}.pr_number IS NULL
+            AND r.issue_number IS NULL
+            AND r.pr_number IS NULL
+            AND (
+                {alias}.branch IS NOT NULL
+                OR {alias}.commit_sha IS NOT NULL
+                OR r.branch IS NOT NULL
+                OR r.commit_sha IS NOT NULL
+            )
+            AND (
+                r.branch = {alias}.branch
+                OR (r.branch IS NULL AND {alias}.branch IS NULL)
+            )
+            AND (
+                r.commit_sha = {alias}.commit_sha
+                OR (r.commit_sha IS NULL AND {alias}.commit_sha IS NULL)
+            )
+        )
+        OR (
+            {alias}.issue_number IS NULL
+            AND {alias}.pr_number IS NULL
+            AND {alias}.branch IS NULL
+            AND {alias}.commit_sha IS NULL
+            AND r.issue_number IS NULL
+            AND r.pr_number IS NULL
+            AND r.branch IS NULL
+            AND r.commit_sha IS NULL
+            AND r.id = COALESCE({alias}.correlation_id, {alias}.event_id)
+        )
+      )
+)
+"""
 
 
 def _log_review_work_item_persistence_json(
@@ -552,8 +1364,10 @@ def _log_review_work_item_persistence_json(
         workflow_chain_populated=bool(workflow_chain),
         runtime_context_populated=bool(context),
         review_dispatch_populated=bool(review_dispatch),
-        raw_json_stored=raw_json_stored,
-        raw_json_loaded=raw_json_loaded,
+        raw_json_stored_present=raw_json_stored is not None,
+        raw_json_stored_bytes=_serialized_text_bytes(raw_json_stored),
+        raw_json_loaded_present=raw_json_loaded is not None,
+        raw_json_loaded_bytes=_serialized_text_bytes(raw_json_loaded),
         _include_nulls=True,
     )
 
@@ -565,8 +1379,15 @@ def _first_dict(*values: Any) -> dict[str, Any]:
     return {}
 
 
+def _serialized_text_bytes(value: object | None) -> int | None:
+    if value is None:
+        return None
+    return len(str(value).encode("utf-8"))
+
+
 _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("base_branch", "TEXT"),
+    ("labels", "TEXT NOT NULL DEFAULT '[]'"),
     ("updated_at", "TEXT"),
     ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'review_queued'"),
     ("worker_claimed_at", "TEXT"),
@@ -591,3 +1412,124 @@ _REVIEW_WORK_ITEM_EXTRA_COLUMNS = [
     ("last_failure_at", "TEXT"),
     ("last_error", "TEXT"),
 ]
+
+
+_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL = """
+max(
+    COALESCE(created_at, ''),
+    COALESCE(worker_claimed_at, ''),
+    COALESCE(review_started_at, ''),
+    COALESCE(openai_review_attempted_at, ''),
+    COALESCE(openai_review_completed_at, ''),
+    COALESCE(github_writeback_started_at, ''),
+    COALESCE(github_writeback_completed_at, ''),
+    COALESCE(review_completed_at, ''),
+    COALESCE(last_failure_at, ''),
+    CASE
+        WHEN status IN ('reviewing', 'needs_changes', 'approved_for_human_review', 'blocked')
+        THEN COALESCE(updated_at, review_completed_at, '')
+        ELSE ''
+    END
+)
+"""
+
+# Review work items currently project to active canonical states. Terminal workflow
+# states are represented by GitHub close/deploy/verify event projections.
+_REVIEW_WORKFLOW_ACTIVE_SQL = "1 = 1"
+
+_EVENT_WORKFLOW_CANONICAL_SQL = """
+(
+    e.github_event = 'push'
+    OR (
+        e.github_event = 'issues'
+        AND e.raw_action IN ('opened', 'labeled', 'edited', 'reopened')
+    )
+    OR (
+        e.github_event = 'pull_request'
+        AND e.raw_action IN ('opened', 'reopened', 'synchronize', 'closed')
+    )
+    OR (e.github_event = 'pull_request_review' AND e.raw_action = 'submitted')
+)
+"""
+
+_RANKED_EVENT_WORKFLOWS_CTE_SQL = f"""
+ranked_event_workflows AS (
+    SELECT
+        e.*,
+        ('wf-' || COALESCE(e.correlation_id, e.event_id)) AS workflow_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+            ORDER BY e.received_at DESC, e.event_id DESC
+        ) AS workflow_rank,
+        ROW_NUMBER() OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+            ORDER BY
+                CASE
+                    WHEN e.issue_number IS NOT NULL OR e.pr_number IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                e.received_at DESC,
+                e.event_id DESC
+        ) AS workflow_identity_rank,
+        MIN(e.received_at) OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+        ) AS first_received_at,
+        COUNT(*) OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+        ) AS workflow_event_count
+    FROM event_records AS e
+    WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
+)
+"""
+
+_EVENT_RECORD_COLUMNS = (
+    "event_id",
+    "github_event",
+    "diagnostic_stage",
+    "correlation_id",
+    "correlation_key",
+    "repo_full_name",
+    "branch",
+    "commit_sha",
+    "issue_number",
+    "pr_number",
+    "pr_merged",
+    "received_at",
+    "raw_action",
+)
+
+_REVIEW_WORK_ITEM_SNAPSHOT_COLUMNS = (
+    "id",
+    "created_at",
+    "updated_at",
+    "repo_full_name",
+    "event_type",
+    "branch",
+    "base_branch",
+    "commit_sha",
+    "issue_number",
+    "pr_number",
+    "labels",
+    "status",
+    "lifecycle_stage",
+    "worker_claimed_at",
+    "review_started_at",
+    "openai_review_attempted_at",
+    "openai_review_completed_at",
+    "review_completed_at",
+    "github_writeback_started_at",
+    "github_writeback_completed_at",
+    "github_writeback_success",
+    "agent_bus_dispatch_started_at",
+    "agent_bus_dispatch_completed_at",
+    "agent_bus_dispatch_success",
+    "agent_bus_work_item_id",
+    "agent_bus_dispatch_error",
+    "runtime_validation_id",
+    "runtime_validation_status",
+    "runtime_validation_digest",
+    "runtime_validation_completed_at",
+    "failure_count",
+    "last_failure_at",
+    "last_error",
+)

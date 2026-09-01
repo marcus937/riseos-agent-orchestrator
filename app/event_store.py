@@ -30,6 +30,12 @@ class EventRecord(BaseModel):
             self.correlation_id = correlation_id_from_key(self.correlation_key)
 
 
+class EventWorkflowSummary(EventRecord):
+    workflow_id: str
+    first_received_at: datetime
+    workflow_event_count: int = 1
+
+
 class DebugHealth(BaseModel):
     webhook_count: int
     accepted_count: int

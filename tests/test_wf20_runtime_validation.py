@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 
 import httpx
+import pytest
 
 from app.circuit_runtime_validation import RuntimeValidationRequest
 from app.clients.agent_bus import AgentBusClient, RUNTIME_VALIDATION_TOKEN_HEADER
@@ -20,6 +21,15 @@ from app.wf20_runtime_validation import (
 from app.wf20_runtime_validation_safe import runtime_validation_request_from_parsed
 
 VERCEL_READY_STATUS = {"context": "Vercel", "state": "success", "target_url": "https://jmc-preview.vercel.app"}
+PUBLIC_DNS_RESULT = [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture(autouse=True)
+def resolve_fake_preview_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.circuit_runtime_validation.socket.getaddrinfo",
+        lambda *_args, **_kwargs: PUBLIC_DNS_RESULT,
+    )
 
 
 class FakeAgentBusClient:

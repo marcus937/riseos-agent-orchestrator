@@ -116,11 +116,66 @@ class AgentTask(BaseModel):
     lifecycle_events: list[AgentTaskLifecycleEvent] = Field(default_factory=list)
 
 
+class AgentTaskWorkflowSummary(BaseModel):
+    task_id: str
+    repo_full_name: str
+    target_agent: str
+    correlation_id: str | None = None
+    status: AgentTaskStatus = AgentTaskStatus.CREATED
+    issue_number: int | None = None
+    agent_bus_work_item_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    queued_at: datetime | None = None
+    assigned_at: datetime | None = None
+    claimed_at: datetime | None = None
+    running_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    branch: str | None = None
+    commit_sha: str | None = None
+    last_actor: str | None = None
+    workflow_event_count: int = 1
+
+
 class AgentTaskStore(Protocol):
     def save_agent_task(self, task: AgentTask) -> None:
         ...
 
     def list_agent_tasks(self) -> list[AgentTask]:
+        ...
+
+    def count_agent_tasks(self) -> int:
+        ...
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        ...
+
+    def list_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTask]:
+        ...
+
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
+        ...
+
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
         ...
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
@@ -140,6 +195,61 @@ class InMemoryAgentTaskStore:
 
     def list_agent_tasks(self) -> list[AgentTask]:
         return sorted(self._items, key=lambda task: task.created_at, reverse=True)
+
+    def count_agent_tasks(self) -> int:
+        return len(self._items)
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        refresh_agent_task_dependency_states(list(self._items))
+        return len(
+            _filter_agent_tasks_for_workflow_collection(
+                list(self._items),
+                workflow_filter=workflow_filter,
+                recent_since=recent_since,
+            )
+        )
+
+    def list_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTask]:
+        if limit <= 0:
+            return []
+        refresh_agent_task_dependency_states(list(self._items))
+        tasks = _filter_agent_tasks_for_workflow_collection(
+            list(self._items),
+            workflow_filter=workflow_filter,
+            recent_since=recent_since,
+        )
+        return _sort_agent_tasks_for_workflow_collection(tasks)[:limit]
+
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
+        return [
+            agent_task_workflow_summary(task)
+            for task in self.list_agent_tasks_for_workflow_collection(
+                limit=limit,
+                workflow_filter=workflow_filter,
+                recent_since=recent_since,
+            )
+        ]
+
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        refresh_agent_task_dependency_states(list(self._items))
+        return _agent_task_workflow_summary_counts(list(self._items))
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         return next((task for task in self._items if task.task_id == task_id), None)
@@ -191,12 +301,20 @@ class SQLiteAgentTaskStore:
                     commit_sha TEXT,
                     changed_files TEXT NOT NULL DEFAULT '[]',
                     execution_evidence TEXT NOT NULL DEFAULT '{}',
-                    lifecycle_events TEXT NOT NULL
+                    lifecycle_events TEXT NOT NULL,
+                    lifecycle_event_count INTEGER NOT NULL DEFAULT 1,
+                    last_actor TEXT
                 )
                 """
             )
             for column_name, column_type in _AGENT_TASK_EXTRA_COLUMNS:
                 _ensure_column(conn, "agent_tasks", column_name, column_type)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_workflow_collection
+                ON agent_tasks (status, updated_at DESC, created_at DESC, task_id)
+                """
+            )
 
     def save_agent_task(self, task: AgentTask) -> None:
         with self._connect() as conn:
@@ -235,8 +353,10 @@ class SQLiteAgentTaskStore:
                     commit_sha,
                     changed_files,
                     execution_evidence,
-                    lifecycle_events
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    lifecycle_events,
+                    lifecycle_event_count,
+                    last_actor
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -272,6 +392,8 @@ class SQLiteAgentTaskStore:
                     json.dumps(task.changed_files),
                     json.dumps(task.execution_evidence),
                     json.dumps([event.model_dump(mode="json") for event in task.lifecycle_events]),
+                    _agent_task_lifecycle_event_count(task),
+                    _last_agent_task_lifecycle_actor(task),
                 ),
             )
 
@@ -285,13 +407,134 @@ class SQLiteAgentTaskStore:
             ).fetchall()
         return refresh_agent_task_dependency_states([_task_from_row(row) for row in rows])
 
+    def count_agent_tasks(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM agent_tasks").fetchone()
+        return int(row["count"])
+
+    def count_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        where_sql, params = _agent_task_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM agent_tasks
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_agent_tasks_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTask]:
+        if limit <= 0:
+            return []
+        where_sql, params = _agent_task_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM agent_tasks
+                {where_sql}
+                ORDER BY {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         updated_at DESC,
+                         created_at DESC,
+                         ('wf-agent-task-' || task_id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            tasks = [_task_from_row(row) for row in rows]
+            return _refresh_sqlite_agent_task_dependency_states(conn, tasks)
+
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
+        if limit <= 0:
+            return []
+        where_sql, params = _agent_task_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    task_id,
+                    repo_full_name,
+                    target_agent,
+                    correlation_id,
+                    status,
+                    issue_number,
+                    agent_bus_work_item_id,
+                    created_at,
+                    updated_at,
+                    queued_at,
+                    assigned_at,
+                    claimed_at,
+                    running_at,
+                    completed_at,
+                    failed_at,
+                    cancelled_at,
+                    branch,
+                    commit_sha,
+                    last_actor,
+                    COALESCE(NULLIF(lifecycle_event_count, 0), 1) AS workflow_event_count
+                FROM agent_tasks
+                {where_sql}
+                ORDER BY {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         updated_at DESC,
+                         created_at DESC,
+                         ('wf-agent-task-' || task_id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [AgentTaskWorkflowSummary.model_validate(dict(row)) for row in rows]
+
+    def workflow_summary_counts_for_snapshot(self) -> "WorkflowSummaryCounts":
+        from app.workflows import WorkflowSummaryCounts
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status <> ? THEN 1 ELSE 0 END) AS active_count,
+                    SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END) AS blocked_count,
+                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS reviewing_count
+                FROM agent_tasks
+                """,
+                (
+                    AgentTaskStatus.COMPLETED.value,
+                    AgentTaskStatus.FAILED.value,
+                    AgentTaskStatus.CANCELLED.value,
+                    AgentTaskStatus.READY_FOR_REVIEW.value,
+                ),
+            ).fetchone()
+        return WorkflowSummaryCounts(
+            active=int(row["active_count"] or 0),
+            blocked=int(row["blocked_count"] or 0),
+            reviewing=int(row["reviewing_count"] or 0),
+            verified=0,
+        )
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
-        if row is None:
-            return None
-        tasks = self.list_agent_tasks()
-        return next((task for task in tasks if task.task_id == task_id), None)
+            if row is None:
+                return None
+            task = _task_from_row(row)
+            return _refresh_sqlite_agent_task_dependency_states(conn, [task])[0]
 
 
 agent_task_store = InMemoryAgentTaskStore()
@@ -339,6 +582,75 @@ def refresh_agent_task_dependency_state(task: AgentTask, tasks_by_id: dict[str, 
 
 def refresh_agent_task_dependency_states(tasks: list[AgentTask]) -> list[AgentTask]:
     tasks_by_id = {task.task_id: task for task in tasks}
+    for task in tasks:
+        refresh_agent_task_dependency_state(task, tasks_by_id)
+    return tasks
+
+
+def agent_task_workflow_summary(task: AgentTask) -> AgentTaskWorkflowSummary:
+    return AgentTaskWorkflowSummary(
+        task_id=task.task_id,
+        repo_full_name=task.repo_full_name,
+        target_agent=task.target_agent,
+        correlation_id=task.correlation_id,
+        status=task.status,
+        issue_number=task.issue_number,
+        agent_bus_work_item_id=task.agent_bus_work_item_id,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        queued_at=task.queued_at,
+        assigned_at=task.assigned_at,
+        claimed_at=task.claimed_at,
+        running_at=task.running_at,
+        completed_at=task.completed_at,
+        failed_at=task.failed_at,
+        cancelled_at=task.cancelled_at,
+        branch=task.branch,
+        commit_sha=task.commit_sha,
+        last_actor=_last_agent_task_lifecycle_actor(task),
+        workflow_event_count=_agent_task_lifecycle_event_count(task),
+    )
+
+
+def _agent_task_workflow_summary_counts(tasks: list[AgentTask]) -> "WorkflowSummaryCounts":
+    from app.workflows import WorkflowSummaryCounts
+
+    return WorkflowSummaryCounts(
+        active=sum(1 for task in tasks if task.status != AgentTaskStatus.COMPLETED),
+        blocked=sum(1 for task in tasks if task.status in {AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED}),
+        reviewing=sum(1 for task in tasks if task.status == AgentTaskStatus.READY_FOR_REVIEW),
+        verified=0,
+    )
+
+
+def _refresh_sqlite_agent_task_dependency_states(
+    conn: sqlite3.Connection,
+    tasks: list[AgentTask],
+) -> list[AgentTask]:
+    tasks_by_id = {task.task_id: task for task in tasks}
+    missing_dependency_ids = sorted(
+        {
+            dependency_id
+            for task in tasks
+            for dependency_id in task.dependency_task_ids
+            if dependency_id not in tasks_by_id
+        }
+    )
+    if missing_dependency_ids:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM agent_tasks
+            WHERE task_id IN ({','.join('?' for _ in missing_dependency_ids)})
+            """,
+            missing_dependency_ids,
+        ).fetchall()
+        tasks_by_id.update(
+            {
+                dependency.task_id: dependency
+                for dependency in (_task_from_row(row) for row in rows)
+            }
+        )
     for task in tasks:
         refresh_agent_task_dependency_state(task, tasks_by_id)
     return tasks
@@ -491,6 +803,82 @@ def _task_from_row(row: sqlite3.Row) -> AgentTask:
     return AgentTask.model_validate(data)
 
 
+def _filter_agent_tasks_for_workflow_collection(
+    tasks: list[AgentTask],
+    *,
+    workflow_filter: str,
+    recent_since: datetime | None,
+) -> list[AgentTask]:
+    if workflow_filter == "all":
+        return tasks
+    if workflow_filter == "active":
+        return [task for task in tasks if _agent_task_workflow_active(task)]
+    if workflow_filter == "recent":
+        return [
+            task
+            for task in tasks
+            if recent_since is not None
+            and _agent_task_workflow_last_activity_at(task) >= recent_since
+        ]
+    return [
+        task
+        for task in tasks
+        if _agent_task_workflow_active(task)
+        or (
+            recent_since is not None
+            and _agent_task_workflow_last_activity_at(task) >= recent_since
+        )
+    ]
+
+
+def _sort_agent_tasks_for_workflow_collection(tasks: list[AgentTask]) -> list[AgentTask]:
+    return sorted(
+        sorted(tasks, key=lambda task: f"wf-agent-task-{task.task_id}"),
+        key=lambda task: (
+            _agent_task_workflow_last_activity_at(task),
+            task.updated_at,
+            task.created_at,
+        ),
+        reverse=True,
+    )
+
+
+def _agent_task_workflow_active(task: AgentTask) -> bool:
+    return task.status != AgentTaskStatus.COMPLETED
+
+
+def _agent_task_workflow_last_activity_at(task: AgentTask) -> datetime:
+    values = [
+        value
+        for value in (
+            task.updated_at,
+            task.completed_at,
+            task.failed_at,
+            task.cancelled_at,
+            task.running_at,
+            task.claimed_at,
+            task.assigned_at,
+            task.queued_at,
+            task.created_at,
+        )
+        if value is not None
+    ]
+    return max(values)
+
+
+def _agent_task_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    if workflow_filter == "all":
+        return "", ()
+    if workflow_filter == "active":
+        return "WHERE status <> ?", (AgentTaskStatus.COMPLETED.value,)
+    if workflow_filter == "recent":
+        return f"WHERE {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} >= ?", (_dt(recent_since),)
+    return (
+        f"WHERE status <> ? OR {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} >= ?",
+        (AgentTaskStatus.COMPLETED.value, _dt(recent_since)),
+    )
+
+
 def _execution_evidence_with_preserved_orchestration_metadata(
     task: AgentTask,
     result: AgentTaskExecutionResult,
@@ -552,4 +940,29 @@ _AGENT_TASK_EXTRA_COLUMNS = [
     ("commit_sha", "TEXT"),
     ("changed_files", "TEXT NOT NULL DEFAULT '[]'"),
     ("execution_evidence", "TEXT NOT NULL DEFAULT '{}'"),
+    ("lifecycle_event_count", "INTEGER NOT NULL DEFAULT 1"),
+    ("last_actor", "TEXT"),
 ]
+
+
+_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL = """
+max(
+    COALESCE(updated_at, ''),
+    COALESCE(completed_at, ''),
+    COALESCE(failed_at, ''),
+    COALESCE(cancelled_at, ''),
+    COALESCE(running_at, ''),
+    COALESCE(claimed_at, ''),
+    COALESCE(assigned_at, ''),
+    COALESCE(queued_at, ''),
+    COALESCE(created_at, '')
+)
+"""
+
+
+def _last_agent_task_lifecycle_actor(task: AgentTask) -> str | None:
+    return task.lifecycle_events[-1].actor if task.lifecycle_events else None
+
+
+def _agent_task_lifecycle_event_count(task: AgentTask) -> int:
+    return max(len(task.lifecycle_events), 1)
