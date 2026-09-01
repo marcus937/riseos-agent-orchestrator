@@ -10,6 +10,22 @@ from app.review_dispatch import reconcile_bb2_review_request_status
 logger = logging.getLogger(__name__)
 
 
+def _has_safe_pull_request_reference(evidence: dict[str, Any]) -> bool:
+    pr_number = evidence.get("pr_number")
+    pull_request = evidence.get("pull_request")
+    if pr_number is None and pull_request is None:
+        return True
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool):
+        return False
+    if not isinstance(pull_request, dict):
+        return False
+    referenced_number = pull_request.get("number")
+    return (
+        pull_request.get("status") == "existing"
+        and referenced_number == pr_number
+    )
+
+
 def is_verified_noop_execution(payload: AgentTaskExecutionResult) -> bool:
     """Return true only for a successful execution that provably changed nothing."""
 
@@ -29,8 +45,7 @@ def is_verified_noop_execution(payload: AgentTaskExecutionResult) -> bool:
             evidence.get("codex_exit_code") == 0,
             evidence.get("codex_timed_out") is False,
             evidence.get("push_success") is False,
-            evidence.get("pr_number") is None,
-            evidence.get("pull_request") is None,
+            _has_safe_pull_request_reference(evidence),
             isinstance(evidence_packet_id, str) and bool(evidence_packet_id.strip()),
         )
     )
