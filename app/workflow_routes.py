@@ -1,5 +1,6 @@
 import hmac
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -13,6 +14,7 @@ from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
 from app.config import Settings, get_settings
 from app.event_store import event_store
+from app.operational_logging import log_polling_endpoint_response, serialized_json_bytes
 from app.review_queue import ReviewWorkItem, review_queue
 from app.storage import SQLiteStateStore
 from app.workflows import (
@@ -120,7 +122,8 @@ async def list_workflows(
     _: None = Depends(_require_workflow_read_access),
     settings: Settings = Depends(get_settings),
 ) -> WorkflowCollection:
-    return _build_request_workflow_collection(
+    started_at = perf_counter()
+    collection = _build_request_workflow_collection(
         request,
         settings,
         limit=limit,
@@ -128,6 +131,23 @@ async def list_workflows(
         workflow_filter=workflow_filter,
         recent_days=recent_days,
     )
+    pagination = collection.pagination
+    log_polling_endpoint_response(
+        endpoint="/api/v1/workflows",
+        duration_seconds=perf_counter() - started_at,
+        returned_count=pagination.returned if pagination is not None else len(collection.workflows),
+        total_count=pagination.total if pagination is not None else len(collection.workflows),
+        serialized_bytes=serialized_json_bytes(collection),
+        limit=pagination.limit if pagination is not None else limit,
+        offset=pagination.offset if pagination is not None else offset,
+        workflow_filter=(
+            pagination.filter.value
+            if pagination is not None
+            else WorkflowListFilter(workflow_filter).value
+        ),
+        recent_days=pagination.recent_days if pagination is not None else recent_days,
+    )
+    return collection
 
 
 def _build_request_workflow_collection(

@@ -1,5 +1,6 @@
 import hmac
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Annotated, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
@@ -64,12 +65,14 @@ from app.operational_logging import (
     log_hermes_dispatch_result,
     log_openai_review_attempted,
     log_openai_review_result,
+    log_polling_endpoint_response,
     log_queue_item_created,
     log_review_completed,
     log_review_processing_started,
     log_slack_issue_dispatch_result,
     log_webhook_accepted,
     log_webhook_duplicate_suppressed,
+    serialized_json_bytes,
 )
 from app.orchestrator_snapshot import (
     ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT,
@@ -513,10 +516,11 @@ async def orchestrator_snapshot(
     _: None = Depends(_require_debug_read_access),
     settings: Settings = Depends(get_settings),
 ) -> OrchestratorSnapshot:
+    started_at = perf_counter()
     storage = _storage()
     snapshot_limit = ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT if storage is not None else None
     items = _snapshot_review_items(limit=snapshot_limit)
-    return build_orchestrator_snapshot(
+    snapshot = build_orchestrator_snapshot(
         settings=settings,
         health=_debug_health(),
         queue=_review_queue_stats(items),
@@ -538,6 +542,27 @@ async def orchestrator_snapshot(
         events=_recent_events(limit=ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
         recent_failures=_recent_failures(items),
     )
+    snapshot_meta = snapshot.workforce.meta
+    returned_count = (
+        snapshot_meta.agents.returned
+        + snapshot_meta.issues.returned
+        + snapshot_meta.prs.returned
+        + snapshot_meta.events.returned
+    )
+    total_count = (
+        snapshot_meta.agents.total
+        + snapshot_meta.issues.total
+        + snapshot_meta.prs.total
+        + snapshot_meta.events.total
+    )
+    log_polling_endpoint_response(
+        endpoint="/api/v1/orchestrator/snapshot",
+        duration_seconds=perf_counter() - started_at,
+        returned_count=returned_count,
+        total_count=total_count,
+        serialized_bytes=serialized_json_bytes(snapshot),
+    )
+    return snapshot
 
 
 @app.get("/debug/repositories")

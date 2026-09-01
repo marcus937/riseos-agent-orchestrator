@@ -52,8 +52,53 @@ Structured log events include:
 - `github_writeback_attempted`
 - `github_writeback_succeeded`
 - `github_writeback_failed`
+- `mission_control_polling_response`
+
+Mission Control polling endpoints emit `mission_control_polling_response` with
+`endpoint`, `duration_ms`, `returned_count`, `total_count`, `serialized_bytes`,
+and page parameters when present. These logs intentionally exclude response
+payloads, prompt text, raw review packets, execution evidence, and secret
+values.
 
 Task dispatch status is returned on the process response with `task_dispatch_attempted`, `task_dispatch_success`, `task_dispatch_issue_number`, and `task_dispatch_error`.
+
+## Mission Control Polling
+
+Deterministic response-size budgets are enforced with production-shaped SQLite
+fixtures containing at least 500 historical review workflows, 500 AgentTask
+workflows, 300 PR review records, 500 lifecycle visibility records, and 50
+event-backed workflows:
+
+| Request | Serialized JSON budget |
+| --- | ---: |
+| `GET /api/v1/orchestrator/snapshot` | `280000` bytes |
+| `GET /api/v1/workflows` | `60000` bytes |
+| `GET /api/v1/workflows?limit=2` | `3500` bytes |
+
+The opt-in integration benchmark records wall-clock latency for the same
+requests without adding hardware-sensitive timing assertions to ordinary CI:
+
+```bash
+RUN_MISSION_CONTROL_POLLING_BENCHMARK=1 \
+MISSION_CONTROL_POLLING_BENCHMARK_ITERATIONS=10 \
+MISSION_CONTROL_POLLING_BENCHMARK_OUTPUT=/tmp/mission-control-polling-benchmark.json \
+pytest -q -s tests/test_mission_control_polling_performance.py::test_mission_control_polling_integration_benchmark_records_wall_clock_latency
+```
+
+Production verification after deploy:
+
+1. Poll `GET /api/v1/orchestrator/snapshot`, `GET /api/v1/workflows`, and
+   `GET /api/v1/workflows?limit=2` from Mission Control or with `curl`. Include
+   `X-Orchestrator-Admin-Token` when `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`.
+2. Watch `journalctl -u riseos-agent-orchestrator -f` and confirm one
+   `mission_control_polling_response` event per request.
+3. Confirm each event includes non-negative `duration_ms`, expected
+   `returned_count`/`total_count`, and `serialized_bytes` below the documented
+   budget for that request.
+4. Confirm log entries do not contain workflow payload bodies, prompt text,
+   raw review packets, execution evidence, or secret values.
+5. Use benchmark latency as production evidence only; ordinary CI validates
+   query shape and byte budgets, not wall-clock thresholds.
 
 ## DB Backup
 

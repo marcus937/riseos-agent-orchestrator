@@ -38,6 +38,40 @@ def log_event(event: str, **fields: Any) -> None:
     logger.info(json.dumps(payload, sort_keys=True, default=str))
 
 
+def serialized_json_bytes(value: Any) -> int:
+    if hasattr(value, "model_dump_json"):
+        payload = value.model_dump_json()
+    else:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return len(payload.encode("utf-8"))
+
+
+def log_polling_endpoint_response(
+    *,
+    endpoint: str,
+    duration_seconds: float,
+    returned_count: int,
+    total_count: int,
+    serialized_bytes: int,
+    limit: int | None = None,
+    offset: int | None = None,
+    workflow_filter: str | None = None,
+    recent_days: int | None = None,
+) -> None:
+    log_event(
+        "mission_control_polling_response",
+        endpoint=endpoint,
+        duration_ms=round(duration_seconds * 1000, 3),
+        returned_count=returned_count,
+        total_count=total_count,
+        serialized_bytes=serialized_bytes,
+        limit=limit,
+        offset=offset,
+        filter=workflow_filter,
+        recent_days=recent_days,
+    )
+
+
 def _with_workflow_chain_identity_fields(event: str, fields: dict[str, Any]) -> dict[str, Any]:
     if not _is_workflow_chain_trace_event(event, fields):
         return fields
