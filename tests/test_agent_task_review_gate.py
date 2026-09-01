@@ -135,6 +135,7 @@ def test_approved_review_completes_current_task_and_releases_successor() -> None
     assert store.get_agent_task(second_id).status == AgentTaskStatus.ASSIGNED
     assert bus.claimed == ["review-1"]
     assert bus.reviews[0]["decision"] == "approved"
+    assert bus.reviews[0]["risk_level"] == "low"
     assert len(bus.created) == 1
 
 
