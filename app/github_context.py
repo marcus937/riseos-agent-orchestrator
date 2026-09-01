@@ -2,6 +2,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
+from app.github_events import extract_commit_sha_from_comment
 from app.review_queue import ReviewWorkItem
 
 MAX_PATCH_FILES = 20
@@ -47,15 +48,18 @@ async def hydrate_github_context(
         return GitHubContextResult(github_context_error="repo_full_name is required for GitHub context hydration.")
 
     try:
-        if item.pr_number is not None and item.branch:
-            payload = await client.compare_branch(item.repo_full_name, base_branch, item.branch)
-            result = _context_from_payload(payload, source=f"compare {base_branch}...{item.branch}")
-            await _attach_runtime_evidence_context(item, client, result)
-            return result
-
+        # Agent-task reviews are commit-scoped. Prefer the immutable completion
+        # commit over a base...head comparison, which may include earlier workflow
+        # steps and can exceed the BB2 patch budget.
         if item.commit_sha:
             payload = await client.fetch_commit(item.repo_full_name, item.commit_sha)
             result = _context_from_payload(payload, source=f"commit {item.commit_sha}")
+            await _attach_runtime_evidence_context(item, client, result)
+            return result
+
+        if item.pr_number is not None and item.branch:
+            payload = await client.compare_branch(item.repo_full_name, base_branch, item.branch)
+            result = _context_from_payload(payload, source=f"compare {base_branch}...{item.branch}")
             await _attach_runtime_evidence_context(item, client, result)
             return result
     except Exception as exc:
@@ -121,12 +125,19 @@ async def _attach_runtime_evidence_context(
         result.runtime_evidence_error = str(exc)
         return
 
-    evidence, truncated = _runtime_evidence_context_from_comments(comments)
+    evidence, truncated = _runtime_evidence_context_from_comments(
+        comments,
+        commit_sha=item.commit_sha,
+    )
     result.runtime_evidence_context = evidence
     result.runtime_evidence_truncated = truncated
 
 
-def _runtime_evidence_context_from_comments(comments: Any) -> tuple[list[dict[str, Any]], bool]:
+def _runtime_evidence_context_from_comments(
+    comments: Any,
+    *,
+    commit_sha: str | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     if not isinstance(comments, list):
         return [], False
 
@@ -141,6 +152,8 @@ def _runtime_evidence_context_from_comments(comments: Any) -> tuple[list[dict[st
             continue
         body = comment.get("body")
         if not isinstance(body, str) or not _is_hermes_evidence_comment(body):
+            continue
+        if commit_sha and not _comment_matches_commit(body, commit_sha):
             continue
 
         remaining_total = MAX_HERMES_EVIDENCE_CHARS_TOTAL - total_chars
@@ -174,6 +187,17 @@ def _runtime_evidence_context_from_comments(comments: Any) -> tuple[list[dict[st
 
 def _is_hermes_evidence_comment(body: str) -> bool:
     return any(marker in body for marker in HERMES_EVIDENCE_MARKERS)
+
+
+def _comment_matches_commit(body: str, commit_sha: str) -> bool:
+    """Require immutable commit lineage for GitHub-sourced runtime evidence."""
+
+    evidence_sha = extract_commit_sha_from_comment(body)
+    if not evidence_sha:
+        return False
+    expected = commit_sha.strip().lower()
+    actual = evidence_sha.strip().lower()
+    return expected.startswith(actual) or actual.startswith(expected)
 
 
 def _login_from_comment(comment: dict[str, Any]) -> str | None:
