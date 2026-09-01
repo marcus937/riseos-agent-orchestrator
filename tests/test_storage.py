@@ -167,6 +167,7 @@ def test_event_workflow_summary_records_preserve_first_and_latest_activity(tmp_p
     assert summary.received_at == base + timedelta(minutes=3)
     assert summary.event_id == "event-2"
     assert summary.pr_number == 17
+    assert summary.workflow_event_count == 2
 
 
 def test_issue_dispatch_claim_is_single_owner(tmp_path) -> None:

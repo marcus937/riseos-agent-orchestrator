@@ -38,13 +38,19 @@ class WorkflowSummaryRecord(BaseModel):
     issue_number: int | None = None
     pr_number: int | None = None
     agent_task_id: str | None = None
+    branch: str | None = None
+    base_branch: str | None = None
+    commit_sha: str | None = None
     current_state: WorkflowState
+    current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
     assigned_agent: str | None = None
     hermes_job_id: str | None = None
     last_actor: str
     created_at: datetime
     updated_at: datetime
     last_activity_at: datetime
+    workflow_event_count: int = 0
+    workflow_events_truncated: bool = False
 
 
 class WorkflowRecord(WorkflowSummaryRecord):
@@ -228,9 +234,11 @@ def find_workflow(workflows: list[WorkflowRecord], workflow_id: str) -> Workflow
 
 
 def workflow_summary(workflow: WorkflowRecord) -> WorkflowSummaryRecord:
-    return WorkflowSummaryRecord.model_validate(
-        workflow.model_dump(exclude={"timeline", "route_history"})
-    )
+    timeline_count = len(workflow.timeline)
+    summary = workflow.model_dump(exclude={"timeline", "route_history"})
+    summary["workflow_event_count"] = timeline_count
+    summary["workflow_events_truncated"] = timeline_count > 0
+    return WorkflowSummaryRecord.model_validate(summary)
 
 
 def workflow_summaries(workflows: list[WorkflowRecord]) -> list[WorkflowSummaryRecord]:
@@ -257,12 +265,18 @@ def workflow_summary_from_review_item(item: ReviewWorkflowSummarySource) -> Work
         repo_full_name=item.repo_full_name,
         issue_number=item.issue_number,
         pr_number=item.pr_number,
+        branch=item.branch,
+        base_branch=item.base_branch,
+        commit_sha=item.commit_sha,
         current_state=current_state,
+        current_owner=projection.current_owner,
         assigned_agent=_assigned_agent(item, current_state),
         last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
         created_at=created_at,
         updated_at=updated_at,
         last_activity_at=timeline[-1].occurred_at if timeline else updated_at,
+        workflow_event_count=len(timeline),
+        workflow_events_truncated=bool(timeline),
     )
 
 
@@ -272,6 +286,7 @@ def workflow_summary_from_agent_task(
     current_state = _state_from_agent_task_status(task.status)
     lifecycle_events = getattr(task, "lifecycle_events", [])
     last_event = lifecycle_events[-1] if lifecycle_events else None
+    workflow_event_count = int(getattr(task, "workflow_event_count", 0) or len(lifecycle_events) or 1)
     activity_candidates = [_agent_task_last_activity_at(task)]
     if last_event is not None:
         activity_candidates.append(last_event.occurred_at)
@@ -282,12 +297,17 @@ def workflow_summary_from_agent_task(
         repo_full_name=task.repo_full_name,
         issue_number=task.issue_number,
         agent_task_id=task.task_id,
+        branch=task.branch,
+        commit_sha=task.commit_sha,
         current_state=current_state,
+        current_owner=_owner_from_agent_task_state(current_state),
         assigned_agent=task.target_agent,
         last_actor=_agent_task_last_actor(task, current_state, last_event),
         created_at=task.created_at,
         updated_at=task.updated_at,
         last_activity_at=last_activity_at,
+        workflow_event_count=workflow_event_count,
+        workflow_events_truncated=workflow_event_count > 0,
     )
 
 
@@ -298,6 +318,13 @@ def workflow_summary_from_event_records(
     projection = build_event_records_workflow_projection(ordered_records)
     current_state = projection.canonical_workflow_state or WorkflowState.CREATED
     last_record = ordered_records[-1]
+    workflow_event_count = max(
+        (
+            int(getattr(record, "workflow_event_count", len(projection.workflow_events)))
+            for record in ordered_records
+        ),
+        default=len(projection.workflow_events),
+    )
     first_received_at = min(
         (getattr(record, "first_received_at", record.received_at) for record in ordered_records),
         key=_as_utc,
@@ -308,12 +335,17 @@ def workflow_summary_from_event_records(
         repo_full_name=_latest_record_value(ordered_records, "repo_full_name"),
         issue_number=_latest_record_value(ordered_records, "issue_number"),
         pr_number=_latest_record_value(ordered_records, "pr_number"),
+        branch=_latest_record_value(ordered_records, "branch"),
+        commit_sha=_latest_record_value(ordered_records, "commit_sha"),
         current_state=current_state,
+        current_owner=projection.current_owner,
         assigned_agent=_assigned_agent(None, current_state),
         last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
         created_at=first_received_at,
         updated_at=last_record.received_at,
         last_activity_at=last_record.received_at,
+        workflow_event_count=workflow_event_count,
+        workflow_events_truncated=workflow_event_count > 0,
     )
 
 
@@ -328,12 +360,18 @@ def _workflow_from_item(item: ReviewWorkItem) -> WorkflowRecord:
         repo_full_name=item.repo_full_name,
         issue_number=item.issue_number,
         pr_number=item.pr_number,
+        branch=item.branch,
+        base_branch=item.base_branch,
+        commit_sha=item.commit_sha,
         current_state=current_state,
+        current_owner=projection.current_owner,
         assigned_agent=_assigned_agent(item, current_state),
         last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
         created_at=created_at,
         updated_at=updated_at,
         last_activity_at=timeline[-1].occurred_at if timeline else updated_at,
+        workflow_event_count=len(timeline),
+        workflow_events_truncated=False,
         timeline=timeline,
         route_history=[_route_history_entry(event) for event in timeline],
     )
@@ -349,12 +387,17 @@ def _workflow_from_agent_task(task: AgentTask) -> WorkflowRecord:
         repo_full_name=task.repo_full_name,
         issue_number=task.issue_number,
         agent_task_id=task.task_id,
+        branch=task.branch,
+        commit_sha=task.commit_sha,
         current_state=current_state,
+        current_owner=_owner_from_agent_task_state(current_state),
         assigned_agent=task.target_agent,
         last_actor=last_event.actor or WorkflowOwner.ORCHESTRATOR.value,
         created_at=task.created_at,
         updated_at=task.updated_at,
         last_activity_at=last_event.occurred_at,
+        workflow_event_count=len(timeline),
+        workflow_events_truncated=False,
         timeline=timeline,
         route_history=[_route_history_entry(event) for event in timeline],
     )
@@ -373,12 +416,17 @@ def _workflow_from_events(records: list[EventRecord]) -> WorkflowRecord:
         repo_full_name=_latest_record_value(ordered_records, "repo_full_name"),
         issue_number=_latest_record_value(ordered_records, "issue_number"),
         pr_number=_latest_record_value(ordered_records, "pr_number"),
+        branch=_latest_record_value(ordered_records, "branch"),
+        commit_sha=_latest_record_value(ordered_records, "commit_sha"),
         current_state=current_state,
+        current_owner=projection.current_owner,
         assigned_agent=_assigned_agent(None, current_state),
         last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
         created_at=first_record.received_at,
         updated_at=last_record.received_at,
         last_activity_at=last_record.received_at,
+        workflow_event_count=len(timeline),
+        workflow_events_truncated=False,
         timeline=timeline,
         route_history=[_route_history_entry(event) for event in timeline],
     )
@@ -608,7 +656,11 @@ def _route_history_entry(event: WorkflowEvent) -> str:
     return f"{event.actor or event.owner.value}: {event.new_state or event.canonical_state}"
 
 
-def _matches_workflow_filter(workflow: WorkflowRecord, workflow_filter: WorkflowListFilter, cutoff: datetime) -> bool:
+def _matches_workflow_filter(
+    workflow: WorkflowRecord | WorkflowSummaryRecord,
+    workflow_filter: WorkflowListFilter,
+    cutoff: datetime,
+) -> bool:
     active = workflow.current_state not in _TERMINAL_STATES
     recent = _as_utc(workflow.last_activity_at) >= cutoff
     if workflow_filter == WorkflowListFilter.ACTIVE:

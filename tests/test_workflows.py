@@ -238,8 +238,13 @@ def test_workflow_endpoints_return_canonical_record_and_timeline() -> None:
     workflow = workflows[0]
     assert workflow["workflow_id"].startswith("wf-")
     assert workflow["repo_full_name"] == "riseos/example"
+    assert workflow["branch"] == "agent-integration"
+    assert workflow["commit_sha"] == "abc123"
     assert workflow["current_state"] == "CIRCUIT_WORKING"
+    assert workflow["current_owner"] == "Circuit"
     assert workflow["last_actor"] == "Circuit"
+    assert workflow["workflow_event_count"] == 1
+    assert workflow["workflow_events_truncated"] is True
     assert "timeline" not in workflow
     assert "route_history" not in workflow
 
@@ -249,6 +254,8 @@ def test_workflow_endpoints_return_canonical_record_and_timeline() -> None:
     assert detail.status_code == 200
     detail_body = detail.json()
     assert detail_body["workflow_id"] == workflow["workflow_id"]
+    assert detail_body["workflow_event_count"] == 1
+    assert detail_body["workflow_events_truncated"] is False
     assert detail_body["timeline"][0]["event_type"] == "workflow.lifecycle.changed"
     assert detail_body["timeline"][0]["state"] == "CIRCUIT_IN_PROGRESS"
     assert detail_body["timeline"][0]["canonical_state"] == "CIRCUIT_WORKING"
@@ -542,15 +549,37 @@ def test_workflow_endpoint_uses_summary_records_without_detail_payloads(tmp_path
     now = datetime.now(UTC)
     review_detail_sentinel = "runtime-context-sentinel-" + ("x" * 10_000)
     task_detail_sentinel = "agent-task-detail-sentinel-" + ("x" * 10_000)
+    secret_sentinel = "secret-token-must-not-leak"
+    prompt_sentinel = "review-prompt-must-not-leak"
+    raw_packet_sentinel = "raw-review-packet-must-not-leak"
+    workflow_chain_sentinel = "workflow-chain-object-must-not-repeat"
     review_item = _review_item("compact-review", now)
-    review_item.runtime_validation_context = {"large_payload": review_detail_sentinel}
+    review_item.runtime_validation_context = {
+        "large_payload": review_detail_sentinel,
+        "secret": secret_sentinel,
+        "review_dispatch": {
+            "prompt": prompt_sentinel,
+            "review_packet": {"raw": raw_packet_sentinel},
+            "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+        },
+        "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+    }
     review_item.agent_bus_dispatch_error = review_detail_sentinel
     storage.save_review_work_item(review_item)
     task = _agent_task("compact-agent", AgentTaskStatus.QUEUED, now + timedelta(minutes=1))
     task.body = task_detail_sentinel
     task.instructions = [task_detail_sentinel]
-    task.execution_evidence = {"large_payload": task_detail_sentinel}
-    task.lifecycle_events[-1].metadata = {"large_payload": task_detail_sentinel}
+    task.execution_evidence = {
+        "large_payload": task_detail_sentinel,
+        "secret": secret_sentinel,
+        "_workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+    }
+    task.lifecycle_events[-1].metadata = {
+        "large_payload": task_detail_sentinel,
+        "prompt": prompt_sentinel,
+        "review_packet": {"raw": raw_packet_sentinel},
+        "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+    }
     task_store.save_agent_task(task)
     app.state.storage = storage
     app.state.agent_task_store = task_store
@@ -565,8 +594,32 @@ def test_workflow_endpoint_uses_summary_records_without_detail_payloads(tmp_path
     ]
     assert all("timeline" not in workflow for workflow in body["workflows"])
     assert all("route_history" not in workflow for workflow in body["workflows"])
+    assert body["workflows"][0]["branch"] is None
+    assert body["workflows"][0]["current_owner"] == "Orchestrator"
+    assert body["workflows"][0]["workflow_event_count"] == 2
+    assert body["workflows"][0]["workflow_events_truncated"] is True
+    assert body["workflows"][1]["branch"] == "agent-compact-review"
+    assert body["workflows"][1]["current_owner"] == "Circuit"
+    assert body["workflows"][1]["workflow_event_count"] == 1
+    assert body["workflows"][1]["workflow_events_truncated"] is True
     assert review_detail_sentinel not in response.text
     assert task_detail_sentinel not in response.text
+    assert secret_sentinel not in response.text
+    assert prompt_sentinel not in response.text
+    assert raw_packet_sentinel not in response.text
+    assert workflow_chain_sentinel not in response.text
+
+    detail = client.get("/api/v1/workflows/wf-agent-task-compact-agent")
+    timeline = client.get("/api/v1/workflows/wf-agent-task-compact-agent/timeline")
+
+    assert detail.status_code == 200
+    assert timeline.status_code == 200
+    assert detail.json()["workflow_event_count"] == 2
+    assert detail.json()["workflow_events_truncated"] is False
+    assert task_detail_sentinel in detail.text
+    assert prompt_sentinel in timeline.text
+    assert raw_packet_sentinel in timeline.text
+    assert workflow_chain_sentinel in timeline.text
 
 
 def test_workflow_endpoint_bounded_sqlite_pages_across_sources_by_activity(tmp_path) -> None:
@@ -1012,6 +1065,12 @@ def test_workflow_endpoint_bounded_sqlite_event_summary_keeps_created_at_without
     workflow = response.json()["workflows"][0]
     assert workflow["workflow_id"] == "wf-orch-summary-created-at"
     assert workflow["current_state"] == "BB2_REVIEWING"
+    assert workflow["current_owner"] == "BB2"
+    assert workflow["branch"] == "agent-summary"
+    assert workflow["commit_sha"] == "summary-sha"
+    assert workflow["pr_number"] == 17
+    assert workflow["workflow_event_count"] == 2
+    assert workflow["workflow_events_truncated"] is True
     assert datetime.fromisoformat(workflow["created_at"].replace("Z", "+00:00")) == base
     assert datetime.fromisoformat(workflow["updated_at"].replace("Z", "+00:00")) == base + timedelta(minutes=2)
     assert datetime.fromisoformat(workflow["last_activity_at"].replace("Z", "+00:00")) == base + timedelta(minutes=2)
@@ -1020,6 +1079,8 @@ def test_workflow_endpoint_bounded_sqlite_event_summary_keeps_created_at_without
 
     detail = client.get("/api/v1/workflows/wf-orch-summary-created-at")
     assert detail.status_code == 200
+    assert detail.json()["workflow_event_count"] == 2
+    assert detail.json()["workflow_events_truncated"] is False
     assert [event["source"] for event in detail.json()["timeline"]] == [
         "github_webhook",
         "github_webhook",

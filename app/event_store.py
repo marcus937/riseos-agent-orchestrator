@@ -33,6 +33,7 @@ class EventRecord(BaseModel):
 class EventWorkflowSummary(EventRecord):
     workflow_id: str
     first_received_at: datetime
+    workflow_event_count: int = 1
 
 
 class DebugHealth(BaseModel):

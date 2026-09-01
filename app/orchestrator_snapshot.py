@@ -105,6 +105,11 @@ class WorkflowLifecycleVisibilitySnapshot(WorkflowFields):
     item_id: str
     repo_full_name: str | None = None
     event_type: GitHubEventType
+    branch: str | None = None
+    base_branch: str | None = None
+    commit_sha: str | None = None
+    issue_number: int | None = None
+    pr_number: int | None = None
     status: ReviewWorkItemStatus
     lifecycle_stage: ReviewLifecycleStage
     queued_at: datetime
@@ -394,6 +399,11 @@ def _workflow_lifecycle_snapshot(
 ) -> WorkflowLifecycleVisibilitySnapshot:
     matching_item = workflow_items.get(item.item_id)
     workflow_fields = matching_item.model_dump(include=set(WorkflowFields.model_fields)) if matching_item else {}
+    identity_fields = (
+        matching_item.model_dump(include={"branch", "base_branch", "commit_sha", "issue_number", "pr_number"})
+        if matching_item
+        else {}
+    )
     last_error, last_error_truncated = _bounded_string(item.last_error)
     agent_bus_dispatch_error, agent_bus_dispatch_error_truncated = _bounded_string(item.agent_bus_dispatch_error)
     return WorkflowLifecycleVisibilitySnapshot.model_validate(
@@ -401,6 +411,7 @@ def _workflow_lifecycle_snapshot(
             "item_id": item.item_id,
             "repo_full_name": item.repo_full_name,
             "event_type": item.event_type,
+            **identity_fields,
             "status": item.status,
             "lifecycle_stage": item.lifecycle_stage,
             "queued_at": item.queued_at,

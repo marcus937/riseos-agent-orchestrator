@@ -126,13 +126,14 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 - Snapshot workflow summary counts use aggregate count queries and the same
   event-backed workflow de-duplication identity as `/api/v1/workflows`, so raw
   correlated event rows do not inflate dashboard counts.
-- Workforce records preserve compact workflow summary fields, including `workflow_id`, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
+- Workforce records preserve compact workflow summary fields, including `workflow_id`, repository, issue/PR number, branch/base/commit refs, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
 - Workforce records intentionally do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
 - Top-level `workflows` counts include review work items, AgentTask workflows, and de-duplicated event-backed workflows using summary/count records only.
 - `labels` returns at most 20 labels per work item while preserving `label_count` and `labels_truncated`.
 - `recent_failures` returns at most 20 records.
 - Error strings in workforce records and `recent_failures` are capped at 2048 characters and expose a matching `*_truncated` boolean.
 - Full `runtime_validation_context` payloads are not included in the snapshot. Runtime status remains available through bounded fields such as `runtime_validation_id`, `runtime_validation_status`, `runtime_validation_digest`, and `runtime_validation_completed_at`.
+- Prompt text, raw review packets, raw execution evidence, repeated `workflow_chain` objects, and unbounded diagnostic bodies are detail/evidence data and are not part of snapshot workforce summaries.
 
 Collection metadata uses this shape:
 

@@ -136,6 +136,7 @@ class AgentTaskWorkflowSummary(BaseModel):
     branch: str | None = None
     commit_sha: str | None = None
     last_actor: str | None = None
+    workflow_event_count: int = 1
 
 
 class AgentTaskStore(Protocol):
@@ -301,6 +302,7 @@ class SQLiteAgentTaskStore:
                     changed_files TEXT NOT NULL DEFAULT '[]',
                     execution_evidence TEXT NOT NULL DEFAULT '{}',
                     lifecycle_events TEXT NOT NULL,
+                    lifecycle_event_count INTEGER NOT NULL DEFAULT 1,
                     last_actor TEXT
                 )
                 """
@@ -352,8 +354,9 @@ class SQLiteAgentTaskStore:
                     changed_files,
                     execution_evidence,
                     lifecycle_events,
+                    lifecycle_event_count,
                     last_actor
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -389,6 +392,7 @@ class SQLiteAgentTaskStore:
                     json.dumps(task.changed_files),
                     json.dumps(task.execution_evidence),
                     json.dumps([event.model_dump(mode="json") for event in task.lifecycle_events]),
+                    _agent_task_lifecycle_event_count(task),
                     _last_agent_task_lifecycle_actor(task),
                 ),
             )
@@ -484,7 +488,8 @@ class SQLiteAgentTaskStore:
                     cancelled_at,
                     branch,
                     commit_sha,
-                    last_actor
+                    last_actor,
+                    COALESCE(NULLIF(lifecycle_event_count, 0), 1) AS workflow_event_count
                 FROM agent_tasks
                 {where_sql}
                 ORDER BY {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
@@ -603,6 +608,7 @@ def agent_task_workflow_summary(task: AgentTask) -> AgentTaskWorkflowSummary:
         branch=task.branch,
         commit_sha=task.commit_sha,
         last_actor=_last_agent_task_lifecycle_actor(task),
+        workflow_event_count=_agent_task_lifecycle_event_count(task),
     )
 
 
@@ -934,6 +940,7 @@ _AGENT_TASK_EXTRA_COLUMNS = [
     ("commit_sha", "TEXT"),
     ("changed_files", "TEXT NOT NULL DEFAULT '[]'"),
     ("execution_evidence", "TEXT NOT NULL DEFAULT '{}'"),
+    ("lifecycle_event_count", "INTEGER NOT NULL DEFAULT 1"),
     ("last_actor", "TEXT"),
 ]
 
@@ -955,3 +962,7 @@ max(
 
 def _last_agent_task_lifecycle_actor(task: AgentTask) -> str | None:
     return task.lifecycle_events[-1].actor if task.lifecycle_events else None
+
+
+def _agent_task_lifecycle_event_count(task: AgentTask) -> int:
+    return max(len(task.lifecycle_events), 1)

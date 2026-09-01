@@ -110,6 +110,12 @@ Query parameters:
 The `workflows` array is intentionally compact for polling clients. It omits
 `timeline` and `route_history`; fetch `GET /api/v1/workflows/{workflow_id}` or
 `GET /api/v1/workflows/{workflow_id}/timeline` when a view needs full detail.
+Summary records keep only the scalar fields JMC needs for cards and tables:
+stable workflow/correlation/task identifiers, repository and issue/PR numbers,
+branch/base/commit refs, canonical state, current owner, assigned agent,
+timestamps, and `workflow_event_count`/`workflow_events_truncated`.
+They do not include prompts, raw review packets, execution evidence, embedded
+workflow-chain objects, or long diagnostic bodies.
 Correlated GitHub event records are collapsed into one event-backed workflow;
 event-backed workflows are de-duplicated against review work items by issue/PR
 subject when present, by branch and commit for ref-only events, or by fallback
@@ -143,13 +149,20 @@ bounded offset window.
       "repo_full_name": "owner/repo",
       "issue_number": 42,
       "pr_number": 17,
+      "agent_task_id": null,
+      "branch": "feature/example",
+      "base_branch": "main",
+      "commit_sha": "abc123",
       "current_state": "BB2_REVIEWING",
+      "current_owner": "BB2",
       "assigned_agent": "circuit-forge",
       "hermes_job_id": null,
       "last_actor": "BB2",
       "created_at": "...",
       "updated_at": "...",
-      "last_activity_at": "..."
+      "last_activity_at": "...",
+      "workflow_event_count": 4,
+      "workflow_events_truncated": true
     }
   ],
   "pagination": {
@@ -170,7 +183,9 @@ bounded offset window.
 ### `GET /api/v1/workflows/{workflow_id}`
 
 Returns one full workflow record, including `timeline` and `route_history`, or
-`404` when the workflow is unknown.
+`404` when the workflow is unknown. Full workflow records keep the same scalar
+fields as list summaries, but `workflow_events_truncated` is false because the
+timeline is included in the detail payload.
 
 ### `GET /api/v1/workflows/{workflow_id}/timeline`
 
@@ -223,6 +238,10 @@ Workforce entries include both legacy and canonical values:
 Snapshot v3 workforce entries omit `workflow_events` and `workflow_state_history`.
 These fields are dashboard summaries. Detailed UI surfaces should use the
 workflow endpoints above.
+Snapshot workforce summaries also omit prompts, raw review packets, execution
+evidence, repeated `workflow_chain` objects, and unbounded diagnostic text.
+Where diagnostics are retained for current JMC summary panels, they are capped
+and paired with a truncation flag.
 
 Snapshot `workflows` counts use the same normalized summary semantics as the
 workflow list: review work items, AgentTask workflows, and de-duplicated

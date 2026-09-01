@@ -160,6 +160,8 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
     assert workforce["agents"][0]["item_id"]
     assert workforce["agents"][0]["workflow_id"].startswith("wf-")
     assert workforce["agents"][0]["repo_full_name"] == "riseos/example"
+    assert workforce["agents"][0]["branch"] == "agent-integration"
+    assert workforce["agents"][0]["commit_sha"] == "abc123"
     assert workforce["agents"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
     assert workforce["agents"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
     assert workforce["agents"][0]["current_owner"] == "Circuit"
@@ -223,6 +225,10 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     client = client_with_secret()
     huge_historical_payload = "large-runtime-context-" + ("x" * 100_000)
     huge_error = "review failed: " + ("e" * (ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT + 100))
+    secret_sentinel = "snapshot-secret-must-not-leak"
+    prompt_sentinel = "snapshot-prompt-must-not-leak"
+    raw_packet_sentinel = "snapshot-raw-review-packet-must-not-leak"
+    workflow_chain_sentinel = "snapshot-workflow-chain-object-must-not-repeat"
     labels = [f"label-{index}" for index in range(ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT + 5)]
     now = datetime.now(UTC)
 
@@ -240,7 +246,16 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
             labels=labels,
             status=ReviewWorkItemStatus.BLOCKED,
             lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
-            runtime_validation_context={"historical_payload": huge_historical_payload},
+            runtime_validation_context={
+                "historical_payload": huge_historical_payload,
+                "secret": secret_sentinel,
+                "review_dispatch": {
+                    "prompt": prompt_sentinel,
+                    "review_packet": {"raw": raw_packet_sentinel},
+                    "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+                },
+                "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+            },
             failure_count=1,
             last_failure_at=now,
             last_error=huge_error,
@@ -285,6 +300,71 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     assert f"label-{ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT}" not in response.text
     assert "historical_payload" not in response.text
     assert huge_historical_payload not in response.text
+    assert secret_sentinel not in response.text
+    assert prompt_sentinel not in response.text
+    assert raw_packet_sentinel not in response.text
+    assert workflow_chain_sentinel not in response.text
+
+
+def test_orchestrator_snapshot_v3_is_materially_smaller_than_v2_shape() -> None:
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    workflow_chain_sentinel = "legacy-v2-workflow-chain-repeat"
+    raw_packet_sentinel = "legacy-v2-review-packet-repeat"
+    diagnostic_sentinel = "legacy-v2-diagnostic-text-" + ("x" * 512)
+
+    for index in range(ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT):
+        review_queue.add_if_absent(
+            ReviewWorkItem(
+                id=f"production-shaped-{index}",
+                created_at=now - timedelta(minutes=index + 4),
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.PULL_REQUEST,
+                branch=f"feature/production-shaped-{index}",
+                base_branch="main",
+                commit_sha=f"sha-{index}",
+                pr_number=index + 1,
+                status=ReviewWorkItemStatus.BLOCKED,
+                lifecycle_stage=ReviewLifecycleStage.REVIEW_FAILED,
+                worker_claimed_at=now - timedelta(minutes=index + 3),
+                review_started_at=now - timedelta(minutes=index + 2),
+                openai_review_attempted_at=now - timedelta(minutes=index + 1),
+                openai_review_completed_at=now - timedelta(seconds=index + 30),
+                failure_count=1,
+                last_failure_at=now - timedelta(seconds=index),
+                last_error=diagnostic_sentinel,
+                runtime_validation_context={
+                    "review_dispatch": {
+                        "prompt": "legacy prompt",
+                        "review_packet": {"raw": raw_packet_sentinel},
+                    },
+                    "workflow_chain": {"workflow_chain_id": workflow_chain_sentinel},
+                },
+            )
+        )
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    v3_payload = response.json()
+    v2_payload = _legacy_v2_snapshot_shape(v3_payload, diagnostic_sentinel, workflow_chain_sentinel)
+    v3_size = len(json.dumps(v3_payload, sort_keys=True))
+    v2_size = len(json.dumps(v2_payload, sort_keys=True))
+
+    assert v3_payload["schema_version"] == "orchestrator.snapshot.v3"
+    assert v3_payload["workforce"]["meta"]["agents"]["returned"] == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert v3_payload["workforce"]["agents"][0]["workflow_id"]
+    assert v3_payload["workforce"]["agents"][0]["canonical_workflow_state"]
+    assert v3_payload["workforce"]["agents"][0]["current_owner"]
+    assert v3_payload["workforce"]["agents"][0]["workflow_event_count"] >= 1
+    assert v3_payload["workforce"]["agents"][0]["workflow_events_truncated"] is True
+    for collection_name in ("agents", "issues", "prs", "events"):
+        assert all("workflow_events" not in record for record in v3_payload["workforce"][collection_name])
+        assert all("workflow_state_history" not in record for record in v3_payload["workforce"][collection_name])
+    assert raw_packet_sentinel not in response.text
+    assert workflow_chain_sentinel not in response.text
+    assert v3_size < int(v2_size * 0.6)
 
 
 def test_orchestrator_snapshot_memory_event_meta_uses_total_before_payload_limit() -> None:
@@ -649,6 +729,49 @@ def test_orchestrator_snapshot_runtime_status_does_not_expose_secret_values() ->
         "dgx_dispatch_enabled",
         "dgx_configured",
     }
+
+
+def _legacy_v2_snapshot_shape(
+    v3_payload: dict[str, object],
+    diagnostic_sentinel: str,
+    workflow_chain_sentinel: str,
+) -> dict[str, object]:
+    v2_payload = json.loads(json.dumps(v3_payload))
+    v2_payload["schema_version"] = "orchestrator.snapshot.v2"
+    workforce = v2_payload["workforce"]
+    for collection_name in ("agents", "issues", "prs", "events"):
+        for record in workforce[collection_name]:
+            events = _legacy_v2_workflow_events(record, diagnostic_sentinel, workflow_chain_sentinel)
+            record["workflow_events"] = events
+            record["workflow_state_history"] = events
+    return v2_payload
+
+
+def _legacy_v2_workflow_events(
+    record: dict[str, object],
+    diagnostic_sentinel: str,
+    workflow_chain_sentinel: str,
+) -> list[dict[str, object]]:
+    event_count = max(int(record.get("workflow_event_count") or 1), 8)
+    return [
+        {
+            "event_type": "workflow.lifecycle.changed",
+            "state": record.get("workflow_state"),
+            "canonical_state": record.get("canonical_workflow_state"),
+            "previous_state": record.get("workflow_state"),
+            "new_state": record.get("canonical_workflow_state"),
+            "actor": record.get("current_owner"),
+            "timestamp": record.get("queued_at") or record.get("created_at") or record.get("received_at"),
+            "metadata": {
+                "diagnostic_text": diagnostic_sentinel,
+                "workflow_chain": {
+                    "workflow_chain_id": workflow_chain_sentinel,
+                    "workflow_step": f"step-{index}",
+                },
+            },
+        }
+        for index in range(event_count)
+    ]
 
 
 def _agent_task(

@@ -252,16 +252,75 @@ class SQLiteStateStore:
                 SELECT
                     latest.workflow_id,
                     latest.first_received_at,
+                    latest.workflow_event_count,
                     latest.event_id,
                     latest.github_event,
                     latest.diagnostic_stage,
                     COALESCE(latest.correlation_id, identity.correlation_id) AS correlation_id,
                     COALESCE(latest.correlation_key, identity.correlation_key) AS correlation_key,
-                    COALESCE(latest.repo_full_name, identity.repo_full_name) AS repo_full_name,
-                    COALESCE(latest.branch, identity.branch) AS branch,
-                    COALESCE(latest.commit_sha, identity.commit_sha) AS commit_sha,
-                    COALESCE(latest.issue_number, identity.issue_number) AS issue_number,
-                    COALESCE(latest.pr_number, identity.pr_number) AS pr_number,
+                    COALESCE(
+                        latest.repo_full_name,
+                        identity.repo_full_name,
+                        (
+                            SELECT candidate.repo_full_name
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.repo_full_name IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS repo_full_name,
+                    COALESCE(
+                        latest.branch,
+                        (
+                            SELECT candidate.branch
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.branch IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS branch,
+                    COALESCE(
+                        latest.commit_sha,
+                        (
+                            SELECT candidate.commit_sha
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.commit_sha IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS commit_sha,
+                    COALESCE(
+                        identity.issue_number,
+                        latest.issue_number,
+                        (
+                            SELECT candidate.issue_number
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.issue_number IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS issue_number,
+                    COALESCE(
+                        identity.pr_number,
+                        latest.pr_number,
+                        (
+                            SELECT candidate.pr_number
+                            FROM ranked_event_workflows AS candidate
+                            WHERE candidate.workflow_id = latest.workflow_id
+                              AND candidate.pr_number IS NOT NULL
+                            ORDER BY candidate.received_at DESC,
+                                     candidate.event_id DESC
+                            LIMIT 1
+                        )
+                    ) AS pr_number,
                     latest.pr_merged,
                     latest.received_at,
                     latest.raw_action
@@ -1406,7 +1465,10 @@ ranked_event_workflows AS (
         ) AS workflow_identity_rank,
         MIN(e.received_at) OVER (
             PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
-        ) AS first_received_at
+        ) AS first_received_at,
+        COUNT(*) OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+        ) AS workflow_event_count
     FROM event_records AS e
     WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
 )
