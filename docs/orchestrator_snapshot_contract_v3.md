@@ -120,6 +120,9 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 - `workforce.agents`, `workforce.issues`, and `workforce.prs` return at most 50 records each.
 - `workforce.events` returns at most 25 records.
 - SQLite-backed snapshots use limited compact collection queries and separate aggregate totals for collection metadata.
+- SQLite-backed snapshots merge AgentTask workflow counts only from a matching
+  SQLite AgentTask store; in-memory AgentTask state is ignored when persisted
+  storage is active.
 - Workforce records preserve compact workflow summary fields, including `workflow_id`, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
 - Workforce records intentionally do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
 - Top-level `workflows` counts include review work items, AgentTask workflows, and de-duplicated event-backed workflows using summary/count records only.

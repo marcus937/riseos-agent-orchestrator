@@ -112,6 +112,10 @@ and `pagination.unfiltered_total` count normalized workflows, not raw event rows
 Correlated event workflow summaries preserve the first event as `created_at`
 and the latest event as `updated_at`/`last_activity_at`; full event sequences
 remain detail-only.
+When SQLite storage is active, AgentTask workflows are merged into the list only
+from a matching SQLite AgentTask store. In-memory AgentTask stores are ignored
+for storage-backed polling so global process state cannot inflate or leak into
+the persisted workflow collection.
 `pagination.truncated` means more filtered workflows exist beyond the returned
 page. `pagination.has_next` is true only when `next_offset` is within the
 bounded offset window.

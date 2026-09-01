@@ -491,6 +491,47 @@ def test_orchestrator_snapshot_storage_path_does_not_count_global_agent_tasks(tm
     assert detail_sentinel not in response.text
 
 
+def test_orchestrator_snapshot_storage_path_ignores_in_memory_agent_task_store(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SnapshotCompactSQLiteStateStore(db_path)
+    persisted_task_store = SQLiteAgentTaskStore(db_path)
+    client = client_with_secret()
+    now = datetime.now(UTC)
+    detail_sentinel = "state-agent-task-detail-" + ("x" * 10_000)
+    persisted_detail_sentinel = "persisted-agent-task-detail-" + ("x" * 10_000)
+
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="persisted-snapshot-review",
+            created_at=now,
+            updated_at=now,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            pr_number=17,
+        )
+    )
+    persisted_task_store.save_agent_task(
+        _agent_task("persisted-agent", AgentTaskStatus.QUEUED, now, persisted_detail_sentinel)
+    )
+    agent_task_store.save_agent_task(
+        _agent_task("in-memory-agent", AgentTaskStatus.QUEUED, now, detail_sentinel)
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = agent_task_store
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["workflows"] == {
+        "active": 2,
+        "blocked": 0,
+        "reviewing": 0,
+        "verified": 0,
+    }
+    assert detail_sentinel not in response.text
+    assert persisted_detail_sentinel not in response.text
+
+
 def test_orchestrator_snapshot_limits_before_work_item_projection(monkeypatch) -> None:
     client = client_with_secret()
     now = datetime.now(UTC)
