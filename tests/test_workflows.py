@@ -8,6 +8,7 @@ from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
     AgentTaskLifecycleEvent,
+    AgentTaskWorkflowSummary,
     AgentTaskStatus,
     SQLiteAgentTaskStore,
     agent_task_store,
@@ -69,6 +70,24 @@ class NoFullWorkflowListSQLiteStateStore(SQLiteStateStore):
 class NoFullWorkflowListSQLiteAgentTaskStore(SQLiteAgentTaskStore):
     def list_agent_tasks(self) -> list[AgentTask]:
         raise AssertionError("GET /api/v1/workflows must not hydrate all agent tasks")
+
+
+class SummaryOnlyWorkflowListSQLiteStateStore(NoFullWorkflowListSQLiteStateStore):
+    def _review_work_item_from_row(self, row):
+        row_keys = set(dict(row))
+        assert "runtime_validation_context" not in row_keys
+        assert "agent_bus_dispatch_error" not in row_keys
+        return super()._review_work_item_from_row(row)
+
+
+class SummaryOnlyWorkflowListSQLiteAgentTaskStore(NoFullWorkflowListSQLiteAgentTaskStore):
+    def list_agent_task_workflow_summaries_for_collection(self, *args, **kwargs) -> list[AgentTaskWorkflowSummary]:
+        summaries = super().list_agent_task_workflow_summaries_for_collection(*args, **kwargs)
+        assert all(isinstance(summary, AgentTaskWorkflowSummary) for summary in summaries)
+        assert all(not hasattr(summary, "body") for summary in summaries)
+        assert all(not hasattr(summary, "execution_evidence") for summary in summaries)
+        assert all(not hasattr(summary, "lifecycle_events") for summary in summaries)
+        return summaries
 
 
 def signed_headers(secret: str, event: str, payload: bytes) -> dict[str, str]:
@@ -372,6 +391,41 @@ def test_workflow_endpoint_uses_bounded_sqlite_queries_for_collection(tmp_path) 
         "filter": "all",
         "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
     }
+
+
+def test_workflow_endpoint_uses_summary_records_without_detail_payloads(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = SummaryOnlyWorkflowListSQLiteStateStore(db_path)
+    task_store = SummaryOnlyWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    review_detail_sentinel = "runtime-context-sentinel-" + ("x" * 10_000)
+    task_detail_sentinel = "agent-task-detail-sentinel-" + ("x" * 10_000)
+    review_item = _review_item("compact-review", now)
+    review_item.runtime_validation_context = {"large_payload": review_detail_sentinel}
+    review_item.agent_bus_dispatch_error = review_detail_sentinel
+    storage.save_review_work_item(review_item)
+    task = _agent_task("compact-agent", AgentTaskStatus.QUEUED, now + timedelta(minutes=1))
+    task.body = task_detail_sentinel
+    task.instructions = [task_detail_sentinel]
+    task.execution_evidence = {"large_payload": task_detail_sentinel}
+    task.lifecycle_events[-1].metadata = {"large_payload": task_detail_sentinel}
+    task_store.save_agent_task(task)
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-agent-task-compact-agent",
+        "wf-compact-review",
+    ]
+    assert all("timeline" not in workflow for workflow in body["workflows"])
+    assert all("route_history" not in workflow for workflow in body["workflows"])
+    assert review_detail_sentinel not in response.text
+    assert task_detail_sentinel not in response.text
 
 
 def test_workflow_endpoint_bounded_sqlite_recent_filter_counts_review_items(tmp_path) -> None:

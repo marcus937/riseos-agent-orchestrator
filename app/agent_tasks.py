@@ -116,6 +116,28 @@ class AgentTask(BaseModel):
     lifecycle_events: list[AgentTaskLifecycleEvent] = Field(default_factory=list)
 
 
+class AgentTaskWorkflowSummary(BaseModel):
+    task_id: str
+    repo_full_name: str
+    target_agent: str
+    correlation_id: str | None = None
+    status: AgentTaskStatus = AgentTaskStatus.CREATED
+    issue_number: int | None = None
+    agent_bus_work_item_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    queued_at: datetime | None = None
+    assigned_at: datetime | None = None
+    claimed_at: datetime | None = None
+    running_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    branch: str | None = None
+    commit_sha: str | None = None
+    last_actor: str | None = None
+
+
 class AgentTaskStore(Protocol):
     def save_agent_task(self, task: AgentTask) -> None:
         ...
@@ -141,6 +163,15 @@ class AgentTaskStore(Protocol):
         workflow_filter: str = "active_recent",
         recent_since: datetime | None = None,
     ) -> list[AgentTask]:
+        ...
+
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
         ...
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
@@ -196,6 +227,22 @@ class InMemoryAgentTaskStore:
         )
         return _sort_agent_tasks_for_workflow_collection(tasks)[:limit]
 
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
+        return [
+            agent_task_workflow_summary(task)
+            for task in self.list_agent_tasks_for_workflow_collection(
+                limit=limit,
+                workflow_filter=workflow_filter,
+                recent_since=recent_since,
+            )
+        ]
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         return next((task for task in self._items if task.task_id == task_id), None)
 
@@ -246,7 +293,8 @@ class SQLiteAgentTaskStore:
                     commit_sha TEXT,
                     changed_files TEXT NOT NULL DEFAULT '[]',
                     execution_evidence TEXT NOT NULL DEFAULT '{}',
-                    lifecycle_events TEXT NOT NULL
+                    lifecycle_events TEXT NOT NULL,
+                    last_actor TEXT
                 )
                 """
             )
@@ -296,8 +344,9 @@ class SQLiteAgentTaskStore:
                     commit_sha,
                     changed_files,
                     execution_evidence,
-                    lifecycle_events
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    lifecycle_events,
+                    last_actor
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -333,6 +382,7 @@ class SQLiteAgentTaskStore:
                     json.dumps(task.changed_files),
                     json.dumps(task.execution_evidence),
                     json.dumps([event.model_dump(mode="json") for event in task.lifecycle_events]),
+                    _last_agent_task_lifecycle_actor(task),
                 ),
             )
 
@@ -394,6 +444,50 @@ class SQLiteAgentTaskStore:
             tasks = [_task_from_row(row) for row in rows]
             return _refresh_sqlite_agent_task_dependency_states(conn, tasks)
 
+    def list_agent_task_workflow_summaries_for_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[AgentTaskWorkflowSummary]:
+        if limit <= 0:
+            return []
+        where_sql, params = _agent_task_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    task_id,
+                    repo_full_name,
+                    target_agent,
+                    correlation_id,
+                    status,
+                    issue_number,
+                    agent_bus_work_item_id,
+                    created_at,
+                    updated_at,
+                    queued_at,
+                    assigned_at,
+                    claimed_at,
+                    running_at,
+                    completed_at,
+                    failed_at,
+                    cancelled_at,
+                    branch,
+                    commit_sha,
+                    last_actor
+                FROM agent_tasks
+                {where_sql}
+                ORDER BY updated_at DESC,
+                         created_at DESC,
+                         ('wf-agent-task-' || task_id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [AgentTaskWorkflowSummary.model_validate(dict(row)) for row in rows]
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
@@ -451,6 +545,30 @@ def refresh_agent_task_dependency_states(tasks: list[AgentTask]) -> list[AgentTa
     for task in tasks:
         refresh_agent_task_dependency_state(task, tasks_by_id)
     return tasks
+
+
+def agent_task_workflow_summary(task: AgentTask) -> AgentTaskWorkflowSummary:
+    return AgentTaskWorkflowSummary(
+        task_id=task.task_id,
+        repo_full_name=task.repo_full_name,
+        target_agent=task.target_agent,
+        correlation_id=task.correlation_id,
+        status=task.status,
+        issue_number=task.issue_number,
+        agent_bus_work_item_id=task.agent_bus_work_item_id,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        queued_at=task.queued_at,
+        assigned_at=task.assigned_at,
+        claimed_at=task.claimed_at,
+        running_at=task.running_at,
+        completed_at=task.completed_at,
+        failed_at=task.failed_at,
+        cancelled_at=task.cancelled_at,
+        branch=task.branch,
+        commit_sha=task.commit_sha,
+        last_actor=_last_agent_task_lifecycle_actor(task),
+    )
 
 
 def _refresh_sqlite_agent_task_dependency_states(
@@ -736,4 +854,9 @@ _AGENT_TASK_EXTRA_COLUMNS = [
     ("commit_sha", "TEXT"),
     ("changed_files", "TEXT NOT NULL DEFAULT '[]'"),
     ("execution_evidence", "TEXT NOT NULL DEFAULT '{}'"),
+    ("last_actor", "TEXT"),
 ]
+
+
+def _last_agent_task_lifecycle_actor(task: AgentTask) -> str | None:
+    return task.lifecycle_events[-1].actor if task.lifecycle_events else None

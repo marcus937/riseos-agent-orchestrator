@@ -23,7 +23,7 @@ from app.workflow_lifecycle import (
     build_event_workflow_projection,
     build_work_item_workflow_projection,
 )
-from app.workflows import WorkflowSummaryCounts, build_workflow_summary_counts, build_workflows
+from app.workflows import WorkflowSummaryCounts, build_workflow_summaries, build_workflow_summary_counts
 
 ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v2"
 ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT = 50
@@ -221,13 +221,30 @@ def build_orchestrator_snapshot(
     events: list[EventRecord],
     recent_failures: list[RecentFailure],
 ) -> OrchestratorSnapshot:
-    workflow_items = [_workflow_work_item_snapshot(item) for item in review_items]
-    workflow_items_by_id = {item.id: item for item in workflow_items}
-    agents = [_workflow_lifecycle_snapshot(item, workflow_items_by_id) for item in lifecycle]
-    issues = [item for item in workflow_items if item.issue_number is not None and item.pr_number is None]
-    prs = [item for item in workflow_items if item.pr_number is not None]
-    event_snapshots = [_workflow_event_snapshot(event) for event in events]
-    workflows = build_workflows(review_items, events)
+    issue_items = [item for item in review_items if item.issue_number is not None and item.pr_number is None]
+    pr_items = [item for item in review_items if item.pr_number is not None]
+    limited_lifecycle = _limit_collection(lifecycle, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT)
+    limited_issue_items = _limit_collection(issue_items, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT)
+    limited_pr_items = _limit_collection(pr_items, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT)
+    review_items_by_id = {item.id: item for item in review_items}
+    workflow_item_ids = {
+        *(item.item_id for item in limited_lifecycle),
+        *(item.id for item in limited_issue_items),
+        *(item.id for item in limited_pr_items),
+    }
+    workflow_items_by_id = {
+        item_id: _workflow_work_item_snapshot(review_items_by_id[item_id])
+        for item_id in workflow_item_ids
+        if item_id in review_items_by_id
+    }
+    agents = [_workflow_lifecycle_snapshot(item, workflow_items_by_id) for item in limited_lifecycle]
+    issues = [workflow_items_by_id[item.id] for item in limited_issue_items if item.id in workflow_items_by_id]
+    prs = [workflow_items_by_id[item.id] for item in limited_pr_items if item.id in workflow_items_by_id]
+    event_snapshots = [
+        _workflow_event_snapshot(event)
+        for event in _limit_collection(events, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT)
+    ]
+    workflows = build_workflow_summaries(review_items, events)
     return OrchestratorSnapshot(
         workforce=OrchestratorWorkforceSnapshot(
             overview=OrchestratorSnapshotOverview(
@@ -246,15 +263,15 @@ def build_orchestrator_snapshot(
                 recent_failure_count=queue.recent_failure_count,
             ),
             meta=OrchestratorWorkforceSnapshotMeta(
-                agents=_collection_meta(agents, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-                issues=_collection_meta(issues, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-                prs=_collection_meta(prs, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-                events=_collection_meta(event_snapshots, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
+                agents=_collection_meta_from_total(len(lifecycle), ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+                issues=_collection_meta_from_total(len(issue_items), ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+                prs=_collection_meta_from_total(len(pr_items), ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
+                events=_collection_meta_from_total(len(events), ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
             ),
-            agents=_limit_collection(agents, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-            issues=_limit_collection(issues, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-            prs=_limit_collection(prs, ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT),
-            events=_limit_collection(event_snapshots, ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT),
+            agents=agents,
+            issues=issues,
+            prs=prs,
+            events=event_snapshots,
         ),
         workflows=build_workflow_summary_counts(workflows),
         queue=queue,
@@ -431,11 +448,15 @@ def _recent_failure_snapshot(failure: RecentFailure) -> RecentFailureSnapshot:
 
 
 def _collection_meta(items: list[Any], limit: int) -> SnapshotCollectionMeta:
+    return _collection_meta_from_total(len(items), limit)
+
+
+def _collection_meta_from_total(total: int, limit: int) -> SnapshotCollectionMeta:
     return SnapshotCollectionMeta(
-        returned=min(len(items), limit),
-        total=len(items),
+        returned=min(total, limit),
+        total=total,
         limit=limit,
-        truncated=len(items) > limit,
+        truncated=total > limit,
     )
 
 

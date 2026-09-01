@@ -26,9 +26,9 @@ from app.workflows import (
     WorkflowRecord,
     WorkflowTimeline,
     build_workflow_collection,
+    build_workflow_summaries,
     build_workflows,
     find_workflow,
-    workflow_summaries,
 )
 from app.workflow_orchestration import (
     WorkflowCreateRequest,
@@ -199,13 +199,13 @@ def _build_bounded_storage_workflow_collection(
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
     )
-    review_items = storage.list_review_work_items_for_workflow_collection(
+    review_items = storage.list_review_work_item_summary_records_for_workflow_collection(
         limit=candidate_limit,
         workflow_filter=workflow_filter_value,
         recent_since=recent_since,
     )
-    agent_tasks = (
-        agent_store.list_agent_tasks_for_workflow_collection(
+    agent_task_summaries = (
+        agent_store.list_agent_task_workflow_summaries_for_collection(
             limit=candidate_limit,
             workflow_filter=workflow_filter_value,
             recent_since=recent_since,
@@ -226,11 +226,11 @@ def _build_bounded_storage_workflow_collection(
             workflow_filter=WorkflowListFilter.ALL.value,
         )
     )
-    workflows = build_workflows(review_items, event_candidates, agent_tasks)
+    workflows = build_workflow_summaries(review_items, event_candidates, agent_task_summaries)
     page = workflows[bounded_offset : bounded_offset + bounded_limit]
     next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < total else None
     return WorkflowCollection(
-        workflows=workflow_summaries(page),
+        workflows=page,
         pagination=WorkflowPaginationMetadata(
             limit=bounded_limit,
             offset=bounded_offset,
@@ -382,7 +382,7 @@ def _supports_bounded_workflow_storage(storage: object) -> bool:
             "count_review_work_items",
             "count_review_work_items_for_workflow_collection",
             "list_event_records_for_workflow_collection",
-            "list_review_work_items_for_workflow_collection",
+            "list_review_work_item_summary_records_for_workflow_collection",
         )
     )
 
@@ -395,7 +395,7 @@ def _supports_bounded_agent_task_store(agent_store: object | None) -> bool:
         for name in (
             "count_agent_tasks",
             "count_agent_tasks_for_workflow_collection",
-            "list_agent_tasks_for_workflow_collection",
+            "list_agent_task_workflow_summaries_for_collection",
         )
     )
 

@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.agent_tasks import AgentTask, AgentTaskStatus
+from app.agent_tasks import AgentTask, AgentTaskStatus, AgentTaskWorkflowSummary
 from app.event_store import EventRecord
 from app.review_queue import ReviewWorkItem
 from app.workflow_lifecycle import (
@@ -103,6 +103,27 @@ def build_workflows(
     return sort_workflows(workflows)
 
 
+def build_workflow_summaries(
+    review_items: list[ReviewWorkItem],
+    events: list[EventRecord],
+    agent_tasks: list[AgentTask | AgentTaskWorkflowSummary] | None = None,
+) -> list[WorkflowSummaryRecord]:
+    workflows = [workflow_summary_from_review_item(item) for item in review_items]
+    workflows.extend(workflow_summary_from_agent_task(task) for task in (agent_tasks or []))
+    review_item_keys = {_review_item_workflow_identity_key(item) for item in review_items}
+    event_records_by_workflow_id: dict[str, list[EventRecord]] = {}
+    for record in events:
+        projection = build_event_workflow_projection(record)
+        if not projection.canonical_workflow_state:
+            continue
+        event_records_by_workflow_id.setdefault(_event_workflow_id(record), []).append(record)
+    for records in event_records_by_workflow_id.values():
+        if _event_records_workflow_identity_key(records) in review_item_keys:
+            continue
+        workflows.append(workflow_summary_from_event_records(records))
+    return sort_workflow_summaries(workflows)
+
+
 def build_workflow_collection(
     workflows: list[WorkflowRecord],
     *,
@@ -116,8 +137,9 @@ def build_workflow_collection(
     bounded_offset = max(offset, 0)
     bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
     normalized_filter = WorkflowListFilter(workflow_filter)
-    filtered = filter_workflows(
-        sort_workflows(workflows),
+    summaries = workflow_summaries(sort_workflows(workflows))
+    filtered = filter_workflow_summaries(
+        summaries,
         workflow_filter=normalized_filter,
         recent_days=bounded_recent_days,
         now=now,
@@ -129,7 +151,7 @@ def build_workflow_collection(
         else None
     )
     return WorkflowCollection(
-        workflows=workflow_summaries(page),
+        workflows=page,
         pagination=WorkflowPaginationMetadata(
             limit=bounded_limit,
             offset=bounded_offset,
@@ -148,7 +170,7 @@ def build_workflow_collection(
 def build_workflow_collection_from_candidates(
     review_items: list[ReviewWorkItem],
     events: list[EventRecord],
-    agent_tasks: list[AgentTask] | None = None,
+    agent_tasks: list[AgentTask | AgentTaskWorkflowSummary] | None = None,
     *,
     limit: int = WORKFLOW_LIST_DEFAULT_LIMIT,
     offset: int = 0,
@@ -162,8 +184,8 @@ def build_workflow_collection_from_candidates(
     bounded_offset = max(offset, 0)
     bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
     normalized_filter = WorkflowListFilter(workflow_filter)
-    filtered_candidates = filter_workflows(
-        build_workflows(review_items, events, agent_tasks),
+    filtered_candidates = filter_workflow_summaries(
+        build_workflow_summaries(review_items, events, agent_tasks),
         workflow_filter=normalized_filter,
         recent_days=bounded_recent_days,
         now=now,
@@ -175,7 +197,7 @@ def build_workflow_collection_from_candidates(
         else None
     )
     return WorkflowCollection(
-        workflows=workflow_summaries(page),
+        workflows=page,
         pagination=WorkflowPaginationMetadata(
             limit=bounded_limit,
             offset=bounded_offset,
@@ -206,7 +228,34 @@ def filter_workflows(
     return [workflow for workflow in workflows if _matches_workflow_filter(workflow, normalized_filter, cutoff)]
 
 
+def filter_workflow_summaries(
+    workflows: list[WorkflowSummaryRecord],
+    *,
+    workflow_filter: WorkflowListFilter = WorkflowListFilter.ACTIVE_RECENT,
+    recent_days: int = WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    now: datetime | None = None,
+) -> list[WorkflowSummaryRecord]:
+    normalized_filter = WorkflowListFilter(workflow_filter)
+    if normalized_filter == WorkflowListFilter.ALL:
+        return workflows
+
+    cutoff = _as_utc(now or datetime.now(UTC)) - timedelta(days=recent_days)
+    return [workflow for workflow in workflows if _matches_workflow_filter(workflow, normalized_filter, cutoff)]
+
+
 def sort_workflows(workflows: list[WorkflowRecord]) -> list[WorkflowRecord]:
+    return sorted(
+        sorted(workflows, key=lambda workflow: workflow.workflow_id),
+        key=lambda workflow: (
+            _as_utc(workflow.last_activity_at),
+            _as_utc(workflow.updated_at),
+            _as_utc(workflow.created_at),
+        ),
+        reverse=True,
+    )
+
+
+def sort_workflow_summaries(workflows: list[WorkflowSummaryRecord]) -> list[WorkflowSummaryRecord]:
     return sorted(
         sorted(workflows, key=lambda workflow: workflow.workflow_id),
         key=lambda workflow: (
@@ -232,12 +281,79 @@ def workflow_summaries(workflows: list[WorkflowRecord]) -> list[WorkflowSummaryR
     return [workflow_summary(workflow) for workflow in workflows]
 
 
-def build_workflow_summary_counts(workflows: list[WorkflowRecord]) -> WorkflowSummaryCounts:
+def build_workflow_summary_counts(workflows: list[WorkflowSummaryRecord]) -> WorkflowSummaryCounts:
     return WorkflowSummaryCounts(
         active=sum(1 for workflow in workflows if workflow.current_state not in _TERMINAL_STATES),
         blocked=sum(1 for workflow in workflows if workflow.current_state in _BLOCKED_STATES),
         reviewing=sum(1 for workflow in workflows if workflow.current_state in _REVIEWING_STATES),
         verified=sum(1 for workflow in workflows if workflow.current_state == WorkflowState.VERIFIED),
+    )
+
+
+def workflow_summary_from_review_item(item: ReviewWorkItem) -> WorkflowSummaryRecord:
+    projection = build_work_item_workflow_projection(item)
+    timeline = projection.workflow_events
+    current_state = projection.canonical_workflow_state or WorkflowState.CREATED
+    created_at = timeline[0].occurred_at if timeline else item.created_at
+    updated_at = (item.updated_at or timeline[-1].occurred_at) if timeline else item.created_at
+    return WorkflowSummaryRecord(
+        workflow_id=f"wf-{item.id}",
+        repo_full_name=item.repo_full_name,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        current_state=current_state,
+        assigned_agent=_assigned_agent(item, current_state),
+        last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
+        created_at=created_at,
+        updated_at=updated_at,
+        last_activity_at=timeline[-1].occurred_at if timeline else updated_at,
+    )
+
+
+def workflow_summary_from_agent_task(
+    task: AgentTask | AgentTaskWorkflowSummary,
+) -> WorkflowSummaryRecord:
+    current_state = _state_from_agent_task_status(task.status)
+    lifecycle_events = getattr(task, "lifecycle_events", [])
+    last_event = lifecycle_events[-1] if lifecycle_events else None
+    last_activity_at = (
+        last_event.occurred_at
+        if last_event is not None
+        else _agent_task_last_activity_at(task)
+    )
+    return WorkflowSummaryRecord(
+        workflow_id=f"wf-agent-task-{task.task_id}",
+        correlation_id=task.correlation_id,
+        repo_full_name=task.repo_full_name,
+        issue_number=task.issue_number,
+        agent_task_id=task.task_id,
+        current_state=current_state,
+        assigned_agent=task.target_agent,
+        last_actor=_agent_task_last_actor(task, current_state, last_event),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        last_activity_at=last_activity_at,
+    )
+
+
+def workflow_summary_from_event_records(records: list[EventRecord]) -> WorkflowSummaryRecord:
+    ordered_records = sorted(records, key=lambda record: (record.received_at, record.event_id))
+    projection = build_event_records_workflow_projection(ordered_records)
+    current_state = projection.canonical_workflow_state or WorkflowState.CREATED
+    first_record = ordered_records[0]
+    last_record = ordered_records[-1]
+    return WorkflowSummaryRecord(
+        workflow_id=_event_workflow_id(last_record),
+        correlation_id=_latest_record_value(ordered_records, "correlation_id"),
+        repo_full_name=_latest_record_value(ordered_records, "repo_full_name"),
+        issue_number=_latest_record_value(ordered_records, "issue_number"),
+        pr_number=_latest_record_value(ordered_records, "pr_number"),
+        current_state=current_state,
+        assigned_agent=_assigned_agent(None, current_state),
+        last_actor=(projection.current_owner or WorkflowOwner.UNKNOWN).value,
+        created_at=first_record.received_at,
+        updated_at=last_record.received_at,
+        last_activity_at=last_record.received_at,
     )
 
 
@@ -416,6 +532,42 @@ def _owner_from_agent_task_state(state: WorkflowState) -> WorkflowOwner:
     if state == WorkflowState.BLOCKED:
         return WorkflowOwner.ORCHESTRATOR
     return WorkflowOwner.ORCHESTRATOR
+
+
+def _agent_task_last_activity_at(task: AgentTask | AgentTaskWorkflowSummary) -> datetime:
+    values = [
+        value
+        for value in (
+            task.updated_at,
+            task.completed_at,
+            task.failed_at,
+            task.cancelled_at,
+            task.running_at,
+            task.claimed_at,
+            task.assigned_at,
+            task.queued_at,
+            task.created_at,
+        )
+        if value is not None
+    ]
+    return max(values, key=_as_utc)
+
+
+def _agent_task_last_actor(
+    task: AgentTask | AgentTaskWorkflowSummary,
+    state: WorkflowState,
+    last_event: Any | None,
+) -> str:
+    if last_event is not None and last_event.actor:
+        return last_event.actor
+    last_actor = getattr(task, "last_actor", None)
+    if last_actor:
+        return last_actor
+    if state in {WorkflowState.CIRCUIT_WORKING, WorkflowState.COMPLETED, WorkflowState.BLOCKED}:
+        return task.target_agent
+    if state == WorkflowState.BB2_REVIEWING:
+        return WorkflowOwner.BB2.value
+    return WorkflowOwner.ORCHESTRATOR.value
 
 
 def _review_item_workflow_identity_key(

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
+import app.orchestrator_snapshot as snapshot_module
 from app.config import get_settings
 from app.event_store import event_store
 from app.github_events import GitHubEventType
@@ -177,6 +178,38 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     assert f"label-{ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT}" not in response.text
     assert "historical_payload" not in response.text
     assert huge_historical_payload not in response.text
+
+
+def test_orchestrator_snapshot_limits_before_work_item_projection(monkeypatch) -> None:
+    client = client_with_secret()
+    now = datetime.now(UTC)
+
+    for index in range(ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT + 5):
+        review_queue.add_if_absent(
+            ReviewWorkItem(
+                id=f"projection-item-{index}",
+                created_at=now,
+                updated_at=now,
+                repo_full_name="riseos/example",
+                event_type=GitHubEventType.PULL_REQUEST,
+                pr_number=index + 1,
+            )
+        )
+
+    projected_ids: list[str] = []
+    original_snapshot = snapshot_module._workflow_work_item_snapshot
+
+    def record_projection(item: ReviewWorkItem):
+        projected_ids.append(item.id)
+        return original_snapshot(item)
+
+    monkeypatch.setattr(snapshot_module, "_workflow_work_item_snapshot", record_projection)
+
+    response = client.get("/api/v1/orchestrator/snapshot")
+
+    assert response.status_code == 200
+    assert len(projected_ids) == ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT
+    assert response.json()["workforce"]["meta"]["prs"]["truncated"] is True
 
 
 def test_orchestrator_snapshot_uses_debug_read_access_policy() -> None:

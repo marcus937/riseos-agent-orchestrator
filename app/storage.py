@@ -557,6 +557,53 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._review_work_item_from_row(row) for row in rows]
 
+    def list_review_work_item_summary_records_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[ReviewWorkItem]:
+        if limit <= 0:
+            return []
+        where_sql, params = _review_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    created_at,
+                    updated_at,
+                    repo_full_name,
+                    event_type,
+                    branch,
+                    base_branch,
+                    commit_sha,
+                    issue_number,
+                    pr_number,
+                    status,
+                    lifecycle_stage,
+                    worker_claimed_at,
+                    review_started_at,
+                    openai_review_attempted_at,
+                    openai_review_completed_at,
+                    review_completed_at,
+                    github_writeback_started_at,
+                    github_writeback_completed_at,
+                    github_writeback_success,
+                    last_failure_at
+                FROM review_work_items
+                {where_sql}
+                ORDER BY {_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         COALESCE(updated_at, created_at) DESC,
+                         created_at DESC,
+                         ('wf-' || id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._review_work_item_from_row(row) for row in rows]
+
     def has_review_workflow_identity(
         self,
         *,
