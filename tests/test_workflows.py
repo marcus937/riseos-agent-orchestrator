@@ -651,6 +651,55 @@ def test_workflow_endpoint_bounded_sqlite_fetches_only_candidate_window_per_sour
     assert task_store.agent_summary_limits == [7]
 
 
+def test_workflow_endpoint_bounded_sqlite_page_can_be_filled_by_one_source(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    for index in range(12):
+        task_store.save_agent_task(
+            _agent_task(
+                f"dominant-agent-{index:02d}",
+                AgentTaskStatus.QUEUED,
+                base + timedelta(minutes=100 - index),
+            )
+        )
+    for index in range(4):
+        storage.save_review_work_item(_review_item(f"older-review-{index}", base + timedelta(minutes=index)))
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"older-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch=f"older-event-{index}",
+                commit_sha=f"older-sha-{index}",
+                received_at=base + timedelta(minutes=index),
+            )
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=4&offset=5")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-agent-task-dominant-agent-05",
+        "wf-agent-task-dominant-agent-06",
+        "wf-agent-task-dominant-agent-07",
+        "wf-agent-task-dominant-agent-08",
+    ]
+    assert all("timeline" not in workflow for workflow in body["workflows"])
+    assert all("route_history" not in workflow for workflow in body["workflows"])
+    assert body["pagination"]["returned"] == 4
+    assert body["pagination"]["total"] == 20
+    assert body["pagination"]["unfiltered_total"] == 20
+    assert body["pagination"]["has_next"] is True
+    assert body["pagination"]["next_offset"] == 9
+
+
 def test_workflow_endpoint_bounded_sqlite_recent_filter_counts_review_items(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)

@@ -23,6 +23,7 @@ and timeline resources.
 - `BB2_REVIEWING`
 - `CHANGES_REQUESTED`
 - `APPROVED`
+- `COMPLETED`
 - `MERGED`
 - `CLOSED_UNMERGED`
 - `ABANDONED`
@@ -61,6 +62,11 @@ Canonical workflow state is derived deterministically from durable orchestrator 
 | Issue labeled, edited, or reopened | `ASSIGNED` |
 | Push event | `CIRCUIT_WORKING` |
 | Pull request opened, reopened, or synchronized | `PR_OPENED` |
+| AgentTask queued or assigned | `ASSIGNED` |
+| AgentTask claimed, running, or in progress | `CIRCUIT_WORKING` |
+| AgentTask ready for review | `BB2_REVIEWING` |
+| AgentTask completed | `COMPLETED` |
+| AgentTask failed or cancelled | `BLOCKED` |
 | Worker claimed or review started | `HERMES_VALIDATING` |
 | OpenAI/BB2 review attempted or GitHub writeback started | `BB2_REVIEWING` |
 | OpenAI review failed or review failed | `HERMES_FAILED` |
@@ -73,8 +79,8 @@ Canonical workflow state is derived deterministically from durable orchestrator 
 | Review item is blocked | `BLOCKED` |
 
 `APPROVED` is active and awaiting human merge. It is not terminal because only Marcus may
-merge and deploy. `MERGED`, `CLOSED_UNMERGED`, `ABANDONED`, `DEPLOYED`, and `VERIFIED`
-are terminal workflow states for summary-count purposes.
+merge and deploy. `COMPLETED`, `MERGED`, `CLOSED_UNMERGED`, `ABANDONED`, `DEPLOYED`,
+and `VERIFIED` are terminal workflow states for summary-count purposes.
 
 `HERMES_FAILED` is entered when the automated validation/review path records an OpenAI
 review failure or review failure lifecycle timestamp. It is counted as blocked evidence

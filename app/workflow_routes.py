@@ -183,6 +183,8 @@ def _build_bounded_storage_workflow_collection(
     workflow_filter_value = normalized_filter.value
     now = datetime.now(UTC)
     recent_since = now - timedelta(days=bounded_recent_days)
+    # A workflow past this per-source window cannot appear before the end of the
+    # merged global page, so detail hydration is unnecessary for list polling.
     candidate_limit = bounded_offset + bounded_limit
     total = _count_bounded_storage_normalized_workflows(
         storage,
