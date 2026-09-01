@@ -28,7 +28,7 @@ class WorkflowListFilter(StrEnum):
     ALL = "all"
 
 
-class WorkflowRecord(BaseModel):
+class WorkflowSummaryRecord(BaseModel):
     workflow_id: str
     correlation_id: str | None = None
     repo_full_name: str | None = None
@@ -42,6 +42,9 @@ class WorkflowRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_activity_at: datetime
+
+
+class WorkflowRecord(WorkflowSummaryRecord):
     timeline: list[WorkflowEvent] = Field(default_factory=list)
     route_history: list[str] = Field(default_factory=list)
 
@@ -60,7 +63,7 @@ class WorkflowPaginationMetadata(BaseModel):
 
 
 class WorkflowCollection(BaseModel):
-    workflows: list[WorkflowRecord]
+    workflows: list[WorkflowSummaryRecord]
     pagination: WorkflowPaginationMetadata | None = None
 
 
@@ -121,7 +124,7 @@ def build_workflow_collection(
         else None
     )
     return WorkflowCollection(
-        workflows=page,
+        workflows=workflow_summaries(page),
         pagination=WorkflowPaginationMetadata(
             limit=bounded_limit,
             offset=bounded_offset,
@@ -167,7 +170,7 @@ def build_workflow_collection_from_candidates(
         else None
     )
     return WorkflowCollection(
-        workflows=page,
+        workflows=workflow_summaries(page),
         pagination=WorkflowPaginationMetadata(
             limit=bounded_limit,
             offset=bounded_offset,
@@ -212,6 +215,16 @@ def sort_workflows(workflows: list[WorkflowRecord]) -> list[WorkflowRecord]:
 
 def find_workflow(workflows: list[WorkflowRecord], workflow_id: str) -> WorkflowRecord | None:
     return next((workflow for workflow in workflows if workflow.workflow_id == workflow_id), None)
+
+
+def workflow_summary(workflow: WorkflowRecord) -> WorkflowSummaryRecord:
+    return WorkflowSummaryRecord.model_validate(
+        workflow.model_dump(exclude={"timeline", "route_history"})
+    )
+
+
+def workflow_summaries(workflows: list[WorkflowRecord]) -> list[WorkflowSummaryRecord]:
+    return [workflow_summary(workflow) for workflow in workflows]
 
 
 def build_workflow_summary_counts(workflows: list[WorkflowRecord]) -> WorkflowSummaryCounts:

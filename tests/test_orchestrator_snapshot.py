@@ -88,19 +88,23 @@ def test_orchestrator_snapshot_aggregates_existing_telemetry_sources() -> None:
     assert data["queue"]["counters"]["pending_review_count"] == 1
     assert data["health"]["accepted_count"] == 1
     assert workforce["agents"][0]["item_id"]
+    assert workforce["agents"][0]["workflow_id"].startswith("wf-")
     assert workforce["agents"][0]["repo_full_name"] == "riseos/example"
     assert workforce["agents"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
     assert workforce["agents"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
     assert workforce["agents"][0]["current_owner"] == "Circuit"
     assert workforce["agents"][0]["workflow_duration_seconds"] >= 0
-    assert workforce["agents"][0]["workflow_state_history"][0]["state"] == "CIRCUIT_IN_PROGRESS"
-    assert workforce["agents"][0]["workflow_state_history"][0]["canonical_state"] == "CIRCUIT_WORKING"
-    assert workforce["agents"][0]["workflow_events"][0]["source"] == "review_work_item"
+    assert workforce["agents"][0]["workflow_event_count"] == 1
+    assert workforce["agents"][0]["workflow_events_truncated"] is True
+    assert "workflow_state_history" not in workforce["agents"][0]
+    assert "workflow_events" not in workforce["agents"][0]
     assert workforce["events"][0]["repo_full_name"] == "riseos/example"
     assert workforce["events"][0]["commit_sha"] == "abc123"
     assert workforce["events"][0]["workflow_state"] == "CIRCUIT_IN_PROGRESS"
     assert workforce["events"][0]["canonical_workflow_state"] == "CIRCUIT_WORKING"
-    assert workforce["events"][0]["workflow_state_history"][0]["source"] == "github_webhook"
+    assert workforce["events"][0]["workflow_event_count"] == 1
+    assert "workflow_state_history" not in workforce["events"][0]
+    assert "workflow_events" not in workforce["events"][0]
     assert workforce["issues"] == []
     assert workforce["prs"] == []
     assert data["runtime"]["auto_processing_enabled"] is False
@@ -162,21 +166,13 @@ def test_orchestrator_snapshot_compacts_large_workforce_payloads() -> None:
     assert pr["labels_truncated"] is True
     assert pr["last_error_truncated"] is True
     assert len(pr["last_error"]) == ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT
-    pr_initial_event = next(
-        event for event in pr["workflow_events"] if event["source"] == "review_work_item"
-    )
-    assert len(pr_initial_event["metadata"]["labels"]) == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
-    assert pr_initial_event["metadata"]["label_count"] == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT + 5
-    assert pr_initial_event["metadata"]["labels_truncated"] is True
-    agent_initial_event = next(
-        event
-        for event in workforce["agents"][0]["workflow_state_history"]
-        if event["source"] == "review_work_item"
-    )
-    assert len(agent_initial_event["metadata"]["labels"]) == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
-    assert agent_initial_event["metadata"]["label_count"] == ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT + 5
-    assert agent_initial_event["metadata"]["labels_truncated"] is True
+    assert "workflow_events" not in pr
+    assert "workflow_state_history" not in pr
+    assert pr["workflow_event_count"] >= 1
+    assert pr["workflow_events_truncated"] is True
     assert workforce["agents"][0]["last_error_truncated"] is True
+    assert "workflow_events" not in workforce["agents"][0]
+    assert "workflow_state_history" not in workforce["agents"][0]
     assert data["recent_failures"][0]["last_error_truncated"] is True
     assert f"label-{ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT}" not in response.text
     assert "historical_payload" not in response.text

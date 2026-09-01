@@ -28,6 +28,7 @@ from app.workflows import (
     build_workflow_collection,
     build_workflows,
     find_workflow,
+    workflow_summaries,
 )
 from app.workflow_orchestration import (
     WorkflowCreateRequest,
@@ -229,7 +230,7 @@ def _build_bounded_storage_workflow_collection(
     page = workflows[bounded_offset : bounded_offset + bounded_limit]
     next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < total else None
     return WorkflowCollection(
-        workflows=page,
+        workflows=workflow_summaries(page),
         pagination=WorkflowPaginationMetadata(
             limit=bounded_limit,
             offset=bounded_offset,

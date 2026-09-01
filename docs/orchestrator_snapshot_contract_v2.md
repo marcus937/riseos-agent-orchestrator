@@ -119,9 +119,9 @@ The snapshot is a dashboard contract, not an archival export. It is intentionall
 
 - `workforce.agents`, `workforce.issues`, and `workforce.prs` return at most 50 records each.
 - `workforce.events` returns at most 25 records.
-- Embedded `workflow_events` and `workflow_state_history` return at most the 8 most recent lifecycle events per record while preserving `workflow_event_count` and `workflow_events_truncated`.
+- Workforce records preserve compact workflow summary fields, including `workflow_id`, `workflow_state`, `canonical_workflow_state`, `current_owner`, `workflow_event_count`, and `workflow_events_truncated`.
+- Workforce records do not include embedded `workflow_events` or `workflow_state_history`; use `/api/v1/workflows/{workflow_id}` or `/api/v1/workflows/{workflow_id}/timeline` for lifecycle detail.
 - `labels` returns at most 20 labels per work item while preserving `label_count` and `labels_truncated`.
-- Embedded workflow event metadata uses the same 20-label cap for `metadata.labels` and includes `metadata.label_count` plus `metadata.labels_truncated` when labels are present.
 - `recent_failures` returns at most 20 records.
 - Error strings in workforce records and `recent_failures` are capped at 2048 characters and expose a matching `*_truncated` boolean.
 - Full `runtime_validation_context` payloads are not included in the snapshot. Runtime status remains available through bounded fields such as `runtime_validation_id`, `runtime_validation_status`, `runtime_validation_digest`, and `runtime_validation_completed_at`.
@@ -149,7 +149,7 @@ The snapshot intentionally reuses existing Orchestrator telemetry sources and ca
 - `ReviewLifecycleVisibility` contributes compact fields to `workforce.agents`.
 - Hermes dispatch configuration is normalized into `runtime.hermes_dispatch` as `HermesDispatchStatus`.
 
-Canonical ownership remains in the workflow lifecycle layer. Snapshot records expose `workflow_state`, `canonical_workflow_state`, `current_owner`, and bounded lifecycle events derived from those canonical builders. Detailed workflow cards, detail views, and full timelines should use `/api/v1/workflows`, `/api/v1/workflows/{workflow_id}`, and `/api/v1/workflows/{workflow_id}/timeline`.
+Canonical ownership remains in the workflow lifecycle layer. Snapshot records expose compact workflow summary fields derived from those canonical builders. Workflow lists should use `/api/v1/workflows`; detail views and full timelines should use `/api/v1/workflows/{workflow_id}` and `/api/v1/workflows/{workflow_id}/timeline`.
 
 ## Access And Security
 

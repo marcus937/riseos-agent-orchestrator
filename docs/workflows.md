@@ -5,9 +5,10 @@ JMC should render workflow cards, workflow detail views, timelines, state badges
 assigned agents, Hermes status, BB2 status, and routing history from these read-only
 workflow payloads instead of reconstructing lifecycle state from GitHub labels.
 
-This contract is additive. Existing snapshot-facing lifecycle fields keep their
-legacy values, and canonical workflow state is layered on top through explicit
-canonical fields and the workflow API resources.
+Existing snapshot-facing lifecycle summary fields keep their legacy values, and
+canonical workflow state is layered on top through explicit canonical fields and
+the workflow API resources. Timeline detail is exposed only by workflow detail
+and timeline resources.
 
 ## States
 
@@ -31,8 +32,8 @@ canonical fields and the workflow API resources.
 
 ## Legacy Snapshot Compatibility
 
-Snapshot consumers that already read `workflow_state`, `workflow_state_history[].state`,
-or `workflow_events[].state` continue receiving the legacy lifecycle values, including:
+Snapshot consumers that already read `workflow_state` continue receiving the
+legacy lifecycle values, including:
 
 - `ISSUE_CREATED`
 - `AGENT_READY`
@@ -87,7 +88,7 @@ summary contract, but does not infer verification from approval or merge events.
 
 ### `GET /api/v1/workflows`
 
-Returns a bounded page of normalized workflow records. By default, the endpoint
+Returns a bounded page of normalized workflow summary records. By default, the endpoint
 returns active workflows plus terminal workflows with activity in the last 14 days,
 sorted by most recent activity with a stable `workflow_id` tie-breaker.
 
@@ -100,8 +101,10 @@ Query parameters:
 | `filter` | `active_recent` | One of `active_recent`, `active`, `recent`, or `all`. |
 | `recent_days` | `14` | Recent activity window. Must be between `1` and `90`. |
 
-The `workflows` array remains the canonical record list. `pagination` is additive
-metadata for polling clients:
+The `workflows` array is intentionally compact for polling clients. It omits
+`timeline` and `route_history`; fetch `GET /api/v1/workflows/{workflow_id}` or
+`GET /api/v1/workflows/{workflow_id}/timeline` when a view needs full detail.
+`pagination` is additive metadata:
 
 ```json
 {
@@ -118,9 +121,7 @@ metadata for polling clients:
       "last_actor": "BB2",
       "created_at": "...",
       "updated_at": "...",
-      "last_activity_at": "...",
-      "timeline": [],
-      "route_history": []
+      "last_activity_at": "..."
     }
   ],
   "pagination": {
@@ -140,7 +141,8 @@ metadata for polling clients:
 
 ### `GET /api/v1/workflows/{workflow_id}`
 
-Returns one workflow record or `404` when the workflow is unknown.
+Returns one full workflow record, including `timeline` and `route_history`, or
+`404` when the workflow is unknown.
 
 ### `GET /api/v1/workflows/{workflow_id}/timeline`
 
@@ -182,10 +184,14 @@ Workforce entries include both legacy and canonical values:
 
 ```json
 {
+  "workflow_id": "wf-...",
   "workflow_state": "CIRCUIT_IN_PROGRESS",
-  "canonical_workflow_state": "CIRCUIT_WORKING"
+  "canonical_workflow_state": "CIRCUIT_WORKING",
+  "workflow_event_count": 1,
+  "workflow_events_truncated": true
 }
 ```
 
-These counts are dashboard summaries. Detailed UI surfaces should use the workflow
-endpoints above.
+Snapshot workforce entries omit `workflow_events` and `workflow_state_history`.
+These fields are dashboard summaries. Detailed UI surfaces should use the
+workflow endpoints above.

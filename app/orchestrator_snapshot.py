@@ -17,7 +17,6 @@ from app.review_queue import (
 )
 from app.workflow_lifecycle import (
     LegacyWorkflowState,
-    WorkflowEvent,
     WorkflowOwner,
     WorkflowState,
     WorkflowStateProjection,
@@ -30,7 +29,7 @@ ORCHESTRATOR_SNAPSHOT_SCHEMA_VERSION = "orchestrator.snapshot.v2"
 ORCHESTRATOR_SNAPSHOT_COLLECTION_LIMIT = 50
 ORCHESTRATOR_SNAPSHOT_EVENT_LIMIT = 25
 ORCHESTRATOR_SNAPSHOT_RECENT_FAILURE_LIMIT = 20
-ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT = 8
+ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT = 0
 ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT = 20
 ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT = 2048
 _TRUNCATED_SUFFIX = "... [truncated]"
@@ -53,10 +52,9 @@ class OrchestratorSnapshotOverview(BaseModel):
 
 
 class WorkflowFields(BaseModel):
-    workflow_events: list[WorkflowEvent] = Field(default_factory=list)
+    workflow_id: str | None = None
     workflow_state: LegacyWorkflowState | None = None
     canonical_workflow_state: WorkflowState | None = None
-    workflow_state_history: list[WorkflowEvent] = Field(default_factory=list)
     workflow_duration_seconds: float | None = None
     current_owner: WorkflowOwner = WorkflowOwner.UNKNOWN
     workflow_event_count: int = 0
@@ -334,7 +332,7 @@ def _workflow_work_item_snapshot(item: ReviewWorkItem) -> WorkflowWorkItemSnapsh
             "last_failure_at": item.last_failure_at,
             "last_error": last_error,
             "last_error_truncated": last_error_truncated,
-            **_workflow_fields(projection),
+            **_workflow_fields(projection, workflow_id=f"wf-{item.id}"),
         }
     )
 
@@ -376,6 +374,7 @@ def _workflow_lifecycle_snapshot(
             "last_failure_at": item.last_failure_at,
             "last_error": last_error,
             "last_error_truncated": last_error_truncated,
+            "workflow_id": f"wf-{item.item_id}",
             **workflow_fields,
         }
     )
@@ -398,27 +397,21 @@ def _workflow_event_snapshot(event: EventRecord) -> WorkflowEventRecordSnapshot:
             "pr_merged": event.pr_merged,
             "received_at": event.received_at,
             "raw_action": event.raw_action,
-            **_workflow_fields(projection),
+            **_workflow_fields(projection, workflow_id=f"wf-{event.correlation_id or event.event_id}"),
         }
     )
 
 
-def _workflow_fields(projection: WorkflowStateProjection) -> dict[str, Any]:
-    events = _bounded_workflow_events(
-        _limit_workflow_events(
-            projection.workflow_events,
-            ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
-        )
-    )
+def _workflow_fields(projection: WorkflowStateProjection, *, workflow_id: str | None) -> dict[str, Any]:
+    workflow_event_count = len(projection.workflow_events)
     return {
-        "workflow_events": events,
+        "workflow_id": workflow_id,
         "workflow_state": projection.workflow_state,
         "canonical_workflow_state": projection.canonical_workflow_state,
-        "workflow_state_history": events,
         "workflow_duration_seconds": projection.workflow_duration_seconds,
         "current_owner": projection.current_owner,
-        "workflow_event_count": len(projection.workflow_events),
-        "workflow_events_truncated": len(projection.workflow_events) > ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
+        "workflow_event_count": workflow_event_count,
+        "workflow_events_truncated": workflow_event_count > ORCHESTRATOR_SNAPSHOT_WORKFLOW_EVENT_LIMIT,
     }
 
 
@@ -448,38 +441,6 @@ def _collection_meta(items: list[Any], limit: int) -> SnapshotCollectionMeta:
 
 def _limit_collection(items: list[Any], limit: int) -> list[Any]:
     return items[:limit]
-
-
-def _limit_workflow_events(events: list[WorkflowEvent], limit: int) -> list[WorkflowEvent]:
-    return events[-limit:]
-
-
-def _bounded_workflow_events(events: list[WorkflowEvent]) -> list[WorkflowEvent]:
-    return [_bounded_workflow_event(event) for event in events]
-
-
-def _bounded_workflow_event(event: WorkflowEvent) -> WorkflowEvent:
-    return event.model_copy(
-        deep=True,
-        update={"metadata": _bounded_workflow_event_metadata(event.metadata)},
-    )
-
-
-def _bounded_workflow_event_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    bounded = dict(metadata)
-    labels = bounded.get("labels")
-    if isinstance(labels, list):
-        bounded["labels"] = _limit_collection(labels, ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT)
-        bounded["label_count"] = len(labels)
-        bounded["labels_truncated"] = len(labels) > ORCHESTRATOR_SNAPSHOT_LABEL_LIMIT
-    for key, value in list(bounded.items()):
-        if not isinstance(value, str):
-            continue
-        bounded_value, truncated = _bounded_string(value)
-        bounded[key] = bounded_value
-        if truncated:
-            bounded[f"{key}_truncated"] = True
-    return bounded
 
 
 def _bounded_string(value: str | None, *, limit: int = ORCHESTRATOR_SNAPSHOT_TEXT_LIMIT) -> tuple[str | None, bool]:

@@ -156,17 +156,20 @@ def test_workflow_endpoints_return_canonical_record_and_timeline() -> None:
     assert workflow["repo_full_name"] == "riseos/example"
     assert workflow["current_state"] == "CIRCUIT_WORKING"
     assert workflow["last_actor"] == "Circuit"
-    assert workflow["timeline"][0]["event_type"] == "workflow.lifecycle.changed"
-    assert workflow["timeline"][0]["state"] == "CIRCUIT_IN_PROGRESS"
-    assert workflow["timeline"][0]["canonical_state"] == "CIRCUIT_WORKING"
-    assert workflow["timeline"][0]["new_state"] == "CIRCUIT_WORKING"
-    assert workflow["route_history"] == ["Circuit: CIRCUIT_WORKING"]
+    assert "timeline" not in workflow
+    assert "route_history" not in workflow
 
     detail = client.get(f"/api/v1/workflows/{workflow['workflow_id']}")
     timeline = client.get(f"/api/v1/workflows/{workflow['workflow_id']}/timeline")
 
     assert detail.status_code == 200
-    assert detail.json()["workflow_id"] == workflow["workflow_id"]
+    detail_body = detail.json()
+    assert detail_body["workflow_id"] == workflow["workflow_id"]
+    assert detail_body["timeline"][0]["event_type"] == "workflow.lifecycle.changed"
+    assert detail_body["timeline"][0]["state"] == "CIRCUIT_IN_PROGRESS"
+    assert detail_body["timeline"][0]["canonical_state"] == "CIRCUIT_WORKING"
+    assert detail_body["timeline"][0]["new_state"] == "CIRCUIT_WORKING"
+    assert detail_body["route_history"] == ["Circuit: CIRCUIT_WORKING"]
     assert timeline.status_code == 200
     assert timeline.json()["events"][0]["new_state"] == "CIRCUIT_WORKING"
 
@@ -485,7 +488,11 @@ def test_pull_request_closed_is_not_automatically_merged() -> None:
     assert collection.status_code == 200
     workflows = collection.json()["workflows"]
     assert workflows[0]["current_state"] == "CLOSED_UNMERGED"
-    assert workflows[0]["timeline"][0]["state"] == "CLOSED_UNMERGED"
+    assert "timeline" not in workflows[0]
+
+    detail = client.get(f"/api/v1/workflows/{workflows[0]['workflow_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["timeline"][0]["state"] == "CLOSED_UNMERGED"
 
 
 def test_pull_request_closed_merged_is_explicitly_merged() -> None:
@@ -497,7 +504,11 @@ def test_pull_request_closed_merged_is_explicitly_merged() -> None:
     assert collection.status_code == 200
     workflows = collection.json()["workflows"]
     assert workflows[0]["current_state"] == "MERGED"
-    assert workflows[0]["timeline"][0]["state"] == "MERGED"
+    assert "timeline" not in workflows[0]
+
+    detail = client.get(f"/api/v1/workflows/{workflows[0]['workflow_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["timeline"][0]["state"] == "MERGED"
 
 
 def _workflow_record(workflow_id: str, state: WorkflowState, last_activity_at: datetime) -> WorkflowRecord:
