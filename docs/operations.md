@@ -76,7 +76,8 @@ event-backed workflows:
 | `GET /api/v1/workflows?limit=2` | `3500` bytes |
 
 The opt-in integration benchmark records wall-clock latency for the same
-requests without adding hardware-sensitive timing assertions to ordinary CI:
+requests without adding hardware-sensitive timing assertions to ordinary CI.
+It also records each request's serialized byte count, budget, and budget result:
 
 Ordinary CI also asserts aggregate count-query shape, bounded per-source
 hydration windows, and serialized-byte budgets for the production-shaped

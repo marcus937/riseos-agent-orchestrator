@@ -35,9 +35,21 @@ BENCHMARK_ITERATIONS_ENV_VAR = "MISSION_CONTROL_POLLING_BENCHMARK_ITERATIONS"
 BENCHMARK_OUTPUT_ENV_VAR = "MISSION_CONTROL_POLLING_BENCHMARK_OUTPUT"
 
 MISSION_CONTROL_POLLING_REQUESTS = (
-    ("snapshot", "/api/v1/orchestrator/snapshot"),
-    ("workflow_default_page", "/api/v1/workflows"),
-    ("workflow_two_item_page", "/api/v1/workflows?limit=2"),
+    (
+        "snapshot",
+        "/api/v1/orchestrator/snapshot",
+        DEFAULT_SNAPSHOT_SERIALIZED_BYTES_BUDGET,
+    ),
+    (
+        "workflow_default_page",
+        "/api/v1/workflows",
+        DEFAULT_WORKFLOW_PAGE_SERIALIZED_BYTES_BUDGET,
+    ),
+    (
+        "workflow_two_item_page",
+        "/api/v1/workflows?limit=2",
+        TWO_ITEM_WORKFLOW_PAGE_SERIALIZED_BYTES_BUDGET,
+    ),
 )
 
 
@@ -300,6 +312,26 @@ def test_mission_control_production_snapshot_has_bounded_queries_and_size_budget
     assert PRODUCTION_SECRET_SENTINEL not in response.text
 
 
+def test_mission_control_production_fixture_matches_required_scale() -> None:
+    fixture = MissionControlProductionFixture()
+
+    assert fixture.review_item_count >= 500
+    assert fixture.agent_lifecycle_record_count >= 500
+    assert fixture.pr_record_count >= 300
+    assert fixture.event_record_count >= 50
+    assert fixture.issue_record_count + fixture.pr_record_count == fixture.review_item_count
+
+
+def test_mission_control_polling_size_budgets_match_operations_documentation() -> None:
+    documented_budgets = _documented_polling_budgets()
+
+    assert documented_budgets == {
+        "GET /api/v1/orchestrator/snapshot": DEFAULT_SNAPSHOT_SERIALIZED_BYTES_BUDGET,
+        "GET /api/v1/workflows": DEFAULT_WORKFLOW_PAGE_SERIALIZED_BYTES_BUDGET,
+        "GET /api/v1/workflows?limit=2": TWO_ITEM_WORKFLOW_PAGE_SERIALIZED_BYTES_BUDGET,
+    }
+
+
 def test_mission_control_default_workflow_page_has_bounded_queries_and_size_budget(tmp_path: Path) -> None:
     client, storage, task_store, fixture = _seeded_client(tmp_path)
 
@@ -367,17 +399,19 @@ def test_mission_control_polling_observability_is_scalar_only(
     caplog.clear()
 
     snapshot = client.get("/api/v1/orchestrator/snapshot")
-    workflows = client.get("/api/v1/workflows?limit=2")
+    default_workflows = client.get("/api/v1/workflows")
+    two_item_workflows = client.get("/api/v1/workflows?limit=2")
 
     assert snapshot.status_code == 200
-    assert workflows.status_code == 200
+    assert default_workflows.status_code == 200
+    assert two_item_workflows.status_code == 200
     logs = _polling_logs(caplog)
-    assert {record["endpoint"] for record in logs} == {
-        "/api/v1/orchestrator/snapshot",
-        "/api/v1/workflows",
-    }
+    assert len(logs) == 3
     snapshot_log = next(record for record in logs if record["endpoint"] == "/api/v1/orchestrator/snapshot")
-    workflow_log = next(record for record in logs if record["endpoint"] == "/api/v1/workflows")
+    workflow_logs = [record for record in logs if record["endpoint"] == "/api/v1/workflows"]
+    assert len(workflow_logs) == 2
+    default_workflow_log = next(record for record in workflow_logs if record["limit"] == 50)
+    two_item_workflow_log = next(record for record in workflow_logs if record["limit"] == 2)
     assert snapshot_log["returned_count"] == 175
     assert snapshot_log["total_count"] == (
         fixture.agent_lifecycle_record_count
@@ -386,13 +420,18 @@ def test_mission_control_polling_observability_is_scalar_only(
         + fixture.event_record_count
     )
     assert snapshot_log["serialized_bytes"] == _model_serialized_bytes(snapshot.json())
-    assert workflow_log["returned_count"] == 2
-    assert workflow_log["total_count"] == fixture.total_workflow_count
-    assert workflow_log["serialized_bytes"] == _model_serialized_bytes(workflows.json())
-    assert workflow_log["limit"] == 2
-    assert workflow_log["offset"] == 0
-    assert workflow_log["filter"] == "active_recent"
-    assert workflow_log["recent_days"] == 14
+    assert default_workflow_log["returned_count"] == 50
+    assert default_workflow_log["total_count"] == fixture.total_workflow_count
+    assert default_workflow_log["serialized_bytes"] == _model_serialized_bytes(default_workflows.json())
+    assert default_workflow_log["offset"] == 0
+    assert default_workflow_log["filter"] == "active_recent"
+    assert default_workflow_log["recent_days"] == 14
+    assert two_item_workflow_log["returned_count"] == 2
+    assert two_item_workflow_log["total_count"] == fixture.total_workflow_count
+    assert two_item_workflow_log["serialized_bytes"] == _model_serialized_bytes(two_item_workflows.json())
+    assert two_item_workflow_log["offset"] == 0
+    assert two_item_workflow_log["filter"] == "active_recent"
+    assert two_item_workflow_log["recent_days"] == 14
     for record in logs:
         assert record["duration_ms"] >= 0
         assert record["serialized_bytes"] > 0
@@ -441,8 +480,8 @@ def test_mission_control_polling_integration_benchmark_records_wall_clock_latenc
     results = {
         "iterations": iterations,
         "requests": [
-            _benchmark_request(client, name, path, iterations=iterations)
-            for name, path in MISSION_CONTROL_POLLING_REQUESTS
+            _benchmark_request(client, name, path, budget_bytes=budget_bytes, iterations=iterations)
+            for name, path, budget_bytes in MISSION_CONTROL_POLLING_REQUESTS
         ],
     }
     output_path = os.getenv(BENCHMARK_OUTPUT_ENV_VAR)
@@ -513,7 +552,31 @@ def _json_log_payloads(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]
     return logs
 
 
-def _benchmark_request(client: TestClient, name: str, path: str, *, iterations: int) -> dict[str, Any]:
+def _documented_polling_budgets() -> dict[str, int]:
+    table_lines = (
+        Path(__file__).resolve().parents[1] / "docs/operations.md"
+    ).read_text().splitlines()
+    budgets: dict[str, int] = {}
+    for line in table_lines:
+        if not line.startswith("| `GET "):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 2:
+            continue
+        request = cells[0].removeprefix("`").removesuffix("`")
+        budget_text = cells[1].replace("`", "").removesuffix(" bytes")
+        budgets[request] = int(budget_text)
+    return budgets
+
+
+def _benchmark_request(
+    client: TestClient,
+    name: str,
+    path: str,
+    *,
+    budget_bytes: int,
+    iterations: int,
+) -> dict[str, Any]:
     durations_ms: list[float] = []
     response_body: dict[str, Any] | None = None
     status_code = 0
@@ -534,6 +597,8 @@ def _benchmark_request(client: TestClient, name: str, path: str, *, iterations: 
         "returned_count": returned_count,
         "total_count": total_count,
         "serialized_bytes": serialized_bytes,
+        "budget_bytes": budget_bytes,
+        "within_budget": serialized_bytes <= budget_bytes,
         "min_ms": min(durations_ms),
         "median_ms": statistics.median(durations_ms),
         "max_ms": max(durations_ms),
