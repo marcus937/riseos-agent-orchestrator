@@ -34,10 +34,22 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
       "blocked_count": 0,
       "recent_failure_count": 0
     },
+    "meta": {
+      "agents": { "returned": 0, "total": 0, "limit": 50, "truncated": false },
+      "issues": { "returned": 0, "total": 0, "limit": 50, "truncated": false },
+      "prs": { "returned": 0, "total": 0, "limit": 50, "truncated": false },
+      "events": { "returned": 0, "total": 0, "limit": 25, "truncated": false }
+    },
     "agents": [],
     "issues": [],
     "prs": [],
     "events": []
+  },
+  "workflows": {
+    "active": 1,
+    "blocked": 0,
+    "reviewing": 0,
+    "verified": 0
   },
   "queue": {},
   "health": {},
@@ -66,6 +78,7 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 | `schema_version` | string | Stable contract identifier. Current value is `orchestrator.snapshot.v1`. |
 | `generated_at` | datetime | UTC timestamp when the snapshot was assembled. |
 | `workforce` | object | JMC Workforce section payload. Contains `overview`, `agents`, `issues`, `prs`, and `events`. |
+| `workflows` | object | Canonical workflow summary counts. Detailed workflow records are owned by the workflow endpoints. |
 | `queue` | object | Existing `ReviewQueueStats` payload for operational queue counters and ages. |
 | `health` | object | Existing `DebugHealth` payload for service and webhook counters. |
 | `runtime` | object | Current Orchestrator runtime and dispatch configuration status. Secret values are never included. |
@@ -76,10 +89,11 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 | Field | Type | Definition |
 | --- | --- | --- |
 | `workforce.overview` | object | Compact summary for top-level JMC Workforce status cards. |
-| `workforce.agents` | array | Review lifecycle projection built from existing `ReviewLifecycleVisibility` records. |
-| `workforce.issues` | array | Review work items attached to GitHub issues and not PRs. |
-| `workforce.prs` | array | Review work items attached to GitHub pull requests. |
-| `workforce.events` | array | Recent accepted webhook events from the existing `EventRecord` source. |
+| `workforce.meta` | object | Collection count, limit, and truncation metadata for each bounded workforce list. |
+| `workforce.agents` | array | Compact review lifecycle projection built from existing `ReviewLifecycleVisibility` records. |
+| `workforce.issues` | array | Compact review work item projection for GitHub issue work items and not PRs. |
+| `workforce.prs` | array | Compact review work item projection for GitHub pull request work items. |
+| `workforce.events` | array | Compact recent accepted webhook event projection from the existing `EventRecord` source. |
 
 ## Overview Fields
 
@@ -99,17 +113,42 @@ When `REQUIRE_ADMIN_TOKEN_FOR_DEBUG_READS=true`, this endpoint requires the same
 | `blocked_count` | `DebugHealth` | Blocked review items. |
 | `recent_failure_count` | `ReviewQueueStats` | Count of queue items with recent failures. |
 
+## Payload Bounds
+
+The snapshot is a dashboard contract, not an archival export. It is intentionally bounded so Mission Control can poll it safely:
+
+- `workforce.agents`, `workforce.issues`, and `workforce.prs` return at most 50 records each.
+- `workforce.events` returns at most 25 records.
+- Embedded `workflow_events` and `workflow_state_history` return at most the 8 most recent lifecycle events per record while preserving `workflow_event_count` and `workflow_events_truncated`.
+- `labels` returns at most 20 labels per work item while preserving `label_count` and `labels_truncated`.
+- `recent_failures` returns at most 20 records.
+- Error strings in workforce records and `recent_failures` are capped at 2048 characters and expose a matching `*_truncated` boolean.
+- Full `runtime_validation_context` payloads are not included in the snapshot. Runtime status remains available through bounded fields such as `runtime_validation_id`, `runtime_validation_status`, `runtime_validation_digest`, and `runtime_validation_completed_at`.
+
+Collection metadata uses this shape:
+
+```json
+{
+  "returned": 50,
+  "total": 73,
+  "limit": 50,
+  "truncated": true
+}
+```
+
 ## Embedded Existing Models
 
-The snapshot intentionally reuses existing Orchestrator telemetry sources rather than duplicating business logic:
+The snapshot intentionally reuses existing Orchestrator telemetry sources and canonical workflow builders rather than duplicating business logic:
 
 - `WorkerStats` contributes worker activity fields to `workforce.overview` and runtime interpretation.
 - `ReviewQueueStats` is embedded at `queue`.
-- `ReviewWorkItem` is embedded in `workforce.issues` and `workforce.prs`.
-- `EventRecord` is embedded in `workforce.events`.
-- `RecentFailure` is embedded in `recent_failures`.
-- `ReviewLifecycleVisibility` is embedded in `workforce.agents`.
+- `ReviewWorkItem` contributes compact fields to `workforce.issues` and `workforce.prs`.
+- `EventRecord` contributes compact fields to `workforce.events`.
+- `RecentFailure` contributes bounded fields to `recent_failures`.
+- `ReviewLifecycleVisibility` contributes compact fields to `workforce.agents`.
 - Hermes dispatch configuration is normalized into `runtime.hermes_dispatch` as `HermesDispatchStatus`.
+
+Canonical ownership remains in the workflow lifecycle layer. Snapshot records expose `workflow_state`, `canonical_workflow_state`, `current_owner`, and bounded lifecycle events derived from those canonical builders. Detailed workflow cards, detail views, and full timelines should use `/api/v1/workflows`, `/api/v1/workflows/{workflow_id}`, and `/api/v1/workflows/{workflow_id}/timeline`.
 
 ## Access And Security
 
@@ -154,5 +193,6 @@ The contract is covered by endpoint tests that verify:
 
 - `GET /api/v1/orchestrator/snapshot` returns `schema_version: orchestrator.snapshot.v1`.
 - Existing webhook, event, queue, lifecycle, health, and runtime data are aggregated into one payload with JMC Workforce data under `workforce`.
+- Workforce list payloads are bounded and omit full runtime validation context payloads.
 - The endpoint follows the debug-read access policy when token protection is enabled.
 - Runtime status does not expose configured secret values.
