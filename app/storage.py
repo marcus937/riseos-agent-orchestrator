@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app.correlation import correlation_id_from_key
 from app.event_store import EventRecord
 from app.operational_logging import log_event
 from app.review_queue import ReviewQueueCounters, ReviewWorkItem, ReviewWorkItemStatus, review_queue_counters, review_work_item_identity
@@ -30,6 +31,7 @@ class SQLiteStateStore:
                     event_id TEXT PRIMARY KEY,
                     github_event TEXT NOT NULL,
                     diagnostic_stage TEXT NOT NULL DEFAULT 'webhook_accepted',
+                    correlation_id TEXT,
                     correlation_key TEXT,
                     repo_full_name TEXT,
                     branch TEXT,
@@ -43,12 +45,20 @@ class SQLiteStateStore:
                 """
             )
             _ensure_column(conn, "event_records", "diagnostic_stage", "TEXT NOT NULL DEFAULT 'webhook_accepted'")
+            _ensure_column(conn, "event_records", "correlation_id", "TEXT")
             _ensure_column(conn, "event_records", "correlation_key", "TEXT")
             _ensure_column(conn, "event_records", "pr_merged", "INTEGER")
+            _backfill_event_record_correlation_ids(conn)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_event_records_received_at
                 ON event_records (received_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_event_records_workflow_lookup
+                ON event_records (correlation_id, event_id, received_at DESC)
                 """
             )
             conn.execute(
@@ -102,6 +112,7 @@ class SQLiteStateStore:
                     event_id,
                     github_event,
                     diagnostic_stage,
+                    correlation_id,
                     correlation_key,
                     repo_full_name,
                     branch,
@@ -111,12 +122,13 @@ class SQLiteStateStore:
                     pr_merged,
                     received_at,
                     raw_action
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.event_id,
                     str(record.github_event),
                     record.diagnostic_stage,
+                    record.correlation_id,
                     record.correlation_key,
                     record.repo_full_name,
                     record.branch,
@@ -201,12 +213,33 @@ class SQLiteStateStore:
                 FROM event_records AS e
                 {where_sql}
                 ORDER BY e.received_at DESC,
-                         ('wf-' || e.event_id) ASC
+                         ('wf-' || COALESCE(e.correlation_id, e.event_id)) ASC
                 LIMIT ?
                 """,
                 (*params, limit),
             ).fetchall()
         return [self._event_record_from_row(row) for row in rows]
+
+    def get_event_record_for_workflow_id(self, workflow_id: str) -> EventRecord | None:
+        if not workflow_id.startswith("wf-"):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT e.*
+                FROM event_records AS e
+                WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
+                  AND ({_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL})
+                  AND ('wf-' || COALESCE(e.correlation_id, e.event_id)) = ?
+                ORDER BY e.received_at DESC,
+                         ('wf-' || COALESCE(e.correlation_id, e.event_id)) ASC
+                LIMIT 1
+                """,
+                (workflow_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._event_record_from_row(row)
 
     def save_review_work_item(self, item: ReviewWorkItem) -> None:
         log_workflow_chain_availability(
@@ -620,6 +653,28 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, 
     if column_name in columns:
         return
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _backfill_event_record_correlation_ids(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT event_id, correlation_key
+        FROM event_records
+        WHERE correlation_id IS NULL
+          AND correlation_key IS NOT NULL
+        """
+    ).fetchall()
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        correlation_id = correlation_id_from_key(str(row["correlation_key"]))
+        if correlation_id is not None:
+            updates.append((correlation_id, str(row["event_id"])))
+    if not updates:
+        return
+    conn.executemany(
+        "UPDATE event_records SET correlation_id = ? WHERE event_id = ?",
+        updates,
+    )
 
 
 def _dt(value: object | None) -> str | None:

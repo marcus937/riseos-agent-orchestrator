@@ -407,6 +407,91 @@ def test_workflow_endpoint_bounded_sqlite_event_candidates_follow_requested_page
     assert body["pagination"]["next_offset"] == 75
 
 
+def test_workflow_detail_uses_targeted_sqlite_review_item_lookup(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    storage.save_review_work_item(_review_item("detail-review", now))
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    detail = client.get("/api/v1/workflows/wf-detail-review")
+    timeline = client.get("/api/v1/workflows/wf-detail-review/timeline")
+
+    assert detail.status_code == 200
+    assert detail.json()["workflow_id"] == "wf-detail-review"
+    assert detail.json()["timeline"][0]["item_id"] == "detail-review"
+    assert timeline.status_code == 200
+    assert timeline.json()["events"][0]["item_id"] == "detail-review"
+
+
+def test_workflow_detail_uses_targeted_sqlite_agent_task_lookup(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    task_store.save_agent_task(_agent_task("detail-agent", AgentTaskStatus.QUEUED, now))
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    detail = client.get("/api/v1/workflows/wf-agent-task-detail-agent")
+    timeline = client.get("/api/v1/workflows/wf-agent-task-detail-agent/timeline")
+
+    assert detail.status_code == 200
+    assert detail.json()["workflow_id"] == "wf-agent-task-detail-agent"
+    assert detail.json()["agent_task_id"] == "detail-agent"
+    assert detail.json()["timeline"][0]["item_id"] == "detail-agent"
+    assert timeline.status_code == 200
+    assert timeline.json()["events"][0]["item_id"] == "detail-agent"
+
+
+def test_workflow_detail_uses_targeted_sqlite_event_lookup_by_correlation_id(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    target = EventRecord(
+        event_id="target-event",
+        github_event=GitHubEventType.PUSH,
+        correlation_key="riseos/example:commit:target-sha",
+        repo_full_name="riseos/example",
+        branch="agent-target",
+        commit_sha="target-sha",
+        received_at=base,
+    )
+    storage.save_event_record(target)
+    for index in range(60):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"newer-event-{index}",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch=f"agent-newer-{index}",
+                commit_sha=f"newer-sha-{index}",
+                received_at=base + timedelta(minutes=index + 1),
+            )
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    workflow_id = f"wf-{target.correlation_id}"
+    detail = client.get(f"/api/v1/workflows/{workflow_id}")
+    timeline = client.get(f"/api/v1/workflows/{workflow_id}/timeline")
+
+    assert detail.status_code == 200
+    detail_body = detail.json()
+    assert detail_body["workflow_id"] == workflow_id
+    assert detail_body["correlation_id"] == target.correlation_id
+    assert detail_body["timeline"][0]["source"] == "github_webhook"
+    assert detail_body["timeline"][0]["commit_sha"] == "target-sha"
+    assert timeline.status_code == 200
+    assert timeline.json()["events"][0]["commit_sha"] == "target-sha"
+
+
 def test_workflow_endpoint_bounded_sqlite_event_filters_match_active_recent_contract(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)

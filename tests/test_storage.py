@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+from app.correlation import correlation_id_from_key
 from app.event_store import event_record_from_parsed
 from app.github_events import parse_github_event
 from app.review_queue import ReviewWorkItemStatus, review_work_item_from_parsed
@@ -47,6 +48,44 @@ def test_duplicate_event_record_is_ignored(tmp_path) -> None:
     assert second_saved is False
     assert store.has_event_record("delivery-1") is True
     assert store.event_count() == 1
+
+
+def test_event_record_correlation_id_backfills_existing_rows(tmp_path) -> None:
+    db_path = tmp_path / "orchestrator.db"
+    correlation_key = "riseos/example:commit:abc123"
+    workflow_id = f"wf-{correlation_id_from_key(correlation_key)}"
+    SQLiteStateStore(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO event_records (
+                event_id,
+                github_event,
+                diagnostic_stage,
+                correlation_key,
+                repo_full_name,
+                branch,
+                commit_sha,
+                received_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-event",
+                "push",
+                "webhook_accepted",
+                correlation_key,
+                "riseos/example",
+                "agent-integration",
+                "abc123",
+                "2026-01-20T12:00:00+00:00",
+            ),
+        )
+
+    reloaded = SQLiteStateStore(str(db_path)).get_event_record_for_workflow_id(workflow_id)
+
+    assert reloaded is not None
+    assert reloaded.event_id == "legacy-event"
+    assert reloaded.correlation_id == correlation_id_from_key(correlation_key)
 
 
 def test_issue_dispatch_claim_is_single_owner(tmp_path) -> None:

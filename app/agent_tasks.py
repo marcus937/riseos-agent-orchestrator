@@ -394,10 +394,24 @@ class SQLiteAgentTaskStore:
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
-        if row is None:
-            return None
-        tasks = self.list_agent_tasks()
-        return next((task for task in tasks if task.task_id == task_id), None)
+            if row is None:
+                return None
+            task = _task_from_row(row)
+            if not task.dependency_task_ids:
+                return task
+            dependency_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM agent_tasks
+                WHERE task_id IN ({','.join('?' for _ in task.dependency_task_ids)})
+                """,
+                task.dependency_task_ids,
+            ).fetchall()
+        dependencies_by_id = {
+            dependency.task_id: dependency
+            for dependency in (_task_from_row(dependency_row) for dependency_row in dependency_rows)
+        }
+        return refresh_agent_task_dependency_state(task, dependencies_by_id)
 
 
 agent_task_store = InMemoryAgentTaskStore()

@@ -13,7 +13,7 @@ from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
 from app.config import Settings, get_settings
 from app.event_store import event_store
-from app.review_queue import review_queue
+from app.review_queue import ReviewWorkItem, review_queue
 from app.storage import SQLiteStateStore
 from app.workflows import (
     WORKFLOW_LIST_DEFAULT_LIMIT,
@@ -259,7 +259,7 @@ async def get_workflow(
         agent_store = _agent_task_store(request, settings)
         return build_workflow_response(workflow, agent_store.list_agent_tasks())
 
-    legacy_workflow = find_workflow(_build_request_workflows(request), workflow_id)
+    legacy_workflow = _build_request_workflow(request, settings, workflow_id)
     if legacy_workflow is not None:
         return legacy_workflow
 
@@ -271,8 +271,9 @@ async def get_workflow_timeline(
     workflow_id: str,
     request: Request,
     _: None = Depends(_require_workflow_read_access),
+    settings: Settings = Depends(get_settings),
 ) -> WorkflowTimeline:
-    workflow = find_workflow(_build_request_workflows(request), workflow_id)
+    workflow = _build_request_workflow(request, settings, workflow_id)
     if workflow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
     return WorkflowTimeline(workflow_id=workflow.workflow_id, events=workflow.timeline)
@@ -296,6 +297,65 @@ def _build_request_workflows(request: Request) -> list[WorkflowRecord]:
     if storage is not None:
         return build_workflows(storage.list_review_work_items(), storage.recent_events(), agent_tasks)
     return build_workflows(review_queue.list_items(), event_store.recent_events(), agent_tasks)
+
+
+def _build_request_workflow(
+    request: Request,
+    settings: Settings,
+    workflow_id: str,
+) -> WorkflowRecord | None:
+    storage = _storage(request)
+    if storage is not None:
+        workflow = _build_storage_workflow(request, settings, storage, workflow_id)
+        if workflow is not None:
+            return workflow
+    return find_workflow(_build_request_workflows(request), workflow_id)
+
+
+def _build_storage_workflow(
+    request: Request,
+    settings: Settings,
+    storage: SQLiteStateStore,
+    workflow_id: str,
+) -> WorkflowRecord | None:
+    agent_task = _agent_task_for_workflow_id(request, settings, workflow_id)
+    if agent_task is not None:
+        return build_workflows([], [], [agent_task])[0]
+
+    review_item = _review_work_item_for_workflow_id(storage, workflow_id)
+    if review_item is not None:
+        return build_workflows([review_item], [], [])[0]
+
+    if hasattr(storage, "get_event_record_for_workflow_id"):
+        event_record = storage.get_event_record_for_workflow_id(workflow_id)
+        if event_record is not None:
+            return build_workflows([], [event_record], [])[0]
+
+    return None
+
+
+def _agent_task_for_workflow_id(
+    request: Request,
+    settings: Settings,
+    workflow_id: str,
+) -> AgentTask | None:
+    prefix = "wf-agent-task-"
+    if not workflow_id.startswith(prefix):
+        return None
+    agent_store = _agent_task_store_for_read(request, settings)
+    if agent_store is None:
+        return None
+    return agent_store.get_agent_task(workflow_id.removeprefix(prefix))
+
+
+def _review_work_item_for_workflow_id(
+    storage: SQLiteStateStore,
+    workflow_id: str,
+) -> ReviewWorkItem | None:
+    prefix = "wf-"
+    if not workflow_id.startswith(prefix):
+        return None
+    return storage.get_review_work_item(workflow_id.removeprefix(prefix))
 
 
 def _agent_task_store_for_read(request: Request, settings: Settings) -> AgentTaskStore | None:
