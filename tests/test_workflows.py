@@ -268,6 +268,37 @@ def test_build_workflows_merges_correlated_event_records_into_full_timeline() ->
     assert workflow.route_history == ["Circuit: CIRCUIT_WORKING", "Human: MERGED"]
 
 
+def test_build_workflows_keeps_distinct_ref_review_and_event_workflows() -> None:
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    workflows = build_workflows(
+        [_review_item("review-push", base)],
+        [
+            EventRecord(
+                event_id="duplicate-push-event",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch="agent-review-push",
+                commit_sha="sha-review-push",
+                received_at=base + timedelta(minutes=2),
+            ),
+            EventRecord(
+                event_id="unrelated-push-event",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch="agent-unrelated",
+                commit_sha="unrelated-sha",
+                received_at=base + timedelta(minutes=1),
+            ),
+        ],
+    )
+
+    assert [workflow.workflow_id for workflow in workflows] == [
+        "wf-unrelated-push-event",
+        "wf-review-push",
+    ]
+
+
 def test_workflow_endpoint_honors_pagination_query_params() -> None:
     client = client_with_secret()
     base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
@@ -496,6 +527,115 @@ def test_workflow_endpoint_bounded_sqlite_event_totals_are_deduplicated_by_workf
     assert body["pagination"]["unfiltered_total"] == 3
     assert body["pagination"]["has_next"] is True
     assert body["pagination"]["next_offset"] == 2
+
+
+def test_workflow_endpoint_bounded_sqlite_event_duplicates_review_item_identity(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    storage.save_review_work_item(
+        ReviewWorkItem(
+            id="review-pr-17",
+            created_at=base,
+            updated_at=base,
+            repo_full_name="riseos/example",
+            event_type=GitHubEventType.PULL_REQUEST,
+            branch="feature/review-pr-17",
+            commit_sha="review-sha",
+            pr_number=17,
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="duplicate-pr-event",
+            github_event=GitHubEventType.PULL_REQUEST,
+            correlation_id="orch-duplicate-pr-event",
+            repo_full_name="riseos/example",
+            pr_number=17,
+            received_at=base + timedelta(minutes=1),
+            raw_action="opened",
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="duplicate-pr-push",
+            github_event=GitHubEventType.PUSH,
+            correlation_id="orch-duplicate-pr-event",
+            repo_full_name="riseos/example",
+            branch="feature/review-pr-17",
+            commit_sha="review-sha",
+            received_at=base + timedelta(minutes=2),
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="unique-event",
+            github_event=GitHubEventType.PUSH,
+            repo_full_name="riseos/example",
+            branch="agent-unique",
+            commit_sha="unique-sha",
+            received_at=base + timedelta(minutes=3),
+        )
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-unique-event",
+        "wf-review-pr-17",
+    ]
+    assert body["pagination"]["returned"] == 2
+    assert body["pagination"]["total"] == 2
+    assert body["pagination"]["unfiltered_total"] == 2
+    assert body["pagination"]["has_next"] is False
+
+
+def test_workflow_endpoint_bounded_sqlite_keeps_distinct_ref_workflows(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    storage.save_review_work_item(_review_item("review-push", base))
+    storage.save_event_record(
+        EventRecord(
+            event_id="duplicate-push-event",
+            github_event=GitHubEventType.PUSH,
+            repo_full_name="riseos/example",
+            branch="agent-review-push",
+            commit_sha="sha-review-push",
+            received_at=base + timedelta(minutes=1),
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="unrelated-push-event",
+            github_event=GitHubEventType.PUSH,
+            repo_full_name="riseos/example",
+            branch="agent-unrelated",
+            commit_sha="unrelated-sha",
+            received_at=base + timedelta(minutes=2),
+        )
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-unrelated-push-event",
+        "wf-review-push",
+    ]
+    assert body["pagination"]["total"] == 2
+    assert body["pagination"]["unfiltered_total"] == 2
 
 
 def test_workflow_detail_uses_targeted_sqlite_review_item_lookup(tmp_path) -> None:

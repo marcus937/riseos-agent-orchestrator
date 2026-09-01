@@ -232,11 +232,36 @@ class SQLiteStateStore:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
+                WITH ranked_event_workflow AS (
+                    SELECT
+                        e.*,
+                        ('wf-' || COALESCE(e.correlation_id, e.event_id)) AS workflow_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+                            ORDER BY e.received_at DESC, e.event_id DESC
+                        ) AS workflow_rank,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+                            ORDER BY
+                                CASE
+                                    WHEN e.issue_number IS NOT NULL OR e.pr_number IS NOT NULL THEN 0
+                                    ELSE 1
+                                END,
+                                e.received_at DESC,
+                                e.event_id DESC
+                        ) AS workflow_identity_rank
+                    FROM event_records AS e
+                    WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
+                      AND ('wf-' || COALESCE(e.correlation_id, e.event_id)) = ?
+                )
                 SELECT {_event_record_select_sql("e")}
-                FROM event_records AS e
-                WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
-                  AND ({_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL})
-                  AND ('wf-' || COALESCE(e.correlation_id, e.event_id)) = ?
+                FROM ranked_event_workflow AS e
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM ranked_event_workflow AS identity
+                    WHERE identity.workflow_identity_rank = 1
+                      AND ({_event_workflow_not_review_duplicate_sql("identity")})
+                )
                 ORDER BY e.received_at ASC,
                          e.event_id ASC
                 """,
@@ -724,7 +749,18 @@ def _review_workflow_filter_sql(workflow_filter: str, recent_since: datetime | N
 
 
 def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
-    predicates = ["latest.workflow_rank = 1"]
+    predicates = [
+        "latest.workflow_rank = 1",
+        f"""
+        EXISTS (
+            SELECT 1
+            FROM ranked_event_workflows AS identity
+            WHERE identity.workflow_id = latest.workflow_id
+              AND identity.workflow_identity_rank = 1
+              AND ({_event_workflow_not_review_duplicate_sql("identity")})
+        )
+        """,
+    ]
     params: list[object] = []
     recent_sql = "latest.received_at >= ?"
     active_sql = "NOT (latest.github_event = 'pull_request' AND latest.raw_action = 'closed')"
@@ -744,6 +780,51 @@ def _latest_event_workflow_filter_sql(workflow_filter: str, recent_since: dateti
 
 def _event_record_select_sql(alias: str) -> str:
     return ", ".join(f"{alias}.{column}" for column in _EVENT_RECORD_COLUMNS)
+
+
+def _event_workflow_not_review_duplicate_sql(alias: str) -> str:
+    return f"""
+NOT EXISTS (
+    SELECT 1
+    FROM review_work_items AS r
+    WHERE (
+        r.repo_full_name = {alias}.repo_full_name
+        OR (r.repo_full_name IS NULL AND {alias}.repo_full_name IS NULL)
+    )
+      AND (
+        (
+            (
+                {alias}.issue_number IS NOT NULL
+                OR {alias}.pr_number IS NOT NULL
+                OR r.issue_number IS NOT NULL
+                OR r.pr_number IS NOT NULL
+            )
+            AND (
+                r.issue_number = {alias}.issue_number
+                OR (r.issue_number IS NULL AND {alias}.issue_number IS NULL)
+            )
+            AND (
+                r.pr_number = {alias}.pr_number
+                OR (r.pr_number IS NULL AND {alias}.pr_number IS NULL)
+            )
+        )
+        OR (
+            {alias}.issue_number IS NULL
+            AND {alias}.pr_number IS NULL
+            AND r.issue_number IS NULL
+            AND r.pr_number IS NULL
+            AND (
+                r.branch = {alias}.branch
+                OR (r.branch IS NULL AND {alias}.branch IS NULL)
+            )
+            AND (
+                r.commit_sha = {alias}.commit_sha
+                OR (r.commit_sha IS NULL AND {alias}.commit_sha IS NULL)
+            )
+        )
+      )
+)
+"""
 
 
 def _log_review_work_item_persistence_json(
@@ -861,25 +942,6 @@ _EVENT_WORKFLOW_CANONICAL_SQL = """
 )
 """
 
-_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL = """
-NOT EXISTS (
-    SELECT 1
-    FROM review_work_items AS r
-    WHERE (
-        r.repo_full_name = e.repo_full_name
-        OR (r.repo_full_name IS NULL AND e.repo_full_name IS NULL)
-    )
-      AND (
-        r.issue_number = e.issue_number
-        OR (r.issue_number IS NULL AND e.issue_number IS NULL)
-      )
-      AND (
-        r.pr_number = e.pr_number
-        OR (r.pr_number IS NULL AND e.pr_number IS NULL)
-      )
-)
-"""
-
 _RANKED_EVENT_WORKFLOWS_CTE_SQL = f"""
 ranked_event_workflows AS (
     SELECT
@@ -888,10 +950,19 @@ ranked_event_workflows AS (
         ROW_NUMBER() OVER (
             PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
             ORDER BY e.received_at DESC, e.event_id DESC
-        ) AS workflow_rank
+        ) AS workflow_rank,
+        ROW_NUMBER() OVER (
+            PARTITION BY ('wf-' || COALESCE(e.correlation_id, e.event_id))
+            ORDER BY
+                CASE
+                    WHEN e.issue_number IS NOT NULL OR e.pr_number IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                e.received_at DESC,
+                e.event_id DESC
+        ) AS workflow_identity_rank
     FROM event_records AS e
     WHERE ({_EVENT_WORKFLOW_CANONICAL_SQL})
-      AND ({_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL})
 )
 """
 

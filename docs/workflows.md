@@ -105,8 +105,10 @@ The `workflows` array is intentionally compact for polling clients. It omits
 `timeline` and `route_history`; fetch `GET /api/v1/workflows/{workflow_id}` or
 `GET /api/v1/workflows/{workflow_id}/timeline` when a view needs full detail.
 Correlated GitHub event records are collapsed into one event-backed workflow;
-`pagination.total` and `pagination.unfiltered_total` count normalized workflows,
-not raw event rows. `pagination` is additive metadata:
+event-backed workflows are de-duplicated against review work items by issue/PR
+subject when present, or by branch and commit for ref-only events. `pagination.total`
+and `pagination.unfiltered_total` count normalized workflows, not raw event rows.
+`pagination` is additive metadata:
 
 ```json
 {

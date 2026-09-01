@@ -170,6 +170,7 @@ class InMemoryAgentTaskStore:
         workflow_filter: str = "active_recent",
         recent_since: datetime | None = None,
     ) -> int:
+        refresh_agent_task_dependency_states(list(self._items))
         return len(
             _filter_agent_tasks_for_workflow_collection(
                 list(self._items),
@@ -187,6 +188,7 @@ class InMemoryAgentTaskStore:
     ) -> list[AgentTask]:
         if limit <= 0:
             return []
+        refresh_agent_task_dependency_states(list(self._items))
         tasks = _filter_agent_tasks_for_workflow_collection(
             list(self._items),
             workflow_filter=workflow_filter,
@@ -389,7 +391,8 @@ class SQLiteAgentTaskStore:
                 """,
                 (*params, limit),
             ).fetchall()
-        return [_task_from_row(row) for row in rows]
+            tasks = [_task_from_row(row) for row in rows]
+            return _refresh_sqlite_agent_task_dependency_states(conn, tasks)
 
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._connect() as conn:
@@ -397,21 +400,7 @@ class SQLiteAgentTaskStore:
             if row is None:
                 return None
             task = _task_from_row(row)
-            if not task.dependency_task_ids:
-                return task
-            dependency_rows = conn.execute(
-                f"""
-                SELECT *
-                FROM agent_tasks
-                WHERE task_id IN ({','.join('?' for _ in task.dependency_task_ids)})
-                """,
-                task.dependency_task_ids,
-            ).fetchall()
-        dependencies_by_id = {
-            dependency.task_id: dependency
-            for dependency in (_task_from_row(dependency_row) for dependency_row in dependency_rows)
-        }
-        return refresh_agent_task_dependency_state(task, dependencies_by_id)
+            return _refresh_sqlite_agent_task_dependency_states(conn, [task])[0]
 
 
 agent_task_store = InMemoryAgentTaskStore()
@@ -459,6 +448,39 @@ def refresh_agent_task_dependency_state(task: AgentTask, tasks_by_id: dict[str, 
 
 def refresh_agent_task_dependency_states(tasks: list[AgentTask]) -> list[AgentTask]:
     tasks_by_id = {task.task_id: task for task in tasks}
+    for task in tasks:
+        refresh_agent_task_dependency_state(task, tasks_by_id)
+    return tasks
+
+
+def _refresh_sqlite_agent_task_dependency_states(
+    conn: sqlite3.Connection,
+    tasks: list[AgentTask],
+) -> list[AgentTask]:
+    tasks_by_id = {task.task_id: task for task in tasks}
+    missing_dependency_ids = sorted(
+        {
+            dependency_id
+            for task in tasks
+            for dependency_id in task.dependency_task_ids
+            if dependency_id not in tasks_by_id
+        }
+    )
+    if missing_dependency_ids:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM agent_tasks
+            WHERE task_id IN ({','.join('?' for _ in missing_dependency_ids)})
+            """,
+            missing_dependency_ids,
+        ).fetchall()
+        tasks_by_id.update(
+            {
+                dependency.task_id: dependency
+                for dependency in (_task_from_row(row) for row in rows)
+            }
+        )
     for task in tasks:
         refresh_agent_task_dependency_state(task, tasks_by_id)
     return tasks

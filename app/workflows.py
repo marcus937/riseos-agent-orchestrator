@@ -88,7 +88,7 @@ def build_workflows(
 ) -> list[WorkflowRecord]:
     workflows = [_workflow_from_item(item) for item in review_items]
     workflows.extend(_workflow_from_agent_task(task) for task in (agent_tasks or []))
-    item_keys = {_workflow_identity_key(workflow) for workflow in workflows}
+    review_item_keys = {_review_item_workflow_identity_key(item) for item in review_items}
     event_records_by_workflow_id: dict[str, list[EventRecord]] = {}
     for record in events:
         projection = build_event_workflow_projection(record)
@@ -97,7 +97,7 @@ def build_workflows(
         event_records_by_workflow_id.setdefault(_event_workflow_id(record), []).append(record)
     for records in event_records_by_workflow_id.values():
         event_workflow = _workflow_from_events(records)
-        if _workflow_identity_key(event_workflow) in item_keys:
+        if _event_records_workflow_identity_key(records) in review_item_keys:
             continue
         workflows.append(event_workflow)
     return sort_workflows(workflows)
@@ -418,8 +418,56 @@ def _owner_from_agent_task_state(state: WorkflowState) -> WorkflowOwner:
     return WorkflowOwner.ORCHESTRATOR
 
 
-def _workflow_identity_key(workflow: WorkflowRecord) -> tuple[str | None, int | None, int | None, str | None]:
-    return (workflow.repo_full_name, workflow.issue_number, workflow.pr_number, workflow.agent_task_id)
+def _review_item_workflow_identity_key(
+    item: ReviewWorkItem,
+) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
+    return _github_workflow_identity_key(
+        repo_full_name=item.repo_full_name,
+        issue_number=item.issue_number,
+        pr_number=item.pr_number,
+        branch=item.branch,
+        commit_sha=item.commit_sha,
+        fallback_id=item.id,
+    )
+
+
+def _event_records_workflow_identity_key(
+    records: list[EventRecord],
+) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
+    ordered_records = sorted(records, key=lambda record: (record.received_at, record.event_id))
+    for record in reversed(ordered_records):
+        if record.issue_number is not None or record.pr_number is not None:
+            return _event_record_workflow_identity_key(record)
+    return _event_record_workflow_identity_key(ordered_records[-1])
+
+
+def _event_record_workflow_identity_key(
+    record: EventRecord,
+) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
+    return _github_workflow_identity_key(
+        repo_full_name=record.repo_full_name,
+        issue_number=record.issue_number,
+        pr_number=record.pr_number,
+        branch=record.branch,
+        commit_sha=record.commit_sha,
+        fallback_id=record.correlation_id or record.event_id,
+    )
+
+
+def _github_workflow_identity_key(
+    *,
+    repo_full_name: str | None,
+    issue_number: int | None,
+    pr_number: int | None,
+    branch: str | None,
+    commit_sha: str | None,
+    fallback_id: str,
+) -> tuple[str, str | None, int | None, int | None, str | None, str | None]:
+    if issue_number is not None or pr_number is not None:
+        return ("github_subject", repo_full_name, issue_number, pr_number, None, None)
+    if branch is not None or commit_sha is not None:
+        return ("github_ref", repo_full_name, None, None, branch, commit_sha)
+    return ("github_record", repo_full_name, None, None, fallback_id, None)
 
 
 def _event_workflow_id(record: EventRecord) -> str:

@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
@@ -93,3 +95,39 @@ def test_dependency_task_ids_survive_sqlite_reload(tmp_path) -> None:
     assert saved_b.dependency_task_ids == [task_a.task_id]
     assert saved_b.blocked is True
     assert saved_b.blocked_by == [task_a.task_id]
+
+
+def test_bounded_sqlite_agent_task_collection_refreshes_dependency_state(tmp_path) -> None:
+    db_path = tmp_path / "agent_tasks.db"
+    store = SQLiteAgentTaskStore(str(db_path))
+    task_a = create_agent_task(request("Task A"))
+    task_b = create_agent_task(request("Task B", dependency_task_ids=[task_a.task_id]))
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    task_a.created_at = base
+    task_a.updated_at = base
+    task_b.created_at = base + timedelta(minutes=1)
+    task_b.updated_at = task_b.created_at
+    store.save_agent_task(task_a)
+    store.save_agent_task(task_b)
+
+    first_page = SQLiteAgentTaskStore(str(db_path)).list_agent_tasks_for_workflow_collection(
+        limit=1,
+        workflow_filter="all",
+    )
+
+    assert [task.task_id for task in first_page] == [task_b.task_id]
+    assert first_page[0].blocked is True
+    assert first_page[0].blocked_by == [task_a.task_id]
+
+    task_a.status = AgentTaskStatus.COMPLETED
+    task_a.completed_at = task_a.updated_at
+    store.save_agent_task(task_a)
+
+    refreshed_page = SQLiteAgentTaskStore(str(db_path)).list_agent_tasks_for_workflow_collection(
+        limit=1,
+        workflow_filter="all",
+    )
+
+    assert [task.task_id for task in refreshed_page] == [task_b.task_id]
+    assert refreshed_page[0].blocked is False
+    assert refreshed_page[0].blocked_by == []
