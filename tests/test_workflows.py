@@ -428,6 +428,51 @@ def test_workflow_endpoint_uses_summary_records_without_detail_payloads(tmp_path
     assert task_detail_sentinel not in response.text
 
 
+def test_workflow_endpoint_bounded_sqlite_pages_across_sources_by_activity(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+    storage.save_event_record(
+        EventRecord(
+            event_id="newest-event",
+            github_event=GitHubEventType.PUSH,
+            repo_full_name="riseos/example",
+            branch="agent-newest",
+            commit_sha="sha-newest",
+            received_at=base + timedelta(minutes=3),
+        )
+    )
+    storage.save_review_work_item(_review_item("middle-review", base + timedelta(minutes=2)))
+    task_store.save_agent_task(
+        _agent_task("oldest-agent", AgentTaskStatus.QUEUED, base + timedelta(minutes=1))
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=2&offset=1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-middle-review",
+        "wf-agent-task-oldest-agent",
+    ]
+    assert body["pagination"] == {
+        "limit": 2,
+        "offset": 1,
+        "returned": 2,
+        "total": 3,
+        "unfiltered_total": 3,
+        "truncated": False,
+        "has_next": False,
+        "next_offset": None,
+        "filter": "all",
+        "recent_days": WORKFLOW_LIST_DEFAULT_RECENT_DAYS,
+    }
+
+
 def test_workflow_endpoint_bounded_sqlite_recent_filter_counts_review_items(tmp_path) -> None:
     db_path = str(tmp_path / "orchestrator.db")
     storage = NoFullWorkflowListSQLiteStateStore(db_path)
@@ -456,6 +501,43 @@ def test_workflow_endpoint_bounded_sqlite_recent_filter_counts_review_items(tmp_
     ]
     assert body["pagination"]["total"] == 2
     assert body["pagination"]["unfiltered_total"] == 7
+    assert body["pagination"]["has_next"] is False
+
+
+def test_workflow_endpoint_bounded_sqlite_agent_task_recent_filter_uses_status_timestamps(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+    stale = now - timedelta(days=30)
+    recent = now - timedelta(minutes=5)
+    recent_completed = _agent_task("recent-completed", AgentTaskStatus.COMPLETED, stale)
+    recent_completed.updated_at = stale
+    recent_completed.completed_at = recent
+    stale_completed = _agent_task("stale-completed", AgentTaskStatus.COMPLETED, stale)
+    stale_completed.updated_at = stale
+    stale_completed.completed_at = stale
+    task_store.save_agent_task(stale_completed)
+    task_store.save_agent_task(recent_completed)
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=recent&limit=10&recent_days=14")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-agent-task-recent-completed",
+    ]
+    assert datetime.fromisoformat(
+        body["workflows"][0]["last_activity_at"].replace("Z", "+00:00")
+    ) == recent
+    assert body["pagination"]["returned"] == 1
+    assert body["pagination"]["total"] == 1
+    assert body["pagination"]["unfiltered_total"] == 2
     assert body["pagination"]["has_next"] is False
 
 

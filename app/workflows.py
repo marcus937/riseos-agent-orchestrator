@@ -316,11 +316,10 @@ def workflow_summary_from_agent_task(
     current_state = _state_from_agent_task_status(task.status)
     lifecycle_events = getattr(task, "lifecycle_events", [])
     last_event = lifecycle_events[-1] if lifecycle_events else None
-    last_activity_at = (
-        last_event.occurred_at
-        if last_event is not None
-        else _agent_task_last_activity_at(task)
-    )
+    activity_candidates = [_agent_task_last_activity_at(task)]
+    if last_event is not None:
+        activity_candidates.append(last_event.occurred_at)
+    last_activity_at = max(activity_candidates, key=_as_utc)
     return WorkflowSummaryRecord(
         workflow_id=f"wf-agent-task-{task.task_id}",
         correlation_id=task.correlation_id,

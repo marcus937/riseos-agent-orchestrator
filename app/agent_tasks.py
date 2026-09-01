@@ -434,7 +434,8 @@ class SQLiteAgentTaskStore:
                 f"""
                 SELECT * FROM agent_tasks
                 {where_sql}
-                ORDER BY updated_at DESC,
+                ORDER BY {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         updated_at DESC,
                          created_at DESC,
                          ('wf-agent-task-' || task_id) ASC
                 LIMIT ?
@@ -479,7 +480,8 @@ class SQLiteAgentTaskStore:
                     last_actor
                 FROM agent_tasks
                 {where_sql}
-                ORDER BY updated_at DESC,
+                ORDER BY {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} DESC,
+                         updated_at DESC,
                          created_at DESC,
                          ('wf-agent-task-' || task_id) ASC
                 LIMIT ?
@@ -762,19 +764,31 @@ def _filter_agent_tasks_for_workflow_collection(
     if workflow_filter == "active":
         return [task for task in tasks if _agent_task_workflow_active(task)]
     if workflow_filter == "recent":
-        return [task for task in tasks if recent_since is not None and task.updated_at >= recent_since]
+        return [
+            task
+            for task in tasks
+            if recent_since is not None
+            and _agent_task_workflow_last_activity_at(task) >= recent_since
+        ]
     return [
         task
         for task in tasks
         if _agent_task_workflow_active(task)
-        or (recent_since is not None and task.updated_at >= recent_since)
+        or (
+            recent_since is not None
+            and _agent_task_workflow_last_activity_at(task) >= recent_since
+        )
     ]
 
 
 def _sort_agent_tasks_for_workflow_collection(tasks: list[AgentTask]) -> list[AgentTask]:
     return sorted(
         sorted(tasks, key=lambda task: f"wf-agent-task-{task.task_id}"),
-        key=lambda task: (task.updated_at, task.created_at),
+        key=lambda task: (
+            _agent_task_workflow_last_activity_at(task),
+            task.updated_at,
+            task.created_at,
+        ),
         reverse=True,
     )
 
@@ -783,14 +797,36 @@ def _agent_task_workflow_active(task: AgentTask) -> bool:
     return task.status != AgentTaskStatus.COMPLETED
 
 
+def _agent_task_workflow_last_activity_at(task: AgentTask) -> datetime:
+    values = [
+        value
+        for value in (
+            task.updated_at,
+            task.completed_at,
+            task.failed_at,
+            task.cancelled_at,
+            task.running_at,
+            task.claimed_at,
+            task.assigned_at,
+            task.queued_at,
+            task.created_at,
+        )
+        if value is not None
+    ]
+    return max(values)
+
+
 def _agent_task_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
     if workflow_filter == "all":
         return "", ()
     if workflow_filter == "active":
         return "WHERE status <> ?", (AgentTaskStatus.COMPLETED.value,)
     if workflow_filter == "recent":
-        return "WHERE updated_at >= ?", (_dt(recent_since),)
-    return "WHERE status <> ? OR updated_at >= ?", (AgentTaskStatus.COMPLETED.value, _dt(recent_since))
+        return f"WHERE {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} >= ?", (_dt(recent_since),)
+    return (
+        f"WHERE status <> ? OR {_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL} >= ?",
+        (AgentTaskStatus.COMPLETED.value, _dt(recent_since)),
+    )
 
 
 def _execution_evidence_with_preserved_orchestration_metadata(
@@ -856,6 +892,21 @@ _AGENT_TASK_EXTRA_COLUMNS = [
     ("execution_evidence", "TEXT NOT NULL DEFAULT '{}'"),
     ("last_actor", "TEXT"),
 ]
+
+
+_AGENT_TASK_WORKFLOW_LAST_ACTIVITY_SQL = """
+max(
+    COALESCE(updated_at, ''),
+    COALESCE(completed_at, ''),
+    COALESCE(failed_at, ''),
+    COALESCE(cancelled_at, ''),
+    COALESCE(running_at, ''),
+    COALESCE(claimed_at, ''),
+    COALESCE(assigned_at, ''),
+    COALESCE(queued_at, ''),
+    COALESCE(created_at, '')
+)
+"""
 
 
 def _last_agent_task_lifecycle_actor(task: AgentTask) -> str | None:
