@@ -7,13 +7,15 @@ from fastapi.testclient import TestClient
 from app.agent_tasks import (
     AgentTask,
     AgentTaskCreateRequest,
+    AgentTaskLifecycleEvent,
+    AgentTaskStatus,
     SQLiteAgentTaskStore,
     agent_task_store,
     create_agent_task,
 )
 from app.circuit_runtime_validation_routes import register_circuit_runtime_validation_routes
 from app.config import get_settings
-from app.event_store import event_store
+from app.event_store import EventRecord, event_store
 from app.github_events import GitHubEventType
 from app.main import app
 from app.review_queue import ReviewWorkItem, review_queue
@@ -58,6 +60,9 @@ def client_with_secret(
 class NoFullWorkflowListSQLiteStateStore(SQLiteStateStore):
     def list_review_work_items(self) -> list[ReviewWorkItem]:
         raise AssertionError("GET /api/v1/workflows must not hydrate all review work items")
+
+    def recent_events(self, limit: int = 50) -> list[EventRecord]:
+        raise AssertionError("GET /api/v1/workflows must not hydrate legacy recent events")
 
 
 class NoFullWorkflowListSQLiteAgentTaskStore(SQLiteAgentTaskStore):
@@ -292,6 +297,167 @@ def test_workflow_endpoint_uses_bounded_sqlite_queries_for_collection(tmp_path) 
     }
 
 
+def test_workflow_endpoint_bounded_sqlite_recent_filter_counts_review_items(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+
+    for index in range(5):
+        storage.save_review_work_item(
+            _review_item(f"stale-review-{index}", now - timedelta(days=30, minutes=index))
+        )
+    for index in range(2):
+        storage.save_review_work_item(
+            _review_item(f"recent-review-{index}", now - timedelta(minutes=index))
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=recent&limit=10&recent_days=14")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-recent-review-0",
+        "wf-recent-review-1",
+    ]
+    assert body["pagination"]["total"] == 2
+    assert body["pagination"]["unfiltered_total"] == 7
+    assert body["pagination"]["has_next"] is False
+
+
+def test_workflow_endpoint_bounded_sqlite_active_filter_skips_terminal_agent_tasks_before_limit(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+
+    for index in range(6):
+        task_store.save_agent_task(
+            _agent_task(
+                f"completed-{index}",
+                AgentTaskStatus.COMPLETED,
+                now - timedelta(minutes=index),
+            )
+        )
+    for index in range(4):
+        task_store.save_agent_task(
+            _agent_task(
+                f"active-{index}",
+                AgentTaskStatus.QUEUED,
+                now - timedelta(hours=1, minutes=index),
+            )
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=active&limit=3")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-agent-task-active-0",
+        "wf-agent-task-active-1",
+        "wf-agent-task-active-2",
+    ]
+    assert body["pagination"]["returned"] == 3
+    assert body["pagination"]["total"] == 4
+    assert body["pagination"]["unfiltered_total"] == 10
+    assert body["pagination"]["has_next"] is True
+    assert body["pagination"]["next_offset"] == 3
+
+
+def test_workflow_endpoint_bounded_sqlite_event_candidates_follow_requested_page_size(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    base = datetime(2026, 1, 20, 12, 0, tzinfo=UTC)
+
+    for index in range(120):
+        storage.save_event_record(
+            EventRecord(
+                event_id=f"event-{index}",
+                github_event=GitHubEventType.PUSH,
+                repo_full_name="riseos/example",
+                branch=f"branch-{index}",
+                commit_sha=f"sha-{index}",
+                received_at=base + timedelta(minutes=index),
+            )
+        )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=all&limit=75")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["workflows"]) == 75
+    assert body["workflows"][0]["workflow_id"] == "wf-event-119"
+    assert body["workflows"][-1]["workflow_id"] == "wf-event-45"
+    assert body["pagination"]["returned"] == 75
+    assert body["pagination"]["total"] == 120
+    assert body["pagination"]["has_next"] is True
+    assert body["pagination"]["next_offset"] == 75
+
+
+def test_workflow_endpoint_bounded_sqlite_event_filters_match_active_recent_contract(tmp_path) -> None:
+    db_path = str(tmp_path / "orchestrator.db")
+    storage = NoFullWorkflowListSQLiteStateStore(db_path)
+    task_store = NoFullWorkflowListSQLiteAgentTaskStore(db_path)
+    client = client_with_secret(db_path=db_path)
+    now = datetime.now(UTC)
+
+    storage.save_event_record(
+        EventRecord(
+            event_id="stale-active-push",
+            github_event=GitHubEventType.PUSH,
+            repo_full_name="riseos/example",
+            branch="agent-stale-active",
+            commit_sha="sha-stale-active",
+            received_at=now - timedelta(days=30),
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="recent-terminal-pr",
+            github_event=GitHubEventType.PULL_REQUEST,
+            repo_full_name="riseos/example",
+            pr_number=17,
+            pr_merged=True,
+            received_at=now - timedelta(minutes=5),
+            raw_action="closed",
+        )
+    )
+    storage.save_event_record(
+        EventRecord(
+            event_id="stale-terminal-pr",
+            github_event=GitHubEventType.PULL_REQUEST,
+            repo_full_name="riseos/example",
+            pr_number=18,
+            pr_merged=False,
+            received_at=now - timedelta(days=30),
+            raw_action="closed",
+        )
+    )
+    app.state.storage = storage
+    app.state.agent_task_store = task_store
+
+    response = client.get("/api/v1/workflows?filter=active_recent&limit=10&recent_days=14")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [workflow["workflow_id"] for workflow in body["workflows"]] == [
+        "wf-recent-terminal-pr",
+        "wf-stale-active-push",
+    ]
+    assert body["pagination"]["total"] == 2
+    assert body["pagination"]["unfiltered_total"] == 3
+
+
 def test_workflow_endpoint_rejects_unbounded_limit() -> None:
     client = client_with_secret()
 
@@ -354,4 +520,23 @@ def _review_item(item_id: str, created_at: datetime) -> ReviewWorkItem:
         event_type=GitHubEventType.PUSH,
         branch=f"agent-{item_id}",
         commit_sha=f"sha-{item_id}",
+    )
+
+
+def _agent_task(task_id: str, status: AgentTaskStatus, activity_at: datetime) -> AgentTask:
+    return AgentTask(
+        task_id=task_id,
+        repo_full_name="riseos/example",
+        title=f"Task {task_id}",
+        objective=f"Run task {task_id}.",
+        target_agent="codex-m2",
+        status=status,
+        created_at=activity_at,
+        updated_at=activity_at,
+        queued_at=activity_at if status == AgentTaskStatus.QUEUED else None,
+        completed_at=activity_at if status == AgentTaskStatus.COMPLETED else None,
+        lifecycle_events=[
+            AgentTaskLifecycleEvent(event="created", occurred_at=activity_at),
+            AgentTaskLifecycleEvent(event=status.value, occurred_at=activity_at),
+        ],
     )

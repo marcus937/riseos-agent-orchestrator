@@ -166,6 +166,48 @@ class SQLiteStateStore:
             row = conn.execute("SELECT COUNT(*) AS count FROM event_records").fetchone()
         return int(row["count"])
 
+    def count_event_records_for_workflow_collection(
+        self,
+        *,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> int:
+        where_sql, params = _event_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM event_records AS e
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+        return int(row["count"])
+
+    def list_event_records_for_workflow_collection(
+        self,
+        *,
+        limit: int,
+        workflow_filter: str = "active_recent",
+        recent_since: datetime | None = None,
+    ) -> list[EventRecord]:
+        if limit <= 0:
+            return []
+        where_sql, params = _event_workflow_filter_sql(workflow_filter, recent_since)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT e.*
+                FROM event_records AS e
+                {where_sql}
+                ORDER BY e.received_at DESC,
+                         ('wf-' || e.event_id) ASC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._event_record_from_row(row) for row in rows]
+
     def save_review_work_item(self, item: ReviewWorkItem) -> None:
         log_workflow_chain_availability(
             "wf_chain_metadata_storage_save_review_work_item_input",
@@ -611,9 +653,35 @@ def _load_json(value: object | None) -> dict[str, object]:
 
 
 def _review_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    recent_sql = f"{_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} >= ?"
+    recent_params = (_dt(recent_since),)
+    active_sql = _REVIEW_WORKFLOW_ACTIVE_SQL
+    if workflow_filter == "all":
+        return "", ()
+    if workflow_filter == "active":
+        return f"WHERE {active_sql}", ()
     if workflow_filter == "recent":
-        return f"WHERE {_REVIEW_WORKFLOW_LAST_ACTIVITY_SQL} >= ?", (_dt(recent_since),)
-    return "", ()
+        return f"WHERE {recent_sql}", recent_params
+    return f"WHERE ({active_sql}) OR ({recent_sql})", recent_params
+
+
+def _event_workflow_filter_sql(workflow_filter: str, recent_since: datetime | None) -> tuple[str, tuple[object, ...]]:
+    predicates = [_EVENT_WORKFLOW_CANONICAL_SQL, _EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL]
+    params: list[object] = []
+    recent_sql = "e.received_at >= ?"
+    active_sql = _EVENT_WORKFLOW_ACTIVE_SQL
+    if workflow_filter == "active":
+        predicates.append(active_sql)
+    elif workflow_filter == "recent":
+        predicates.append(recent_sql)
+        params.append(_dt(recent_since))
+    elif workflow_filter != "all":
+        predicates.append(f"({active_sql}) OR ({recent_sql})")
+        params.append(_dt(recent_since))
+    where_sql = "WHERE " + "\n                  AND ".join(
+        f"({predicate})" for predicate in predicates
+    )
+    return where_sql, tuple(params)
 
 
 def _log_review_work_item_persistence_json(
@@ -711,3 +779,43 @@ max(
     END
 )
 """
+
+# Review work items currently project to active canonical states. Terminal workflow
+# states are represented by GitHub close/deploy/verify event projections.
+_REVIEW_WORKFLOW_ACTIVE_SQL = "1 = 1"
+
+_EVENT_WORKFLOW_CANONICAL_SQL = """
+(
+    e.github_event = 'push'
+    OR (
+        e.github_event = 'issues'
+        AND e.raw_action IN ('opened', 'labeled', 'edited', 'reopened')
+    )
+    OR (
+        e.github_event = 'pull_request'
+        AND e.raw_action IN ('opened', 'reopened', 'synchronize', 'closed')
+    )
+    OR (e.github_event = 'pull_request_review' AND e.raw_action = 'submitted')
+)
+"""
+
+_EVENT_WORKFLOW_NOT_REVIEW_DUPLICATE_SQL = """
+NOT EXISTS (
+    SELECT 1
+    FROM review_work_items AS r
+    WHERE (
+        r.repo_full_name = e.repo_full_name
+        OR (r.repo_full_name IS NULL AND e.repo_full_name IS NULL)
+    )
+      AND (
+        r.issue_number = e.issue_number
+        OR (r.issue_number IS NULL AND e.issue_number IS NULL)
+      )
+      AND (
+        r.pr_number = e.pr_number
+        OR (r.pr_number IS NULL AND e.pr_number IS NULL)
+      )
+)
+"""
+
+_EVENT_WORKFLOW_ACTIVE_SQL = "NOT (e.github_event = 'pull_request' AND e.raw_action = 'closed')"

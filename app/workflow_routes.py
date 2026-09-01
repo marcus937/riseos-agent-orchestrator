@@ -12,7 +12,7 @@ from app.agent_tasks import AgentTask, AgentTaskStore, agent_task_store, build_a
 from app.clients.agent_bus import AgentBusClient
 from app.clients.github import GitHubClient
 from app.config import Settings, get_settings
-from app.event_store import EventRecord, event_store
+from app.event_store import event_store
 from app.review_queue import review_queue
 from app.storage import SQLiteStateStore
 from app.workflows import (
@@ -22,13 +22,12 @@ from app.workflows import (
     WORKFLOW_LIST_MAX_RECENT_DAYS,
     WorkflowCollection,
     WorkflowListFilter,
+    WorkflowPaginationMetadata,
     WorkflowRecord,
     WorkflowTimeline,
     build_workflow_collection,
-    build_workflow_collection_from_candidates,
     build_workflows,
     find_workflow,
-    filter_workflows,
 )
 from app.workflow_orchestration import (
     WorkflowCreateRequest,
@@ -178,10 +177,27 @@ def _build_bounded_storage_workflow_collection(
     bounded_limit = min(max(limit, 1), WORKFLOW_LIST_MAX_LIMIT)
     bounded_offset = max(offset, 0)
     bounded_recent_days = min(max(recent_days, 1), WORKFLOW_LIST_MAX_RECENT_DAYS)
-    workflow_filter_value = WorkflowListFilter(workflow_filter).value
+    normalized_filter = WorkflowListFilter(workflow_filter)
+    workflow_filter_value = normalized_filter.value
     now = datetime.now(UTC)
     recent_since = now - timedelta(days=bounded_recent_days)
     candidate_limit = bounded_offset + bounded_limit
+    review_total = storage.count_review_work_items_for_workflow_collection(
+        workflow_filter=workflow_filter_value,
+        recent_since=recent_since,
+    )
+    agent_task_total = (
+        agent_store.count_agent_tasks_for_workflow_collection(
+            workflow_filter=workflow_filter_value,
+            recent_since=recent_since,
+        )
+        if agent_store is not None
+        else 0
+    )
+    event_total = storage.count_event_records_for_workflow_collection(
+        workflow_filter=workflow_filter_value,
+        recent_since=recent_since,
+    )
     review_items = storage.list_review_work_items_for_workflow_collection(
         limit=candidate_limit,
         workflow_filter=workflow_filter_value,
@@ -196,44 +212,36 @@ def _build_bounded_storage_workflow_collection(
         if agent_store is not None
         else []
     )
-    event_candidates = _deduped_recent_workflow_events(storage)
-    filtered_events = _filter_events_for_workflow_collection(
-        event_candidates,
-        workflow_filter=workflow_filter,
-        recent_days=bounded_recent_days,
-        now=now,
+    event_candidates = storage.list_event_records_for_workflow_collection(
+        limit=candidate_limit,
+        workflow_filter=workflow_filter_value,
+        recent_since=recent_since,
     )
-    total = (
-        storage.count_review_work_items_for_workflow_collection(
-            workflow_filter=workflow_filter_value,
-            recent_since=recent_since,
-        )
-        + (
-            agent_store.count_agent_tasks_for_workflow_collection(
-                workflow_filter=workflow_filter_value,
-                recent_since=recent_since,
-            )
-            if agent_store is not None
-            else 0
-        )
-        + len(filtered_events)
-    )
+    total = review_total + agent_task_total + event_total
     unfiltered_total = (
         storage.count_review_work_items()
         + (agent_store.count_agent_tasks() if agent_store is not None else 0)
-        + len(event_candidates)
+        + storage.count_event_records_for_workflow_collection(
+            workflow_filter=WorkflowListFilter.ALL.value,
+        )
     )
-    return build_workflow_collection_from_candidates(
-        review_items,
-        filtered_events,
-        agent_tasks,
-        limit=bounded_limit,
-        offset=bounded_offset,
-        workflow_filter=workflow_filter,
-        recent_days=bounded_recent_days,
-        now=now,
-        total=total,
-        unfiltered_total=unfiltered_total,
+    workflows = build_workflows(review_items, event_candidates, agent_tasks)
+    page = workflows[bounded_offset : bounded_offset + bounded_limit]
+    next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < total else None
+    return WorkflowCollection(
+        workflows=page,
+        pagination=WorkflowPaginationMetadata(
+            limit=bounded_limit,
+            offset=bounded_offset,
+            returned=len(page),
+            total=total,
+            unfiltered_total=unfiltered_total,
+            truncated=next_offset is not None,
+            has_next=next_offset is not None,
+            next_offset=next_offset,
+            filter=normalized_filter,
+            recent_days=bounded_recent_days,
+        ),
     )
 
 
@@ -303,9 +311,10 @@ def _supports_bounded_workflow_storage(storage: object) -> bool:
     return all(
         hasattr(storage, name)
         for name in (
+            "count_event_records_for_workflow_collection",
             "count_review_work_items",
             "count_review_work_items_for_workflow_collection",
-            "has_review_workflow_identity",
+            "list_event_records_for_workflow_collection",
             "list_review_work_items_for_workflow_collection",
         )
     )
@@ -322,42 +331,6 @@ def _supports_bounded_agent_task_store(agent_store: object | None) -> bool:
             "list_agent_tasks_for_workflow_collection",
         )
     )
-
-
-def _deduped_recent_workflow_events(storage: SQLiteStateStore) -> list[EventRecord]:
-    events: list[EventRecord] = []
-    for record in storage.recent_events():
-        if not build_workflows([], [record], []):
-            continue
-        if storage.has_review_workflow_identity(
-            repo_full_name=record.repo_full_name,
-            issue_number=record.issue_number,
-            pr_number=record.pr_number,
-        ):
-            continue
-        events.append(record)
-    return events
-
-
-def _filter_events_for_workflow_collection(
-    events: list[EventRecord],
-    *,
-    workflow_filter: WorkflowListFilter,
-    recent_days: int,
-    now: datetime | None = None,
-) -> list[EventRecord]:
-    if WorkflowListFilter(workflow_filter) == WorkflowListFilter.ALL:
-        return events
-    filtered: list[EventRecord] = []
-    for record in events:
-        if filter_workflows(
-            build_workflows([], [record], []),
-            workflow_filter=workflow_filter,
-            recent_days=recent_days,
-            now=now,
-        ):
-            filtered.append(record)
-    return filtered
 
 
 def _storage(request: Request) -> SQLiteStateStore | None:
