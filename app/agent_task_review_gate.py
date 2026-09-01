@@ -154,7 +154,7 @@ def _bb2_review_payload(
         "rationale": response.decision.summary,
         "findings": list(response.decision.required_changes),
         "required_changes": list(response.decision.required_changes),
-        "risk_level": response.decision.risk_level.value,
+        "risk_level": response.decision.risk_level.value.lower(),
         "evidence_packet_ids_reviewed": reviewed_ids,
         "files_reviewed": list(response.changed_files),
         "verified": verified,
